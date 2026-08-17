@@ -1,11 +1,20 @@
-# M200 Agent v0.1.0
+# M200 Agent v0.2.0
 
 M200 Agent 是一个面向个人、本机单用户场景的 AI Agent 原型。它以 FastAPI、LangGraph 和
 Vue 3 为核心，提供 Web 对话、三层记忆、文档混合检索、NapCat/OneBot v11 QQ 接入，以及
-需要 Owner 确认的 JMComic 持久下载任务。
+仅 Owner 可创建的 JMComic 持久下载任务。
 
-这是首个可运行原型版本，不是生产级多用户系统。项目默认绑定本机回环地址，不包含 Docker、
-Redis、Celery、完整 RBAC、OCR、语音/视觉模型、生产日志平台或云部署配置。
+这是面向个人本机使用的 V0.2 版本，不是生产级多用户系统。项目默认绑定本机回环地址，不包含
+Docker、Redis、Celery、完整 RBAC、OCR、语音/视觉模型、生产日志平台或云部署配置。
+
+## 当前发布
+
+- 当前版本：`v0.2.0`
+- 仓库：<https://github.com/sanhuaz/M200_Agent>
+- v0.2 修改明细：[v0.2.0-修改概述.md](./v0.2.0-修改概述.md)
+
+v0.2 在 v0.1 的聊天、记忆、RAG、NapCat 和漫画任务基础上，补充了动态 Tools、Agent
+Skills、结构化人格、管理员管理、用户级记忆隔离、文件产物以及漫画发送后的显式清理流程。
 
 ## 功能
 
@@ -19,8 +28,12 @@ Redis、Celery、完整 RBAC、OCR、语音/视觉模型、生产日志平台或
 - 可选在线 Reranker，失败时明确降级到 RRF，不伪装成重排成功。
 - 本地 BGE 或 OpenAI 兼容在线 Embedding；切换配置时使用影子索引重建。
 - NapCat OneBot v11 WebSocket Client 接入、消息去重和群聊触发规则。
-- JMComic 搜索、十分钟 Owner 确认、单 Worker 下载、PDF 产物与 QQ 私聊发送。
-- Vue 3 测试管理端：聊天、知识库、长期记忆、漫画任务和运行状态。
+- JMComic 搜索、Owner 直接下载、单 Worker、PDF 产物、QQ 私聊发送与显式清理。
+- 动态 Tool Registry：内置 Tool、审核后启用的 Python Tool、文件创建 Tool。
+- Agent Skills：`SKILL.md` 导入、启停、自动/手动加载；包内脚本只展示不执行。
+- 结构化人格编译、全局/用户人格分配、全局/QQ 用户记忆隔离和 Owner 管理。
+- 文件产物隔离、SHA-256 记录、Web 下载及 QQ 私聊发送。
+- Vue 3 管理端：聊天、知识库、Tools、Skills、人格、长期记忆、管理员、任务和状态页面。
 
 ## 架构
 
@@ -31,6 +44,7 @@ FastAPI API + OneBot WebSocket
    ↓
 LangGraph Agent
    ├─ Chat Model / Function Calling
+   ├─ Dynamic Tool Registry / Skills
    ├─ Long-term Memory
    ├─ Knowledge Retrieval
    │    ├─ Chroma Vector Search
@@ -52,17 +66,13 @@ SQLite + Chroma + Local Artifacts
 
 ## 环境准备
 
-推荐 Python 3.13。项目不会在仓库中保存解释器路径；PowerShell 脚本按以下顺序选择 Python：
-
-1. `PERSONAL_AGENT_PYTHON` 环境变量；
-2. 当前 Conda 环境的 `CONDA_PREFIX\python.exe`；
-3. `PATH` 中的 `python`。
+工作解释器固定为 `D:\miniconda\envs\langchain1.2\python.exe`（Python 3.13）。启动、迁移、
+测试和安装依赖都显式使用该解释器，不依赖当前终端的 `python` 指向。
 
 Windows PowerShell 示例：
 
 ```powershell
-$env:PERSONAL_AGENT_PYTHON = "C:\path\to\python.exe"
-& $env:PERSONAL_AGENT_PYTHON -m pip install --no-user -r requirements.txt
+& "D:\miniconda\envs\langchain1.2\python.exe" -m pip install --no-user -r requirements.txt
 ```
 
 安装前端依赖：
@@ -126,7 +136,7 @@ OWNER_QQ_IDS=["your-owner-qq"]
 
 ```powershell
 Set-Location backend
-& $env:PERSONAL_AGENT_PYTHON -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+& "D:\miniconda\envs\langchain1.2\python.exe" -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
 ```powershell
@@ -142,7 +152,7 @@ pnpm run dev
 
 访问地址：
 
-- Web：http://127.0.0.1:5173
+- Web：http://127.0.0.1:5176
 - OpenAPI：http://127.0.0.1:8000/docs
 - 健康检查：http://127.0.0.1:8000/api/v1/health
 
@@ -163,7 +173,9 @@ Token: 与 .env 中 ONEBOT_TOKEN 完全一致
 - 私聊默认响应。
 - 群聊仅响应 `@机器人` 或 `/ai` 前缀。
 - `/help`、`/model list`、`/kb`、`/memory`、`/jm` 可用于查询。
-- `/model use`、`/confirm`、下载和管理操作仅 Owner 可用。
+- `/tools`、`/skills`、`/skill <name> <request>` 可查看和手动触发已启用扩展。
+- `/model use`、漫画下载/删除和管理操作仅 Owner 可用。Tool/Skill 管理仍使用 `/confirm` 二次确认。
+- `/jm download <漫画ID>` 立即创建下载任务；QQ 发送成功后可用 `/jm delete <任务ID>` 删除本地产物。
 - 健康检查中的 OneBot 状态分为 `connected`、`configured_disconnected`、
   `needs_configuration`。
 
@@ -186,10 +198,20 @@ Chroma 语义召回 20 条
 ## 漫画任务边界
 
 - 搜索不会自动下载。
-- 下载必须由 Owner 在十分钟内确认。
+- 只有 Owner 可以下载；Owner 发起后立即创建任务，不再要求二次确认。
 - Worker 单并发，瞬时失败最多重试两次，默认只生成 PDF。
-- QQ 仅向 Owner 私聊发送；超过阈值或发送失败时返回本地绝对路径。
+- QQ 仅向 Owner 私聊自动发送；超过阈值或发送失败时返回本地绝对路径。
+- 成功发送后，Owner 可通过 QQ 命令或 Web 任务页显式删除该任务的本地产物；任务审计记录保留。
 - 用户应确保对下载内容拥有合法保存权利。
+
+## v0.2 扩展边界
+
+- Tool ZIP 必须包含 `tool.json` 和 `plugin.py:create_tools`，导入后默认停用，不自动安装依赖。
+- Skill ZIP 必须包含与目录同名的 `SKILL.md`；启动只读取名称/描述，完整内容按需加载。
+- 人格原文只用于编辑，运行时只使用通过模型编译和字段校验的 `PersonaStyle` JSON，不能修改
+  系统规则、工具、权限、密钥或文件根目录。
+- 文件只能写入 `workspace/generated/<user-id>/<artifact-id>/`，不自动执行；多文件自动 ZIP。
+- `local-owner` 永久存在不可删除，QQ Owner 由数据库实时管理；`.env` Owner 仅首次迁移导入。
 
 ## 验证
 
@@ -207,13 +229,18 @@ Chroma 语义召回 20 条
 - Vue TypeScript 检查
 - Vite 构建
 
-## v0.1.0 验证范围
+## v0.2.0 验证范围
 
-开发环境已分别验证主模型 SSE、原生 Tool Calls、在线 Embedding、本地 BGE、FTS5/向量混合检索、
-在线 Reranker、长期记忆写入与召回、JMComic 搜索/确认取消，以及 NapCat WebSocket 断线重连。
-这些结果不代表所有第三方服务、账号和网络环境始终可用。
+本次发布前已通过 `scripts/check.ps1` 完整离线检查，包括依赖一致性、Python 编译、Ruff、Pyright、
+26 项 Pytest、Vue TypeScript 检查和 Vite 构建。开发过程中还分别联调过主模型 SSE、原生 Tool
+Calls、在线 Embedding、本地 BGE、FTS5/向量混合检索、在线 Reranker、长期记忆、JMComic 下载、
+NapCat WebSocket、QQ 回复和文件发送。第三方服务会受账号、网络、接口和上游版本影响，发布结果不
+代表这些外部链路在其他机器或未来始终可用。
 
 自动测试不调用真实模型、JMComic 或 QQ；页面启动或 HTTP 200 也不能替代真实业务验证。
+
+当前前端仍集中在单个 `App.vue` 中，通过页面路径切换管理标签，并未拆成 Vue Router 多组件工程。
+用户专属人格分配已经提供后端接口，当前 Web 页面只直接提供全局人格启用入口。
 
 ## 安全与发布边界
 

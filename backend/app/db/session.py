@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, inspect
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -51,3 +51,27 @@ def initialize_database() -> None:
             )
             """
         )
+
+
+def verify_schema() -> None:
+    required = {
+        "conversations",
+        "messages",
+        "knowledge_bases",
+        "documents",
+        "chunks",
+        "memories",
+        "confirmations",
+        "jobs",
+        "tool_runs",
+        "processed_events",
+        "extension_packages",
+        "personas",
+        "persona_assignments",
+        "admin_identities",
+        "artifacts",
+        "app_settings",
+    }
+    missing = required.difference(inspect(engine).get_table_names())
+    if missing:
+        raise RuntimeError(f"数据库缺少必要表，迁移未完成: {', '.join(sorted(missing))}")

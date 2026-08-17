@@ -31,21 +31,55 @@ class MemoryService:
 
     def recall(self, user_id: str, query: str, limit: int = 5) -> list[Memory]:
         has_memory = self.session.scalar(
-            select(Memory.id).where(Memory.user_id == user_id, Memory.status == "active").limit(1)
+            select(Memory.id)
+            .where(
+                Memory.status == "active",
+                ((Memory.scope_type == "global") & Memory.user_id.is_(None))
+                | ((Memory.scope_type == "user") & (Memory.user_id == user_id)),
+            )
+            .limit(1)
         )
         if has_memory is None:
             return []
         profile = get_settings().default_embedding_profile
-        provider = get_embedding_provider(profile)
-        collection = safe_collection_name("memory", user_id, profile)
-        vector_rows = vector_store.query(collection, provider.embed_query(query), limit)
-        ids = [str(row["id"]) for row in vector_rows]
+        try:
+            provider = get_embedding_provider(profile)
+            query_embedding = provider.embed_query(query)
+        except Exception:
+            # 本地 BGE 尚未下载时，记忆召回退化为精确关键词，不阻塞当前聊天。
+            terms = [term for term in re.findall(r"[\w\u4e00-\u9fff]+", query) if len(term) >= 2]
+            fallback = select(Memory).where(
+                Memory.status == "active",
+                ((Memory.scope_type == "global") & Memory.user_id.is_(None))
+                | ((Memory.scope_type == "user") & (Memory.user_id == user_id)),
+            )
+            if terms:
+                fallback = fallback.where(
+                    Memory.content.contains(terms[0])
+                    | Memory.fact_key.contains(terms[0])
+                )
+            return list(self.session.scalars(fallback.order_by(Memory.last_seen_at.desc()).limit(limit)))
+        vector_rows: list[dict[str, object]] = []
+        for scope in ("global", user_id):
+            collection = safe_collection_name("memory", scope, profile)
+            vector_rows.extend(vector_store.query(collection, query_embedding, limit))
+        def score(row: dict[str, object]) -> float:
+            value = row.get("score")
+            return float(value) if isinstance(value, (int, float, str)) else 0.0
+
+        vector_rows.sort(key=score, reverse=True)
+        ids = [str(row["id"]) for row in vector_rows[:limit]]
         if not ids:
             return []
         by_id = {
             item.id: item
             for item in self.session.scalars(
-                select(Memory).where(Memory.id.in_(ids), Memory.status == "active")
+                select(Memory).where(
+                    Memory.id.in_(ids),
+                    Memory.status == "active",
+                    ((Memory.scope_type == "global") & Memory.user_id.is_(None))
+                    | ((Memory.scope_type == "user") & (Memory.user_id == user_id)),
+                )
             )
         }
         return [by_id[item_id] for item_id in ids if item_id in by_id]
@@ -74,7 +108,12 @@ class MemoryService:
             return active
         if active:
             active.status = "archived"
+            vector_store.delete_ids(
+                safe_collection_name("memory", user_id, get_settings().default_embedding_profile),
+                [active.id],
+            )
         memory = Memory(
+            scope_type="user",
             user_id=user_id,
             fact_key=fact_key[:200],
             content=content,
@@ -90,7 +129,57 @@ class MemoryService:
             [memory.id],
             [memory.content],
             provider.embed_documents([memory.content]),
-            [{"user_id": user_id, "fact_key": fact_key}],
+                [{"user_id": user_id, "fact_key": fact_key}],
+        )
+        self.session.commit()
+        return memory
+
+    def upsert_global(
+        self,
+        fact_key: str,
+        content: str,
+        source_message_id: str | None = None,
+        extraction_model: str | None = None,
+    ) -> Memory:
+        if SENSITIVE_PATTERN.search(content):
+            raise ValueError("疑似凭证内容不能写入长期记忆")
+        active = self.session.scalar(
+            select(Memory).where(
+                Memory.scope_type == "global",
+                Memory.user_id.is_(None),
+                Memory.fact_key == fact_key,
+                Memory.status == "active",
+            )
+        )
+        now = datetime.now(UTC).replace(tzinfo=None)
+        if active and active.content == content:
+            active.last_seen_at = now
+            self.session.commit()
+            return active
+        if active:
+            active.status = "archived"
+            vector_store.delete_ids(
+                safe_collection_name("memory", "global", get_settings().default_embedding_profile),
+                [active.id],
+            )
+        memory = Memory(
+            scope_type="global",
+            user_id=None,
+            fact_key=fact_key[:200],
+            content=content,
+            source_message_id=source_message_id,
+            extraction_model=extraction_model,
+        )
+        self.session.add(memory)
+        self.session.flush()
+        profile = get_settings().default_embedding_profile
+        provider = get_embedding_provider(profile)
+        vector_store.upsert_documents(
+            safe_collection_name("memory", "global", profile),
+            [memory.id],
+            [memory.content],
+            provider.embed_documents([memory.content]),
+            [{"scope_type": "global", "fact_key": fact_key}],
         )
         self.session.commit()
         return memory

@@ -29,11 +29,14 @@ class Settings(BaseSettings):
     )
 
     app_env: str = "development"
-    frontend_origin: str = "http://127.0.0.1:5173"
+    frontend_origin: str = "http://127.0.0.1:5176"
     database_path: Path = PROJECT_ROOT / "data" / "personal_agent.db"
     chroma_path: Path = PROJECT_ROOT / "data" / "chroma"
     upload_path: Path = PROJECT_ROOT / "data" / "uploads"
     download_path: Path = PROJECT_ROOT / "data" / "downloads"
+    tools_path: Path = PROJECT_ROOT / "tools"
+    skills_path: Path = PROJECT_ROOT / "skills"
+    workspace_path: Path = PROJECT_ROOT / "workspace"
 
     model_profiles_json: str = (
         '[{"alias":"default","model":"unconfigured","base_url":"https://api.example.com/v1",'
@@ -68,7 +71,16 @@ class Settings(BaseSettings):
             return [item.strip() for item in stripped.split(",") if item.strip()]
         return value
 
-    @field_validator("database_path", "chroma_path", "upload_path", "download_path", mode="after")
+    @field_validator(
+        "database_path",
+        "chroma_path",
+        "upload_path",
+        "download_path",
+        "tools_path",
+        "skills_path",
+        "workspace_path",
+        mode="after",
+    )
     @classmethod
     def resolve_project_path(cls, value: Path) -> Path:
         return value if value.is_absolute() else (PROJECT_ROOT / value).resolve()
@@ -84,7 +96,15 @@ class Settings(BaseSettings):
         return profiles
 
     def ensure_directories(self) -> None:
-        for path in (self.database_path.parent, self.chroma_path, self.upload_path, self.download_path):
+        for path in (
+            self.database_path.parent,
+            self.chroma_path,
+            self.upload_path,
+            self.download_path,
+            self.tools_path,
+            self.skills_path,
+            self.workspace_path,
+        ):
             path.mkdir(parents=True, exist_ok=True)
 
 

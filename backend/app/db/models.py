@@ -89,7 +89,8 @@ class Memory(Base):
     __tablename__ = "memories"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    user_id: Mapped[str] = mapped_column(String(120), index=True)
+    scope_type: Mapped[str] = mapped_column(String(20), default="user", index=True)
+    user_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
     fact_key: Mapped[str] = mapped_column(String(200), index=True)
     content: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(20), default="active")
@@ -140,6 +141,89 @@ class ToolRun(Base):
     result: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(20))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class ExtensionPackage(Base):
+    __tablename__ = "extension_packages"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    kind: Mapped[str] = mapped_column(String(20), index=True)
+    name: Mapped[str] = mapped_column(String(80))
+    version: Mapped[str] = mapped_column(String(80), default="0.0.0")
+    description: Mapped[str] = mapped_column(Text, default="")
+    source_type: Mapped[str] = mapped_column(String(20), default="local")
+    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_ref: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    sha256: Mapped[str] = mapped_column(String(64))
+    install_path: Mapped[str] = mapped_column(Text)
+    manifest: Mapped[str] = mapped_column(Text, default="{}")
+    permissions: Mapped[str] = mapped_column(Text, default="[]")
+    access_policy: Mapped[str] = mapped_column(String(30), default="owner_only")
+    status: Mapped[str] = mapped_column(String(30), default="installed_disabled")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    builtin: Mapped[bool] = mapped_column(Boolean, default=False)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+    __table_args__ = (UniqueConstraint("kind", "name", name="uq_extension_kind_name"),)
+
+
+class Persona(Base):
+    __tablename__ = "personas"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    name: Mapped[str] = mapped_column(String(120), unique=True)
+    raw_prompt: Mapped[str] = mapped_column(Text, default="")
+    compiled_style: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="draft")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class PersonaAssignment(Base):
+    __tablename__ = "persona_assignments"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    scope_type: Mapped[str] = mapped_column(String(20))
+    user_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    persona_id: Mapped[str] = mapped_column(ForeignKey("personas.id", ondelete="CASCADE"))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    __table_args__ = (UniqueConstraint("scope_type", "user_id", name="uq_persona_assignment_scope"),)
+
+
+class AdminIdentity(Base):
+    __tablename__ = "admin_identities"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    platform: Mapped[str] = mapped_column(String(20), default="qq")
+    external_id: Mapped[str] = mapped_column(String(120), unique=True)
+    display_name: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_by: Mapped[str] = mapped_column(String(120), default="local-owner")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class Artifact(Base):
+    __tablename__ = "artifacts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_id: Mapped[str] = mapped_column(String(120), index=True)
+    conversation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    filename: Mapped[str] = mapped_column(String(260))
+    path: Mapped[str] = mapped_column(Text)
+    sha256: Mapped[str] = mapped_column(String(64))
+    size: Mapped[int] = mapped_column(Integer)
+    content_type: Mapped[str] = mapped_column(String(120), default="application/octet-stream")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class AppSetting(Base):
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String(120), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class ProcessedEvent(Base):

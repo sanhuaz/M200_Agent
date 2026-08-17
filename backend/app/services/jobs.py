@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
+from pathlib import Path
 
 from sqlalchemy import select, update
 
@@ -12,6 +15,7 @@ from app.db.models import Document, Job
 from app.db.session import SessionLocal
 from app.services.documents import index_document, reindex_knowledge_base
 from app.services.manga import manga_service
+from app.services.runtime import is_owner
 
 logger = logging.getLogger(__name__)
 JobNotifier = Callable[[Job], Awaitable[None]]
@@ -142,3 +146,82 @@ def create_job(
         session.add(job)
         session.flush()
         return job
+
+
+def create_manga_download_job(
+    album_id: str,
+    requester_id: str,
+    conversation_id: str | None = None,
+) -> Job:
+    if not is_owner(requester_id):
+        raise PermissionError("只有 Owner 可以创建漫画下载任务")
+    if not album_id.isdigit():
+        raise ValueError("漫画 ID 必须为数字")
+    return create_job(
+        "manga_download",
+        {"album_id": album_id},
+        requester_id=requester_id,
+        conversation_id=conversation_id,
+    )
+
+
+def update_job_result(job_id: str, updates: dict[str, object]) -> dict[str, object]:
+    with SessionLocal.begin() as session:
+        job = session.get(Job, job_id)
+        if job is None or not job.result:
+            raise ValueError("任务结果不存在")
+        result = json.loads(job.result)
+        result.update(updates)
+        job.result = json.dumps(result, ensure_ascii=False)
+        return result
+
+
+def delete_manga_artifact(job_id: str, requester_id: str) -> dict[str, object]:
+    if not is_owner(requester_id):
+        raise PermissionError("只有 Owner 可以删除漫画产物")
+
+    settings = get_settings()
+    base_dir = settings.download_path.resolve()
+    with SessionLocal.begin() as session:
+        job = session.get(Job, job_id)
+        if job is None or job.type != "manga_download":
+            raise ValueError("漫画下载任务不存在")
+        if job.status != "succeeded" or not job.result:
+            raise ValueError("只有已成功完成的漫画任务可以删除产物")
+
+        result = json.loads(job.result)
+        if result.get("artifact_deleted"):
+            raise ValueError("该漫画产物已经删除")
+        if job.requester_id.isdigit() and result.get("delivery_status") != "sent":
+            raise ValueError("QQ 文件尚未成功发送，不允许删除本地产物")
+
+        job_dir = (base_dir / job.id).resolve()
+        if job_dir.parent != base_dir or not job_dir.is_dir():
+            raise ValueError("漫画任务目录不存在或路径无效")
+        artifact_path = Path(str(result.get("path", ""))).resolve()
+        if job_dir not in artifact_path.parents or not artifact_path.is_file():
+            raise ValueError("漫画任务产物不存在或路径无效")
+
+        deleted_size = 0
+        for path in job_dir.rglob("*"):
+            if path.is_symlink() or path.is_junction():
+                raise ValueError("漫画任务目录包含链接，拒绝删除")
+            if path.is_file():
+                deleted_size += path.stat().st_size
+        shutil.rmtree(job_dir)
+
+        result.update(
+            {
+                "artifact_deleted": True,
+                "deleted_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                "deleted_by": requester_id,
+                "deleted_size": deleted_size,
+            }
+        )
+        job.result = json.dumps(result, ensure_ascii=False)
+        return {
+            "job_id": job.id,
+            "album_id": result.get("album_id"),
+            "deleted": True,
+            "deleted_size": deleted_size,
+        }

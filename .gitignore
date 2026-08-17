@@ -1,6 +1,12 @@
 .env
 .env.*
 !.env.example
+_v020_backups/
+tools/*
+!tools/.gitkeep
+skills/*
+!skills/.gitkeep
+workspace/generated/
 __pycache__/
 *.py[cod]
 .pytest_cache/

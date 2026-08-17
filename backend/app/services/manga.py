@@ -3,6 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import jmcomic
+from PIL import Image
+
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
 
 class MangaService:
@@ -31,9 +34,44 @@ class MangaService:
             extra=jmcomic.Feature.export_pdf,
         )
         pdfs = sorted(output_dir.rglob("*.pdf"), key=lambda path: path.stat().st_mtime, reverse=True)
-        if not pdfs:
-            raise RuntimeError("JMComic 下载完成但没有找到 PDF 产物")
-        return pdfs[0]
+        if pdfs:
+            return pdfs[0]
+        return self.export_downloaded_images(output_dir, album_id)
+
+    @staticmethod
+    def export_downloaded_images(output_dir: Path, album_id: str) -> Path:
+        image_paths = sorted(
+            (
+                path
+                for path in output_dir.rglob("*")
+                if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+            ),
+            key=lambda path: tuple(part.casefold() for part in path.relative_to(output_dir).parts),
+        )
+        if not image_paths:
+            raise RuntimeError("JMComic 下载完成但没有找到图片或 PDF 产物")
+
+        pages: list[Image.Image] = []
+        try:
+            for image_path in image_paths:
+                with Image.open(image_path) as source:
+                    pages.append(source.convert("RGB"))
+
+            pdf_path = output_dir / f"JM{album_id}.pdf"
+            pages[0].save(
+                pdf_path,
+                "PDF",
+                save_all=True,
+                append_images=pages[1:],
+                resolution=100.0,
+            )
+        finally:
+            for page in pages:
+                page.close()
+
+        if not pdf_path.is_file() or pdf_path.stat().st_size == 0:
+            raise RuntimeError("JMComic 图片下载成功但 PDF 兜底导出失败")
+        return pdf_path
 
 
 manga_service = MangaService()

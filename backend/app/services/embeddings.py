@@ -10,6 +10,8 @@ from sentence_transformers import SentenceTransformer
 
 from app.core.config import get_settings
 
+ONLINE_EMBEDDING_BATCH_SIZE = 64
+
 
 class EmbeddingProvider(Protocol):
     profile: str
@@ -51,10 +53,15 @@ class OnlineEmbeddings:
             model=settings.online_embedding_model,
             api_key=SecretStr(api_key),
             base_url=settings.online_embedding_base_url,
+            chunk_size=ONLINE_EMBEDDING_BATCH_SIZE,
         )
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return self._client.embed_documents(texts)
+        embeddings: list[list[float]] = []
+        for start in range(0, len(texts), ONLINE_EMBEDDING_BATCH_SIZE):
+            batch = texts[start : start + ONLINE_EMBEDDING_BATCH_SIZE]
+            embeddings.extend(self._client.embed_documents(batch))
+        return embeddings
 
     def embed_query(self, text: str) -> list[float]:
         return self._client.embed_query(text)

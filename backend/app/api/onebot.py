@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -12,11 +13,20 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from app.core.config import get_settings
-from app.db.models import Conversation, Job, KnowledgeBase, Memory, ProcessedEvent
+from app.db.models import Artifact, Conversation, ExtensionPackage, Job, KnowledgeBase, Memory, ProcessedEvent
 from app.db.session import SessionLocal
 from app.services.chat import chat_service
-from app.services.confirmations import is_owner, resolve_confirmation
-from app.services.jobs import job_worker
+from app.services.confirmations import (
+    create_extension_confirmation,
+    is_owner,
+    resolve_confirmation,
+)
+from app.services.jobs import (
+    create_manga_download_job,
+    delete_manga_artifact,
+    job_worker,
+    update_job_result,
+)
 from app.services.manga import manga_service
 from app.services.models import model_registry
 
@@ -72,7 +82,13 @@ class OneBotManager:
         authorization = websocket.headers.get("authorization", "")
         return authorization.removeprefix("Bearer ").strip()
 
-    async def action(self, action: str, params: dict[str, object]) -> dict[str, object]:
+    async def action(
+        self,
+        action: str,
+        params: dict[str, object],
+        *,
+        timeout_seconds: float = 30,
+    ) -> dict[str, object]:
         if self.websocket is None:
             raise ConnectionError("NapCat 未连接")
         echo = uuid.uuid4().hex
@@ -81,20 +97,27 @@ class OneBotManager:
         async with self._send_lock:
             await self.websocket.send_json({"action": action, "params": params, "echo": echo})
         try:
-            return await asyncio.wait_for(future, timeout=30)
+            return await asyncio.wait_for(future, timeout=timeout_seconds)
         finally:
             self._pending.pop(echo, None)
 
     async def send_text(self, user_id: str, text: str, group_id: str | None = None) -> None:
         if group_id:
-            await self.action("send_group_msg", {"group_id": int(group_id), "message": text})
+            response = await self.action(
+                "send_group_msg", {"group_id": int(group_id), "message": text}
+            )
         else:
-            await self.action("send_private_msg", {"user_id": int(user_id), "message": text})
+            response = await self.action(
+                "send_private_msg", {"user_id": int(user_id), "message": text}
+            )
+        if response.get("status") != "ok" or int(str(response.get("retcode", -1))) != 0:
+            raise RuntimeError(f"QQ 文本发送失败: {response.get('message') or response.get('wording')}")
 
     async def send_private_file(self, user_id: str, path: Path) -> None:
         response = await self.action(
             "upload_private_file",
             {"user_id": int(user_id), "file": str(path.resolve()), "name": path.name},
+            timeout_seconds=300,
         )
         if response.get("status") != "ok" or int(str(response.get("retcode", -1))) != 0:
             raise RuntimeError(f"QQ 文件上传失败: {response.get('message') or response.get('wording')}")
@@ -115,6 +138,7 @@ class OneBotManager:
         text = self._extract_triggered_text(raw, message_type)
         if text is None or not user_id:
             return
+        text = self._expand_manual_extension_request(text)
         external_id = f"group:{group_id}" if group_id else f"private:{user_id}"
         try:
             command_response = await self._command(text, user_id, external_id)
@@ -150,7 +174,16 @@ class OneBotManager:
                         raise RuntimeError("无法创建 QQ 会话")
                 final_text = ""
                 error_text = ""
-                async for item in chat_service.stream(session, conversation, user_id, text, message_id):
+                artifact_ids: list[str] = []
+                async for item in chat_service.stream(
+                    session,
+                    conversation,
+                    user_id,
+                    text,
+                    message_id,
+                    platform="qq",
+                    is_group=bool(group_id),
+                ):
                     event_data = item["data"]
                     if not isinstance(event_data, dict):
                         continue
@@ -158,7 +191,34 @@ class OneBotManager:
                         final_text = str(event_data.get("text", ""))
                     elif item["event"] == "error":
                         error_text = str(event_data.get("message", ""))
+                    elif item["event"] == "artifact_created":
+                        artifact_id = str(event_data.get("artifact_id", ""))
+                        if artifact_id:
+                            artifact_ids.append(artifact_id)
                 await self.send_text(user_id, final_text or f"处理失败：{error_text}", group_id)
+                if not group_id:
+                    with SessionLocal() as artifact_session:
+                        artifacts = [
+                            artifact_session.get(Artifact, artifact_id)
+                            for artifact_id in artifact_ids
+                        ]
+                    for artifact in artifacts:
+                        if artifact is None or not Path(artifact.path).is_file():
+                            continue
+                        path = Path(artifact.path)
+                        if path.stat().st_size <= settings.qq_upload_limit_mb * 1024 * 1024:
+                            try:
+                                await self.send_private_file(user_id, path)
+                            except Exception as error:
+                                await self.send_text(
+                                    user_id,
+                                    f"文件发送失败：{error}\n本地路径：{path.resolve()}",
+                                )
+                        else:
+                            await self.send_text(
+                                user_id,
+                                f"文件超过 QQ 上传阈值，本地路径：{path.resolve()}",
+                            )
         except Exception as error:
             logger.exception("处理 QQ 消息失败")
             try:
@@ -179,11 +239,26 @@ class OneBotManager:
             value = value[len(settings.group_command_prefix) :].strip()
         return value
 
+    @staticmethod
+    def _expand_manual_extension_request(text: str) -> str:
+        for prefix, label in (("/skill ", "Skill"), ("/tool ", "Tool")):
+            if not text.startswith(prefix):
+                continue
+            rest = text[len(prefix) :].strip()
+            if not rest or rest.startswith(("install ", "enable ", "disable ", "remove ")):
+                return text
+            name, separator, request = rest.partition(" ")
+            if separator and request.strip():
+                return f"请明确调用 {label} {name}，完成以下请求：{request.strip()}"
+        return text
+
     async def _command(self, text: str, user_id: str, external_id: str) -> str | None:
         if text == "/help":
             return (
                 "命令：/model list、/model use <alias>、/kb、/memory、"
-                "/jm <关键词>、/confirm <token>、/cancel <token>"
+                "/memory delete <id>、/tools、/skills、/skill <name> <请求>、"
+                "/jm <关键词>、/jm download <漫画ID>、/jm delete <任务ID>、"
+                "/confirm <token>、/cancel <token>"
             )
         if text == "/model list":
             return "可用模型：\n" + "\n".join(
@@ -219,9 +294,94 @@ class OneBotManager:
         if text == "/memory":
             with SessionLocal() as session:
                 items = session.scalars(
-                    select(Memory).where(Memory.user_id == user_id, Memory.status == "active")
+                    select(Memory).where(
+                        Memory.scope_type == "user", Memory.user_id == user_id, Memory.status == "active"
+                    )
                 ).all()
-                return "当前记忆：\n" + ("\n".join(f"- {item.content}" for item in items) or "暂无")
+                return "当前记忆：\n" + (
+                    "\n".join(f"- {item.id}: {item.content}" for item in items) or "暂无"
+                )
+        if text.startswith("/memory delete "):
+            memory_id = text.removeprefix("/memory delete ").strip()
+            with SessionLocal.begin() as session:
+                item = session.get(Memory, memory_id)
+                if item is None or item.scope_type != "user" or item.user_id != user_id:
+                    return "找不到属于你的这条记忆。"
+                item.status = "archived"
+            return "已删除指定记忆。"
+        if text == "/tools":
+            with SessionLocal() as session:
+                items = session.scalars(
+                    select(ExtensionPackage).where(ExtensionPackage.kind == "tool")
+                ).all()
+                return "Tools：\n" + (
+                    "\n".join(
+                        f"- {item.name} ({'启用' if item.enabled else '停用'})：{item.description}"
+                        for item in items
+                    )
+                    or "暂无"
+                )
+        if text == "/skills":
+            with SessionLocal() as session:
+                items = session.scalars(
+                    select(ExtensionPackage).where(ExtensionPackage.kind == "skill")
+                ).all()
+                return "Skills：\n" + (
+                    "\n".join(
+                        f"- {item.name} ({'启用' if item.enabled else '停用'})：{item.description}"
+                        for item in items
+                    )
+                    or "暂无"
+                )
+        management_prefixes = (
+            "/skill install ",
+            "/skill enable ",
+            "/skill disable ",
+            "/skill remove ",
+        )
+        if text.startswith(management_prefixes):
+            if not is_owner(user_id) or external_id.startswith("group:"):
+                return "只有 Owner 私聊可以管理 Skill。"
+            operation, _, name_or_url = text.removeprefix("/skill ").partition(" ")
+            confirmation = create_extension_confirmation(
+                "skill", operation, name_or_url.strip(), user_id, None
+            )
+            return f"Skill 操作待确认：/confirm {confirmation.token}（十分钟内有效）"
+        tool_management_prefixes = (
+            "/tool install ",
+            "/tool enable ",
+            "/tool disable ",
+            "/tool remove ",
+        )
+        if text.startswith(tool_management_prefixes):
+            if not is_owner(user_id) or external_id.startswith("group:"):
+                return "只有 Owner 私聊可以管理 Tool。"
+            operation, _, name_or_url = text.removeprefix("/tool ").partition(" ")
+            confirmation = create_extension_confirmation(
+                "tool", operation, name_or_url.strip(), user_id, None
+            )
+            return f"Tool 操作待确认：/confirm {confirmation.token}（十分钟内有效）"
+        if text.startswith("/jm download "):
+            if external_id.startswith("group:"):
+                return "群聊禁止创建漫画下载任务。"
+            album_id = text.removeprefix("/jm download ").strip()
+            try:
+                job = create_manga_download_job(album_id, user_id, None)
+            except (PermissionError, ValueError) as error:
+                return str(error)
+            return (
+                f"已创建下载任务：{job.id}。下载成功后会自动发送文件；"
+                f"发送完成后可用 /jm delete {job.id} 删除本地产物。"
+            )
+        if text.startswith("/jm delete "):
+            if external_id.startswith("group:"):
+                return "群聊禁止删除漫画产物。"
+            job_id = text.removeprefix("/jm delete ").strip()
+            try:
+                result = delete_manga_artifact(job_id, user_id)
+            except (PermissionError, ValueError, OSError) as error:
+                return str(error)
+            return f"已删除漫画任务 {result['job_id']} 的本地产物，任务审计记录已保留。"
         if text.startswith("/jm "):
             results = await asyncio.wait_for(
                 asyncio.to_thread(manga_service.search, text.removeprefix("/jm ").strip()),
@@ -233,8 +393,12 @@ class OneBotManager:
         if text.startswith(("/confirm ", "/cancel ")):
             approve = text.startswith("/confirm ")
             token = text.split(maxsplit=1)[1].strip()
-            _confirmation, job = resolve_confirmation(token, user_id, approve)
-            return f"已创建下载任务：{job.id}" if job else "已取消该确认请求。"
+            confirmation, job = resolve_confirmation(token, user_id, approve)
+            if job:
+                return f"已创建下载任务：{job.id}"
+            if confirmation.action == "extension_manage" and confirmation.status == "approved":
+                return "已执行扩展管理操作。"
+            return "已取消该确认请求。"
         return None
 
     async def notify_job(self, job: Job) -> None:
@@ -250,12 +414,39 @@ class OneBotManager:
             return
         limit = settings.qq_upload_limit_mb * 1024 * 1024
         if path.stat().st_size > limit:
+            update_job_result(
+                job.id,
+                {
+                    "delivery_status": "skipped_oversize",
+                    "delivery_error": "文件超过 QQ 上传阈值",
+                },
+            )
             await self.send_text(job.requester_id, f"任务完成，文件超过上传阈值：{path.resolve()}")
             return
         try:
             await self.send_private_file(job.requester_id, path)
+            update_job_result(
+                job.id,
+                {
+                    "delivery_status": "sent",
+                    "delivered_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    "delivery_error": None,
+                },
+            )
+            await self.send_text(
+                job.requester_id,
+                f"文件已发送。确认收到后，如需清理本地文件请发送：/jm delete {job.id}",
+            )
         except Exception as error:
-            await self.send_text(job.requester_id, f"QQ 文件发送失败：{error}\n本地路径：{path.resolve()}")
+            error_text = f"{type(error).__name__}: {error}".rstrip()
+            update_job_result(
+                job.id,
+                {"delivery_status": "failed", "delivery_error": error_text},
+            )
+            await self.send_text(
+                job.requester_id,
+                f"QQ 文件发送失败：{error_text}\n本地路径：{path.resolve()}",
+            )
 
 
 onebot_manager = OneBotManager()

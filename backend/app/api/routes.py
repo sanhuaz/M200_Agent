@@ -4,10 +4,11 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select, text
@@ -15,15 +16,44 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.db.models import Chunk, Confirmation, Conversation, Document, Job, KnowledgeBase, Memory, Message
+from app.db.models import (
+    AdminIdentity,
+    Artifact,
+    Chunk,
+    Confirmation,
+    Conversation,
+    Document,
+    ExtensionPackage,
+    Job,
+    KnowledgeBase,
+    Memory,
+    Message,
+    Persona,
+    PersonaAssignment,
+    ToolRun,
+)
 from app.db.session import get_db
 from app.services.chat import chat_service
-from app.services.confirmations import resolve_confirmation
+from app.services.confirmations import resolve_confirmation, utc_isoformat
 from app.services.documents import SUPPORTED_SUFFIXES
 from app.services.embeddings import get_embedding_provider
-from app.services.jobs import create_job, job_worker
+from app.services.extensions import (
+    ExtensionError,
+    import_github,
+    import_zip,
+    list_packages,
+    package_dict,
+)
+from app.services.jobs import (
+    create_job,
+    create_manga_download_job,
+    delete_manga_artifact,
+    job_worker,
+)
 from app.services.manga import manga_service
 from app.services.models import model_registry
+from app.services.personas import assignment_dict, compile_persona, persona_dict
+from app.services.runtime import admin_dict
 from app.services.vector_store import safe_collection_name, vector_store
 
 router = APIRouter()
@@ -71,6 +101,47 @@ class MangaDownloadRequest(BaseModel):
 class ConfirmationResolve(BaseModel):
     requester_id: str = "local-owner"
     approve: bool = True
+
+
+class ExtensionGithubImport(BaseModel):
+    url: str = Field(min_length=1, max_length=500)
+
+
+class ExtensionState(BaseModel):
+    enabled: bool
+    access_policy: str | None = None
+
+
+class PersonaCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    raw_prompt: str = Field(min_length=1, max_length=8_000)
+
+
+class PersonaUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    raw_prompt: str | None = Field(default=None, min_length=1, max_length=8_000)
+
+
+class PersonaAssignmentRequest(BaseModel):
+    persona_id: str
+
+
+class AdminCreate(BaseModel):
+    external_id: str = Field(pattern=r"^\d{5,20}$")
+    display_name: str | None = Field(default=None, max_length=160)
+
+
+class MemoryCreate(BaseModel):
+    fact_key: str = Field(min_length=1, max_length=200)
+    content: str = Field(min_length=1, max_length=5_000)
+    scope_type: str = "global"
+    user_id: str | None = None
+
+
+def require_loopback(request: Request) -> None:
+    host = request.client.host if request.client else ""
+    if host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
+        raise HTTPException(403, "本机管理接口只允许回环地址访问")
 
 
 def conversation_dict(item: Conversation) -> dict[str, object]:
@@ -332,6 +403,29 @@ def list_documents(
     ]
 
 
+@router.post("/documents/{document_id}/reindex")
+def reindex_document(document_id: str, session: Session = Depends(get_db)) -> dict[str, object]:
+    item = session.get(Document, document_id)
+    if item is None:
+        raise HTTPException(404, "文档不存在")
+    if item.status in {"queued", "indexing"}:
+        raise HTTPException(409, "文档已在索引队列中")
+
+    previous_status = item.status
+    previous_error = item.error
+    item.status = "queued"
+    item.error = None
+    session.commit()
+    try:
+        job = create_job("document_index", {"document_id": item.id})
+    except Exception:
+        item.status = previous_status
+        item.error = previous_error
+        session.commit()
+        raise
+    return {"document_id": item.id, "status": item.status, "task_id": job.id}
+
+
 @router.delete("/documents/{document_id}")
 def delete_document(document_id: str, session: Session = Depends(get_db)) -> dict[str, bool]:
     item = session.get(Document, document_id)
@@ -358,14 +452,30 @@ def delete_document(document_id: str, session: Session = Depends(get_db)) -> dic
 
 @router.get("/memories")
 def list_memories(
-    user_id: str = "local-owner", status: str | None = None, session: Session = Depends(get_db)
+    scope: str = "all",
+    user_id: str | None = None,
+    status: str | None = None,
+    keyword: str | None = None,
+    session: Session = Depends(get_db),
 ) -> list[dict[str, object]]:
-    query = select(Memory).where(Memory.user_id == user_id).order_by(Memory.last_seen_at.desc())
+    query = select(Memory).order_by(Memory.last_seen_at.desc())
+    if scope == "global":
+        query = query.where(Memory.scope_type == "global", Memory.user_id.is_(None))
+    elif scope == "user":
+        query = query.where(Memory.scope_type == "user")
+        if user_id:
+            query = query.where(Memory.user_id == user_id)
+    elif user_id:
+        query = query.where(Memory.user_id == user_id)
     if status:
         query = query.where(Memory.status == status)
+    if keyword:
+        query = query.where(Memory.content.contains(keyword))
     return [
         {
             "id": item.id,
+            "scope_type": item.scope_type,
+            "user_id": item.user_id,
             "fact_key": item.fact_key,
             "content": item.content,
             "status": item.status,
@@ -373,11 +483,39 @@ def list_memories(
             "created_at": item.created_at.isoformat(),
             "last_seen_at": item.last_seen_at.isoformat(),
         }
-        for item in session.scalars(query)
-    ]
+    for item in session.scalars(query)
+]
 
 
-@router.put("/memories/{memory_id}")
+@router.post("/memories", dependencies=[Depends(require_loopback)])
+def create_memory(payload: MemoryCreate, session: Session = Depends(get_db)) -> dict[str, object]:
+    if payload.scope_type not in {"global", "user"}:
+        raise HTTPException(400, "scope_type 只能是 global 或 user")
+    if payload.scope_type == "global" and payload.user_id is not None:
+        raise HTTPException(400, "全局记忆不能绑定 user_id")
+    if payload.scope_type == "user" and not payload.user_id:
+        raise HTTPException(400, "用户记忆必须提供 user_id")
+    from app.services.memories import MemoryService
+
+    try:
+        item = (
+            MemoryService(session).upsert_global(payload.fact_key, payload.content)
+            if payload.scope_type == "global"
+            else MemoryService(session).upsert(payload.user_id or "", payload.fact_key, payload.content)
+        )
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    return {
+        "id": item.id,
+        "scope_type": item.scope_type,
+        "user_id": item.user_id,
+        "fact_key": item.fact_key,
+        "content": item.content,
+        "status": item.status,
+    }
+
+
+@router.put("/memories/{memory_id}", dependencies=[Depends(require_loopback)])
 def update_memory(
     memory_id: str, payload: MemoryUpdate, session: Session = Depends(get_db)
 ) -> dict[str, object]:
@@ -388,36 +526,57 @@ def update_memory(
     profile = settings.default_embedding_profile
     provider = get_embedding_provider(profile)
     vector_store.upsert_documents(
-        safe_collection_name("memory", item.user_id, profile),
+        safe_collection_name("memory", item.user_id or "global", profile),
         [item.id],
         [item.content],
         provider.embed_documents([item.content]),
-        [{"user_id": item.user_id, "fact_key": item.fact_key}],
+        [{"user_id": item.user_id or "", "scope_type": item.scope_type, "fact_key": item.fact_key}],
     )
     session.commit()
     return {"id": item.id, "content": item.content, "status": item.status}
 
 
-@router.post("/memories/{memory_id}/archive")
+@router.post("/memories/{memory_id}/archive", dependencies=[Depends(require_loopback)])
 def archive_memory(memory_id: str, session: Session = Depends(get_db)) -> dict[str, object]:
     item = session.get(Memory, memory_id)
     if item is None:
         raise HTTPException(404, "记忆不存在")
     item.status = "archived"
+    profile = settings.default_embedding_profile
+    vector_store.delete_ids(safe_collection_name("memory", item.user_id or "global", profile), [item.id])
     session.commit()
     return {"id": item.id, "status": item.status}
 
 
-@router.delete("/memories/{memory_id}")
+@router.delete("/memories/{memory_id}", dependencies=[Depends(require_loopback)])
 def delete_memory(memory_id: str, session: Session = Depends(get_db)) -> dict[str, bool]:
     item = session.get(Memory, memory_id)
     if item is None:
         raise HTTPException(404, "记忆不存在")
     profile = settings.default_embedding_profile
-    vector_store.delete_ids(safe_collection_name("memory", item.user_id, profile), [item.id])
+    vector_store.delete_ids(safe_collection_name("memory", item.user_id or "global", profile), [item.id])
     session.delete(item)
     session.commit()
     return {"deleted": True}
+
+
+@router.post("/memories/{memory_id}/restore", dependencies=[Depends(require_loopback)])
+def restore_memory(memory_id: str, session: Session = Depends(get_db)) -> dict[str, object]:
+    item = session.get(Memory, memory_id)
+    if item is None:
+        raise HTTPException(404, "记忆不存在")
+    item.status = "active"
+    profile = settings.default_embedding_profile
+    provider = get_embedding_provider(profile)
+    vector_store.upsert_documents(
+        safe_collection_name("memory", item.user_id or "global", profile),
+        [item.id],
+        [item.content],
+        provider.embed_documents([item.content]),
+        [{"user_id": item.user_id or "", "scope_type": item.scope_type, "fact_key": item.fact_key}],
+    )
+    session.commit()
+    return {"id": item.id, "status": item.status}
 
 
 @router.post("/manga/search")
@@ -433,13 +592,20 @@ async def search_manga(payload: MangaSearchRequest) -> dict[str, object]:
 
 @router.post("/manga/download")
 def request_manga_download(payload: MangaDownloadRequest) -> dict[str, object]:
-    from app.services.confirmations import create_download_confirmation
-
     try:
-        item = create_download_confirmation(payload.album_id, payload.requester_id, payload.conversation_id)
+        job = create_manga_download_job(
+            payload.album_id,
+            payload.requester_id,
+            payload.conversation_id,
+        )
     except PermissionError as error:
         raise HTTPException(403, str(error)) from error
-    return {"token": item.token, "status": item.status, "expires_at": item.expires_at.isoformat()}
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    return {
+        "task": job_dict(job),
+        "message": "任务已创建，无需二次确认。",
+    }
 
 
 @router.post("/confirmations/{token}")
@@ -450,7 +616,13 @@ def confirm(token: str, payload: ConfirmationResolve) -> dict[str, object]:
         raise HTTPException(403, str(error)) from error
     except ValueError as error:
         raise HTTPException(400, str(error)) from error
-    return {"confirmation_status": item.status, "task": job_dict(job) if job else None}
+    payload_data = json.loads(item.payload)
+    return {
+        "confirmation_status": item.status,
+        "task": job_dict(job) if job else None,
+        "result": payload_data.get("result"),
+        "error": payload_data.get("error"),
+    }
 
 
 @router.get("/confirmations")
@@ -467,7 +639,7 @@ def list_confirmations(
             "action": item.action,
             "payload": json.loads(item.payload),
             "status": item.status,
-            "expires_at": item.expires_at.isoformat(),
+            "expires_at": utc_isoformat(item.expires_at),
         }
         for item in items
     ]
@@ -501,3 +673,371 @@ def download_artifact(job_id: str, session: Session = Depends(get_db)) -> FileRe
     if settings.download_path.resolve() not in path.parents or not path.is_file():
         raise HTTPException(404, "任务产物路径无效")
     return FileResponse(path, filename=path.name)
+
+
+@router.delete("/tasks/{job_id}/artifact", dependencies=[Depends(require_loopback)])
+def delete_task_artifact(job_id: str) -> dict[str, object]:
+    try:
+        return delete_manga_artifact(job_id, "local-owner")
+    except PermissionError as error:
+        raise HTTPException(403, str(error)) from error
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+
+
+def _extension_response(item: ExtensionPackage) -> dict[str, object]:
+    return package_dict(item)
+
+
+@router.get("/tools")
+def list_tools(session: Session = Depends(get_db)) -> list[dict[str, object]]:
+    result: list[dict[str, object]] = []
+    for item in list_packages(session, "tool"):
+        row = _extension_response(item)
+        row["recent_runs"] = [
+            {
+                "id": run.id,
+                "conversation_id": run.conversation_id,
+                "status": run.status,
+                "created_at": run.created_at.isoformat(),
+            }
+            for run in session.scalars(
+                select(ToolRun)
+                .where(ToolRun.tool_name == item.name)
+                .order_by(ToolRun.created_at.desc())
+                .limit(10)
+            )
+        ]
+        result.append(row)
+    return result
+
+
+@router.post("/tools/import", dependencies=[Depends(require_loopback)])
+async def import_tool(file: UploadFile = File(...), session: Session = Depends(get_db)) -> dict[str, object]:
+    content = await file.read(20 * 1024 * 1024 + 1)
+    if len(content) > 20 * 1024 * 1024:
+        raise HTTPException(413, "Tool 包不能超过 20 MiB")
+    try:
+        item = import_zip(session, "tool", content, Path(file.filename or "tool.zip").name)
+    except (ExtensionError, ValueError) as error:
+        raise HTTPException(400, str(error)) from error
+    return _extension_response(item)
+
+
+@router.post("/tools/import/github", dependencies=[Depends(require_loopback)])
+def import_tool_github(
+    payload: ExtensionGithubImport, session: Session = Depends(get_db)
+) -> dict[str, object]:
+    try:
+        item = import_github(session, "tool", payload.url)
+    except Exception as error:
+        raise HTTPException(400, f"GitHub Tool 导入失败: {type(error).__name__}: {error}") from error
+    return _extension_response(item)
+
+
+@router.get("/skills")
+def list_skills(session: Session = Depends(get_db)) -> list[dict[str, object]]:
+    return [_extension_response(item) for item in list_packages(session, "skill")]
+
+
+@router.post("/skills/import", dependencies=[Depends(require_loopback)])
+async def import_skill(file: UploadFile = File(...), session: Session = Depends(get_db)) -> dict[str, object]:
+    content = await file.read(20 * 1024 * 1024 + 1)
+    if len(content) > 20 * 1024 * 1024:
+        raise HTTPException(413, "Skill 包不能超过 20 MiB")
+    try:
+        item = import_zip(session, "skill", content, Path(file.filename or "skill.zip").name)
+    except (ExtensionError, ValueError) as error:
+        raise HTTPException(400, str(error)) from error
+    return _extension_response(item)
+
+
+@router.post("/skills/import/github", dependencies=[Depends(require_loopback)])
+def import_skill_github(
+    payload: ExtensionGithubImport, session: Session = Depends(get_db)
+) -> dict[str, object]:
+    try:
+        item = import_github(session, "skill", payload.url)
+    except Exception as error:
+        raise HTTPException(400, f"GitHub Skill 导入失败: {type(error).__name__}: {error}") from error
+    return _extension_response(item)
+
+
+def _set_extension_state(
+    kind: str, name: str, payload: ExtensionState, session: Session
+) -> dict[str, object]:
+    item = session.scalar(
+        select(ExtensionPackage).where(
+            ExtensionPackage.kind == kind, ExtensionPackage.name == name
+        )
+    )
+    if item is None:
+        raise HTTPException(404, "扩展不存在")
+    if payload.access_policy is not None:
+        if payload.access_policy not in {"owner_only", "private_users"}:
+            raise HTTPException(400, "access_policy 只能是 owner_only 或 private_users")
+        item.access_policy = payload.access_policy
+    item.enabled = payload.enabled
+    item.status = "ready" if payload.enabled else "installed_disabled"
+    item.error = None
+    session.commit()
+    session.refresh(item)
+    return _extension_response(item)
+
+
+@router.get("/tools/{name}")
+def get_tool(name: str, session: Session = Depends(get_db)) -> dict[str, object]:
+    item = session.scalar(
+        select(ExtensionPackage).where(
+            ExtensionPackage.kind == "tool", ExtensionPackage.name == name
+        )
+    )
+    if item is None:
+        raise HTTPException(404, "Tool 不存在")
+    return _extension_response(item)
+
+
+@router.post("/tools/{name}/enable", dependencies=[Depends(require_loopback)])
+def enable_tool(name: str, session: Session = Depends(get_db)) -> dict[str, object]:
+    return _set_extension_state("tool", name, ExtensionState(enabled=True), session)
+
+
+@router.post("/tools/{name}/disable", dependencies=[Depends(require_loopback)])
+def disable_tool(name: str, session: Session = Depends(get_db)) -> dict[str, object]:
+    return _set_extension_state("tool", name, ExtensionState(enabled=False), session)
+
+
+@router.delete("/tools/{name}", dependencies=[Depends(require_loopback)])
+def delete_tool(name: str, session: Session = Depends(get_db)) -> dict[str, bool]:
+    return _delete_extension("tool", name, session)
+
+
+@router.post("/skills/{name}/enable", dependencies=[Depends(require_loopback)])
+def enable_skill(name: str, session: Session = Depends(get_db)) -> dict[str, object]:
+    return _set_extension_state("skill", name, ExtensionState(enabled=True), session)
+
+
+@router.get("/skills/{name}")
+def get_skill(name: str, session: Session = Depends(get_db)) -> dict[str, object]:
+    item = session.scalar(
+        select(ExtensionPackage).where(
+            ExtensionPackage.kind == "skill", ExtensionPackage.name == name
+        )
+    )
+    if item is None:
+        raise HTTPException(404, "Skill 不存在")
+    return _extension_response(item)
+
+
+@router.post("/skills/{name}/disable", dependencies=[Depends(require_loopback)])
+def disable_skill(name: str, session: Session = Depends(get_db)) -> dict[str, object]:
+    return _set_extension_state("skill", name, ExtensionState(enabled=False), session)
+
+
+@router.delete("/skills/{name}", dependencies=[Depends(require_loopback)])
+def delete_skill(name: str, session: Session = Depends(get_db)) -> dict[str, bool]:
+    return _delete_extension("skill", name, session)
+
+
+def _delete_extension(kind: str, name: str, session: Session) -> dict[str, bool]:
+    item = session.scalar(
+        select(ExtensionPackage).where(
+            ExtensionPackage.kind == kind, ExtensionPackage.name == name
+        )
+    )
+    if item is None:
+        raise HTTPException(404, "扩展不存在")
+    if item.builtin:
+        raise HTTPException(400, "内置扩展不能删除")
+    install_path = Path(item.install_path).resolve()
+    root = (settings.tools_path if kind == "tool" else settings.skills_path).resolve()
+    if install_path != root and root not in install_path.parents:
+        raise HTTPException(400, "扩展路径无效")
+    session.delete(item)
+    session.commit()
+    if install_path.is_dir():
+        shutil.rmtree(install_path, ignore_errors=True)
+    return {"deleted": True}
+
+
+@router.get("/personas")
+def list_personas(session: Session = Depends(get_db)) -> list[dict[str, object]]:
+    return [persona_dict(item) for item in session.scalars(select(Persona).order_by(Persona.name))]
+
+
+@router.post("/personas", dependencies=[Depends(require_loopback)])
+def create_persona(payload: PersonaCreate, session: Session = Depends(get_db)) -> dict[str, object]:
+    item = Persona(name=payload.name, raw_prompt=payload.raw_prompt)
+    session.add(item)
+    try:
+        session.commit()
+    except IntegrityError as error:
+        session.rollback()
+        raise HTTPException(409, "人格名称已存在") from error
+    session.refresh(item)
+    return persona_dict(item)
+
+
+@router.put("/personas/{persona_id}", dependencies=[Depends(require_loopback)])
+def update_persona(
+    persona_id: str, payload: PersonaUpdate, session: Session = Depends(get_db)
+) -> dict[str, object]:
+    item = session.get(Persona, persona_id)
+    if item is None:
+        raise HTTPException(404, "人格不存在")
+    if payload.name is not None:
+        item.name = payload.name
+    if payload.raw_prompt is not None:
+        item.raw_prompt = payload.raw_prompt
+    item.status = "draft"
+    item.compiled_style = None
+    item.error = None
+    try:
+        session.commit()
+    except IntegrityError as error:
+        session.rollback()
+        raise HTTPException(409, "人格名称已存在") from error
+    session.refresh(item)
+    return persona_dict(item)
+
+
+@router.post("/personas/{persona_id}/compile", dependencies=[Depends(require_loopback)])
+def compile_persona_route(
+    persona_id: str, model_alias: str = "default", session: Session = Depends(get_db)
+) -> dict[str, object]:
+    item = session.get(Persona, persona_id)
+    if item is None:
+        raise HTTPException(404, "人格不存在")
+    result = compile_persona(session, item, model_alias)
+    return persona_dict(result)
+
+
+@router.delete("/personas/{persona_id}", dependencies=[Depends(require_loopback)])
+def delete_persona(persona_id: str, session: Session = Depends(get_db)) -> dict[str, bool]:
+    item = session.get(Persona, persona_id)
+    if item is None:
+        raise HTTPException(404, "人格不存在")
+    session.delete(item)
+    session.commit()
+    return {"deleted": True}
+
+
+def _assign_persona(
+    scope_type: str, user_id: str | None, persona_id: str, session: Session
+) -> dict[str, object]:
+    if scope_type not in {"global", "user"}:
+        raise HTTPException(400, "scope_type 只能是 global 或 user")
+    if scope_type == "user" and not user_id:
+        raise HTTPException(400, "用户人格必须提供 user_id")
+    persona = session.get(Persona, persona_id)
+    if persona is None or persona.status != "valid":
+        raise HTTPException(400, "只能启用已通过编译的人格")
+    session.query(PersonaAssignment).filter(
+        PersonaAssignment.scope_type == scope_type,
+        PersonaAssignment.user_id == user_id,
+    ).delete(synchronize_session=False)
+    item = PersonaAssignment(scope_type=scope_type, user_id=user_id, persona_id=persona_id)
+    session.add(item)
+    session.commit()
+    session.refresh(item)
+    return assignment_dict(item)
+
+
+@router.get("/personas/assignments")
+def list_persona_assignments(session: Session = Depends(get_db)) -> list[dict[str, object]]:
+    return [assignment_dict(item) for item in session.scalars(select(PersonaAssignment))]
+
+
+@router.put("/personas/assignments/global", dependencies=[Depends(require_loopback)])
+def assign_global_persona(
+    payload: PersonaAssignmentRequest, session: Session = Depends(get_db)
+) -> dict[str, object]:
+    return _assign_persona("global", None, payload.persona_id, session)
+
+
+@router.put("/personas/assignments/users/{user_id}", dependencies=[Depends(require_loopback)])
+def assign_user_persona(
+    user_id: str, payload: PersonaAssignmentRequest, session: Session = Depends(get_db)
+) -> dict[str, object]:
+    return _assign_persona("user", user_id, payload.persona_id, session)
+
+
+@router.get("/admins")
+def list_admins(session: Session = Depends(get_db)) -> list[dict[str, object]]:
+    rows = [{"id": "local-owner", "platform": "local", "external_id": "local-owner", "enabled": True}]
+    rows.extend(
+        admin_dict(item)
+        for item in session.scalars(select(AdminIdentity).order_by(AdminIdentity.external_id))
+    )
+    return rows
+
+
+@router.get("/identities")
+def list_identities(session: Session = Depends(get_db)) -> list[dict[str, object]]:
+    return list_admins(session)
+
+
+@router.post("/admins", dependencies=[Depends(require_loopback)])
+def create_admin(payload: AdminCreate, session: Session = Depends(get_db)) -> dict[str, object]:
+    if payload.external_id == "local-owner":
+        raise HTTPException(400, "local-owner 已永久存在")
+    item = AdminIdentity(
+        platform="qq",
+        external_id=payload.external_id,
+        display_name=payload.display_name,
+        created_by="local-owner",
+        enabled=True,
+    )
+    session.add(item)
+    try:
+        session.commit()
+    except IntegrityError as error:
+        session.rollback()
+        raise HTTPException(409, "该 QQ 已经是 Owner") from error
+    session.refresh(item)
+    return admin_dict(item)
+
+
+@router.delete("/admins/{external_id}", dependencies=[Depends(require_loopback)])
+def delete_admin(external_id: str, session: Session = Depends(get_db)) -> dict[str, bool]:
+    if external_id == "local-owner":
+        raise HTTPException(400, "local-owner 不可删除")
+    item = session.scalar(select(AdminIdentity).where(AdminIdentity.external_id == external_id))
+    if item is None:
+        raise HTTPException(404, "Owner 不存在")
+    session.delete(item)
+    session.commit()
+    return {"deleted": True}
+
+
+@router.get("/artifacts")
+def list_artifacts(
+    owner_id: str | None = None, session: Session = Depends(get_db)
+) -> list[dict[str, object]]:
+    query = select(Artifact).order_by(Artifact.created_at.desc())
+    if owner_id:
+        query = query.where(Artifact.owner_id == owner_id)
+    return [
+        {
+            "id": item.id,
+            "owner_id": item.owner_id,
+            "conversation_id": item.conversation_id,
+            "filename": item.filename,
+            "size": item.size,
+            "sha256": item.sha256,
+            "created_at": item.created_at.isoformat(),
+        }
+        for item in session.scalars(query)
+    ]
+
+
+@router.get("/artifacts/{artifact_id}/download")
+def download_generated_artifact(artifact_id: str, session: Session = Depends(get_db)) -> FileResponse:
+    item = session.get(Artifact, artifact_id)
+    if item is None:
+        raise HTTPException(404, "产物不存在")
+    path = Path(item.path).resolve()
+    root = (settings.workspace_path / "generated").resolve()
+    if root not in path.parents or not path.is_file():
+        raise HTTPException(404, "产物路径无效")
+    return FileResponse(path, filename=item.filename, media_type=item.content_type)

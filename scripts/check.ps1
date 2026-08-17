@@ -1,25 +1,25 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $PythonExe = $env:PERSONAL_AGENT_PYTHON
 
-if (-not $PythonExe -and $env:CONDA_PREFIX) {
-    $candidate = Join-Path $env:CONDA_PREFIX "python.exe"
-    if (Test-Path -LiteralPath $candidate) { $PythonExe = $candidate }
-}
 if (-not $PythonExe) {
-    $command = Get-Command python -ErrorAction SilentlyContinue
-    if ($command) { $PythonExe = $command.Source }
+    $fixed = "D:\miniconda\envs\langchain1.2\python.exe"
+    if (Test-Path -LiteralPath $fixed) { $PythonExe = $fixed }
 }
 if (-not $PythonExe -or -not (Test-Path -LiteralPath $PythonExe)) {
     throw "未找到 Python。请设置 PERSONAL_AGENT_PYTHON 为 Python 3.13 解释器绝对路径。"
 }
 $PythonExe = (Resolve-Path -LiteralPath $PythonExe).Path
+$interpreter = (& $PythonExe -c "import sys; print(sys.executable)").Trim()
+if ((Resolve-Path -LiteralPath $interpreter).Path -ne $PythonExe) {
+    throw "Python 解释器不匹配，必须使用 D:\miniconda\envs\langchain1.2\python.exe"
+}
 
 & $PythonExe -m pip check
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & $PythonExe -m compileall -q (Join-Path $ProjectRoot "backend")
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-& $PythonExe -m ruff check (Join-Path $ProjectRoot "backend")
+& $PythonExe -m ruff check (Join-Path $ProjectRoot "backend") (Join-Path $ProjectRoot "scripts")
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & $PythonExe -m pyright --pythonpath $PythonExe (Join-Path $ProjectRoot "backend\app")
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
