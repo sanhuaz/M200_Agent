@@ -17,7 +17,9 @@ class ModelProfile(BaseModel):
     model: str
     base_url: str
     api_key_env: str
-    context_window: int = 32_768
+    context_window: int = 1_000_000
+    input_soft_limit: int = 131_072
+    max_output_tokens: int = 16_384
     timeout_seconds: float = 120.0
 
 
@@ -40,7 +42,8 @@ class Settings(BaseSettings):
 
     model_profiles_json: str = (
         '[{"alias":"default","model":"unconfigured","base_url":"https://api.example.com/v1",'
-        '"api_key_env":"PERSONAL_AGENT_LLM_API_KEY","context_window":32768,'
+        '"api_key_env":"PERSONAL_AGENT_LLM_API_KEY","context_window":1000000,'
+        '"input_soft_limit":131072,"max_output_tokens":16384,'
         '"timeout_seconds":120}]'
     )
     default_embedding_profile: str = "local-bge"

@@ -13,7 +13,16 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from app.core.config import get_settings
-from app.db.models import Artifact, Conversation, ExtensionPackage, Job, KnowledgeBase, Memory, ProcessedEvent
+from app.db.models import (
+    Artifact,
+    Conversation,
+    ExtensionPackage,
+    Job,
+    KnowledgeBase,
+    Memory,
+    Persona,
+    ProcessedEvent,
+)
 from app.db.session import SessionLocal
 from app.services.chat import chat_service
 from app.services.confirmations import (
@@ -21,6 +30,7 @@ from app.services.confirmations import (
     is_owner,
     resolve_confirmation,
 )
+from app.services.context import estimate_text_tokens, load_pending_messages, pending_message_count
 from app.services.jobs import (
     create_manga_download_job,
     delete_manga_artifact,
@@ -255,11 +265,114 @@ class OneBotManager:
     async def _command(self, text: str, user_id: str, external_id: str) -> str | None:
         if text == "/help":
             return (
-                "命令：/model list、/model use <alias>、/kb、/memory、"
+                "命令：/new、/reset-context、/context、/model list、/model use <alias>、/kb、/memory、"
+                "/persona、/persona list、/persona use <名称或ID>、/persona off、"
                 "/memory delete <id>、/tools、/skills、/skill <name> <请求>、"
                 "/jm <关键词>、/jm download <漫画ID>、/jm delete <任务ID>、"
                 "/confirm <token>、/cancel <token>"
             )
+        if text in {"/new", "/reset-context"}:
+            if external_id.startswith("group:") and not is_owner(user_id):
+                return "只有 Owner 可以轮换群聊上下文。"
+            with SessionLocal.begin() as session:
+                conversation = session.scalar(
+                    select(Conversation).where(
+                        Conversation.platform == "qq", Conversation.external_id == external_id
+                    )
+                )
+                if conversation is None:
+                    conversation = Conversation(
+                        platform="qq",
+                        external_id=external_id,
+                        conversation_type="group" if external_id.startswith("group:") else "private",
+                        title=f"QQ {external_id}",
+                        owner_id=user_id,
+                    )
+                    session.add(conversation)
+                    return "已创建新的 QQ 会话，长期记忆保持不变。"
+                conversation.external_id = f"archive:{conversation.id}"
+                conversation.title = f"{conversation.title}（已归档）"
+                new_conversation = Conversation(
+                    platform="qq",
+                    external_id=external_id,
+                    conversation_type=conversation.conversation_type,
+                    title=f"QQ {external_id}",
+                    model_alias=conversation.model_alias,
+                    persona_id=conversation.persona_id,
+                    owner_id=user_id,
+                )
+                session.add(new_conversation)
+            return "已开启新的 QQ 会话，旧消息已归档，长期记忆保持不变。"
+        if text == "/context":
+            with SessionLocal() as session:
+                conversation = session.scalar(
+                    select(Conversation).where(
+                        Conversation.platform == "qq", Conversation.external_id == external_id
+                    )
+                )
+                if conversation is None:
+                    return "当前还没有 QQ 会话。"
+                pending = load_pending_messages(session, conversation)
+                history_text = "\n".join(f"{item.role}: {item.content}" for item in pending)
+                history_tokens = estimate_text_tokens(history_text)
+                summary_tokens = estimate_text_tokens(conversation.summary or "")
+                profile = model_registry.profile(conversation.model_alias)
+                return (
+                    f"当前会话：{conversation.id}\n"
+                    f"待摘要消息：{pending_message_count(session, conversation)} 条\n"
+                    f"历史摘要：{'已生成' if conversation.summary else '无'}（约 {summary_tokens} Token）\n"
+                    f"近期历史估算：约 {history_tokens} Token\n"
+                    f"输入软上限：{profile.input_soft_limit} Token\n"
+                    f"上下文硬上限：{profile.context_window} Token\n"
+                    "长期记忆不会因会话轮换而删除。"
+                )
+        if text in {"/persona", "/persona list"}:
+            with SessionLocal() as session:
+                conversation = session.scalar(
+                    select(Conversation).where(
+                        Conversation.platform == "qq", Conversation.external_id == external_id
+                    )
+                )
+                current_id = conversation.persona_id if conversation else None
+                personas = list(session.scalars(select(Persona).order_by(Persona.name)))
+                lines = [f"当前人格：{current_id or '关闭'}"]
+                lines.extend(f"- {item.name} ({item.id})" for item in personas)
+                return "可用人格：\n" + ("\n".join(lines) if personas else "暂无已保存人格")
+        if text == "/persona off" or text.startswith("/persona use "):
+            if external_id.startswith("group:") and not is_owner(user_id):
+                return "只有 Owner 可以切换群聊人格。"
+            requested = None if text == "/persona off" else text.removeprefix("/persona use ").strip()
+            if text != "/persona off" and not requested:
+                return "用法：/persona use <人格名称或ID>，或 /persona off。"
+            with SessionLocal.begin() as session:
+                persona = None
+                if requested is not None:
+                    persona = session.scalar(
+                        select(Persona).where((Persona.id == requested) | (Persona.name == requested))
+                    )
+                    if persona is None:
+                        return "找不到该人格，请先使用 /persona list 查看。"
+                conversation = session.scalar(
+                    select(Conversation).where(
+                        Conversation.platform == "qq", Conversation.external_id == external_id
+                    )
+                )
+                if conversation is None:
+                    conversation = Conversation(
+                        platform="qq",
+                        external_id=external_id,
+                        conversation_type="group" if external_id.startswith("group:") else "private",
+                        title=f"QQ {external_id}",
+                        owner_id=user_id,
+                    )
+                    session.add(conversation)
+                    session.flush()
+                if requested is not None:
+                    assert persona is not None
+                    conversation.persona_id = persona.id
+                    return f"当前 QQ 会话已启用人格：{persona.name}。"
+                conversation.persona_id = None
+                return "当前 QQ 会话已关闭人格。"
         if text == "/model list":
             return "可用模型：\n" + "\n".join(
                 f"- {item['alias']} ({'已配置' if item['configured'] else '未配置'})"
@@ -292,10 +405,14 @@ class OneBotManager:
                 items = session.scalars(select(KnowledgeBase).order_by(KnowledgeBase.name)).all()
                 return "知识库：\n" + ("\n".join(f"- {item.name}: {item.id}" for item in items) or "暂无")
         if text == "/memory":
+            scope_type = "group" if external_id.startswith("group:") else "user"
+            scope_id = external_id if scope_type == "group" else user_id
             with SessionLocal() as session:
                 items = session.scalars(
                     select(Memory).where(
-                        Memory.scope_type == "user", Memory.user_id == user_id, Memory.status == "active"
+                        Memory.scope_type == scope_type,
+                        Memory.user_id == scope_id,
+                        Memory.status == "active",
                     )
                 ).all()
                 return "当前记忆：\n" + (
@@ -303,9 +420,13 @@ class OneBotManager:
                 )
         if text.startswith("/memory delete "):
             memory_id = text.removeprefix("/memory delete ").strip()
+            scope_type = "group" if external_id.startswith("group:") else "user"
+            scope_id = external_id if scope_type == "group" else user_id
+            if scope_type == "group" and not is_owner(user_id):
+                return "只有 Owner 可以删除群聊记忆。"
             with SessionLocal.begin() as session:
                 item = session.get(Memory, memory_id)
-                if item is None or item.scope_type != "user" or item.user_id != user_id:
+                if item is None or item.scope_type != scope_type or item.user_id != scope_id:
                     return "找不到属于你的这条记忆。"
                 item.status = "archived"
             return "已删除指定记忆。"

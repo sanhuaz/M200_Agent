@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { API, api, streamChat } from './services/api'
 
-type Conversation = { id: string; title: string; model_alias: string }
+type Conversation = { id: string; title: string; model_alias: string; persona_id?: string | null }
 type ModelProfile = { alias: string; model: string; configured: boolean }
 type Message = { id?: string; role: string; content: string }
 type KnowledgeBase = { id: string; name: string; embedding_profile: string }
@@ -12,7 +12,7 @@ type MemoryRow = { id: string; fact_key: string; content: string; status: string
 type TaskRow = { id: string; type: string; status: string; error?: string; result?: { path?: string; delivery_status?: string; artifact_deleted?: boolean } }
 type Confirmation = { token: string; action: string; payload: Record<string, unknown>; expires_at: string }
 type ExtensionRow = { id: string; kind: string; name: string; version: string; description: string; enabled: boolean; builtin: boolean; status: string; access_policy: string; error?: string }
-type PersonaRow = { id: string; name: string; raw_prompt: string; compiled_style?: Record<string, unknown> | null; status: string; error?: string }
+type PersonaRow = { id: string; name: string; raw_prompt: string; created_at?: string; updated_at?: string }
 type AdminRow = { id: string; external_id: string; display_name?: string; platform: string; enabled: boolean }
 
 const activeTab = ref('chat')
@@ -49,6 +49,9 @@ const memoryScope = ref('all')
 const memoryUserId = ref('')
 const memoryStatus = ref('active')
 const currentConversation = computed(() => conversations.value.find((item) => item.id === currentConversationId.value))
+const hasIndexingDocuments = computed(() => documents.value.some((item) => ['queued', 'indexing'].includes(item.status)))
+const DOCUMENT_REFRESH_INTERVAL_MS = 1000
+let documentRefreshTimer: number | undefined
 const routePaths: Record<string, string> = {
   chat: '/chat', knowledge: '/knowledge', tools: '/tools', skills: '/skills',
   personas: '/personas', memory: '/memories', admin: '/admin', tasks: '/tasks', status: '/status',
@@ -68,16 +71,18 @@ function changeTab(tab: string | number) {
 }
 
 async function loadBase() {
-  const [healthData, modelData, conversationData, knowledgeData] = await Promise.all([
+  const [healthData, modelData, conversationData, knowledgeData, personaData] = await Promise.all([
     api<Record<string, unknown>>('/health'),
     api<ModelProfile[]>('/models'),
     api<Conversation[]>('/conversations'),
     api<KnowledgeBase[]>('/knowledge-bases'),
+    api<PersonaRow[]>('/personas'),
   ])
   health.value = healthData
   models.value = modelData
   conversations.value = conversationData
   knowledgeBases.value = knowledgeData
+  personas.value = personaData
   if (!currentConversationId.value && conversations.value.length) {
     currentConversationId.value = conversations.value[0].id
     await loadMessages()
@@ -107,6 +112,16 @@ async function switchModel(alias: string) {
   })
   await loadBase()
   ElMessage.success(`已切换为 ${alias}`)
+}
+
+async function switchPersona(personaId: string | null) {
+  if (!currentConversationId.value) return
+  await api(`/conversations/${currentConversationId.value}/persona`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ persona_id: personaId }),
+  })
+  await loadBase()
+  ElMessage.success(personaId ? '已切换人格' : '已关闭人格')
 }
 
 async function send() {
@@ -151,7 +166,32 @@ async function upload() {
 }
 
 async function loadDocuments() {
-  documents.value = await api(`/documents${selectedKb.value ? `?knowledge_base_id=${selectedKb.value}` : ''}`)
+  const knowledgeBaseId = selectedKb.value
+  const data = await api<DocumentRow[]>(`/documents${knowledgeBaseId ? `?knowledge_base_id=${knowledgeBaseId}` : ''}`)
+  if (knowledgeBaseId !== selectedKb.value) return
+  documents.value = data
+  scheduleDocumentRefresh()
+}
+
+function stopDocumentRefresh() {
+  if (documentRefreshTimer !== undefined) window.clearTimeout(documentRefreshTimer)
+  documentRefreshTimer = undefined
+}
+
+function scheduleDocumentRefresh() {
+  if (!hasIndexingDocuments.value) {
+    stopDocumentRefresh()
+    return
+  }
+  if (documentRefreshTimer !== undefined) return
+  documentRefreshTimer = window.setTimeout(async () => {
+    documentRefreshTimer = undefined
+    try {
+      await loadDocuments()
+    } catch (error) {
+      ElMessage.error(`索引状态刷新失败：${(error as Error).message}`)
+    }
+  }, DOCUMENT_REFRESH_INTERVAL_MS)
 }
 
 async function loadMemoryTasks() {
@@ -216,14 +256,11 @@ function editPersona(item: PersonaRow) {
   editingPersonaId.value = item.id; personaName.value = item.name; personaPrompt.value = item.raw_prompt
 }
 
-async function compilePersona(item: PersonaRow) {
-  await api(`/personas/${item.id}/compile`, { method: 'POST' })
-  await loadManagement(); ElMessage.success('人格编译完成')
-}
-
-async function assignGlobalPersona(item: PersonaRow) {
-  await api('/personas/assignments/global', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ persona_id: item.id }) })
-  ElMessage.success(`已启用全局人格：${item.name}`)
+async function deletePersona(item: PersonaRow) {
+  if (!window.confirm(`确定删除人格“${item.name}”？使用它的会话会自动关闭人格。`)) return
+  await api(`/personas/${item.id}`, { method: 'DELETE' })
+  await loadBase()
+  ElMessage.success(`已删除人格：${item.name}`)
 }
 
 async function addAdmin() {
@@ -335,6 +372,11 @@ onMounted(async () => {
   try { await loadBase(); await loadDocuments(); await loadMemoryTasks(); await loadManagement() }
   catch (error) { ElMessage.error((error as Error).message) }
 })
+
+onUnmounted(() => {
+  window.removeEventListener('popstate', syncRoute)
+  stopDocumentRefresh()
+})
 </script>
 
 <template>
@@ -355,9 +397,15 @@ onMounted(async () => {
           <main class="panel chat-panel">
             <div class="toolbar">
               <span>{{ currentConversation?.title || '未选择会话' }}</span>
-              <el-select :model-value="currentConversation?.model_alias" placeholder="模型" @change="switchModel">
-                <el-option v-for="model in models" :key="model.alias" :label="`${model.alias}${model.configured ? '' : '（未配置）'}`" :value="model.alias" />
-              </el-select>
+              <div class="row">
+                <el-select :model-value="currentConversation?.model_alias" placeholder="模型" @change="switchModel">
+                  <el-option v-for="model in models" :key="model.alias" :label="`${model.alias}${model.configured ? '' : '（未配置）'}`" :value="model.alias" />
+                </el-select>
+                <el-select :model-value="currentConversation?.persona_id || null" placeholder="人格" @change="switchPersona">
+                  <el-option label="关闭人格" :value="null" />
+                  <el-option v-for="item in personas" :key="item.id" :label="item.name" :value="item.id" />
+                </el-select>
+              </div>
             </div>
             <div class="messages">
               <article v-for="(message, index) in messages" :key="message.id || index" :class="['message', message.role]">
@@ -387,7 +435,8 @@ onMounted(async () => {
             <el-button :disabled="!selectedKb" @click="rebuildKb">按所选 Embedding 重建</el-button>
             <el-button type="danger" plain :disabled="!selectedKb" @click="deleteKb">删除知识库</el-button>
           </div>
-          <el-table :data="documents"><el-table-column prop="filename" label="文件" /><el-table-column prop="status" label="状态" /><el-table-column prop="error" label="错误" /><el-table-column label="操作" width="190"><template #default="scope"><el-button size="small" :loading="reindexingDocumentIds.includes(scope.row.id)" :disabled="['queued', 'indexing'].includes(scope.row.status)" @click="reindexDocument(scope.row.id)">重新索引</el-button><el-button size="small" type="danger" plain @click="deleteDocument(scope.row.id)">删除</el-button></template></el-table-column></el-table>
+          <el-tag v-if="hasIndexingDocuments" type="warning" effect="plain">索引状态自动刷新中</el-tag>
+          <el-table :data="documents"><el-table-column prop="filename" label="文件" /><el-table-column label="状态"><template #default="scope"><el-tag :type="scope.row.status === 'ready' ? 'success' : scope.row.status === 'failed' ? 'danger' : 'warning'">{{ scope.row.status }}</el-tag></template></el-table-column><el-table-column prop="error" label="错误" /><el-table-column label="操作" width="190"><template #default="scope"><el-button size="small" :loading="reindexingDocumentIds.includes(scope.row.id)" :disabled="['queued', 'indexing'].includes(scope.row.status)" @click="reindexDocument(scope.row.id)">重新索引</el-button><el-button size="small" type="danger" plain @click="deleteDocument(scope.row.id)">删除</el-button></template></el-table-column></el-table>
         </section>
       </el-tab-pane>
 
@@ -410,7 +459,7 @@ onMounted(async () => {
       </el-tab-pane>
 
       <el-tab-pane label="人格" name="personas">
-        <div class="two-column"><section class="panel stack"><h2>{{ editingPersonaId ? '编辑人格' : '新建人格' }}</h2><el-input v-model="personaName" placeholder="人格名称" /><el-input v-model="personaPrompt" type="textarea" :rows="8" maxlength="8000" show-word-limit placeholder="只描述语气、称呼、详细程度、词汇和格式；不能修改权限、工具或系统规则" /><div class="row"><el-button type="primary" @click="savePersona">保存</el-button><el-button @click="personaName = ''; personaPrompt = ''; editingPersonaId = ''">清空</el-button></div></section><section class="panel stack"><h2>已保存人格</h2><div v-for="item in personas" :key="item.id" class="result"><span><strong>{{ item.name }}</strong> · {{ item.status }}<small>{{ item.error || '' }}</small></span><div><el-button size="small" @click="editPersona(item)">编辑</el-button><el-button size="small" @click="compilePersona(item)">编译</el-button><el-button size="small" type="primary" :disabled="item.status !== 'valid'" @click="assignGlobalPersona(item)">启用全局</el-button></div></div></section></div>
+        <div class="two-column"><section class="panel stack"><h2>{{ editingPersonaId ? '编辑人格' : '新建人格' }}</h2><el-input v-model="personaName" placeholder="人格名称" /><el-input v-model="personaPrompt" type="textarea" :rows="8" maxlength="8000" show-word-limit placeholder="描述角色身份、语气、称呼、详细程度和格式；不能修改权限、工具或系统规则" /><div class="row"><el-button type="primary" @click="savePersona">保存</el-button><el-button @click="personaName = ''; personaPrompt = ''; editingPersonaId = ''">清空</el-button></div></section><section class="panel stack"><h2>已保存人格</h2><div v-for="item in personas" :key="item.id" class="result"><strong>{{ item.name }}</strong><div><el-button size="small" @click="editPersona(item)">编辑</el-button><el-button size="small" type="danger" plain @click="deletePersona(item)">删除</el-button></div></div></section></div>
       </el-tab-pane>
 
       <el-tab-pane label="管理员" name="admin">

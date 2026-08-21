@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.session import Base
@@ -26,8 +26,12 @@ class Conversation(Base):
     conversation_type: Mapped[str] = mapped_column(String(20), default="private")
     title: Mapped[str] = mapped_column(String(200), default="新会话")
     model_alias: Mapped[str] = mapped_column(String(80), default="default")
+    persona_id: Mapped[str | None] = mapped_column(
+        ForeignKey("personas.id", ondelete="SET NULL"), nullable=True
+    )
     owner_id: Mapped[str] = mapped_column(String(120), default="local-owner")
     summary: Mapped[str] = mapped_column(Text, default="")
+    summary_up_to_message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
     messages: Mapped[list[Message]] = relationship(
@@ -48,6 +52,7 @@ class Message(Base):
     platform_message_id: Mapped[str | None] = mapped_column(String(160), nullable=True, unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     conversation: Mapped[Conversation] = relationship(back_populates="messages")
+    __table_args__ = (Index("ix_messages_conversation_created_at", "conversation_id", "created_at"),)
 
 
 class KnowledgeBase(Base):
@@ -174,22 +179,8 @@ class Persona(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     name: Mapped[str] = mapped_column(String(120), unique=True)
     raw_prompt: Mapped[str] = mapped_column(Text, default="")
-    compiled_style: Mapped[str | None] = mapped_column(Text, nullable=True)
-    status: Mapped[str] = mapped_column(String(20), default="draft")
-    error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
-
-
-class PersonaAssignment(Base):
-    __tablename__ = "persona_assignments"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    scope_type: Mapped[str] = mapped_column(String(20))
-    user_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
-    persona_id: Mapped[str] = mapped_column(ForeignKey("personas.id", ondelete="CASCADE"))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
-    __table_args__ = (UniqueConstraint("scope_type", "user_id", name="uq_persona_assignment_scope"),)
 
 
 class AdminIdentity(Base):

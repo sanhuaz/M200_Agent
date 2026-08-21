@@ -67,7 +67,6 @@ def verify_schema() -> None:
         "processed_events",
         "extension_packages",
         "personas",
-        "persona_assignments",
         "admin_identities",
         "artifacts",
         "app_settings",

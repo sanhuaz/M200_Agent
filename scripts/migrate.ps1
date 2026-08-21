@@ -43,7 +43,7 @@ if ($state -eq "legacy") {
 if ($state -eq "versioned") {
     $version = & $PythonExe -c "import sqlite3; c=sqlite3.connect(r'$databaseLiteral'); print(c.execute('select version_num from alembic_version').fetchone()[0]); c.close()"
     if ($LASTEXITCODE -ne 0) { throw "无法读取当前迁移版本" }
-    if ($version -ne "0002_v020") {
+    if ($version -ne "0005_conversation_persona_fk") {
         $backupRoot = Backup-RuntimeData "migration"
         Write-Host "迁移前已备份运行数据：$backupRoot"
     }

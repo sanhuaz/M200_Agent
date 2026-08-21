@@ -37,6 +37,7 @@ class ModelRegistry:
             api_key=SecretStr(api_key),
             base_url=profile.base_url,
             timeout=profile.timeout_seconds,
+            extra_body={"max_tokens": profile.max_output_tokens},
             streaming=True,
         )
 

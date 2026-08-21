@@ -29,7 +29,6 @@ from app.db.models import (
     Memory,
     Message,
     Persona,
-    PersonaAssignment,
     ToolRun,
 )
 from app.db.session import get_db
@@ -52,7 +51,7 @@ from app.services.jobs import (
 )
 from app.services.manga import manga_service
 from app.services.models import model_registry
-from app.services.personas import assignment_dict, compile_persona, persona_dict
+from app.services.personas import persona_dict, validate_persona_prompt
 from app.services.runtime import admin_dict
 from app.services.vector_store import safe_collection_name, vector_store
 
@@ -67,6 +66,10 @@ class ConversationCreate(BaseModel):
 
 class ModelSwitch(BaseModel):
     model_alias: str
+
+
+class PersonaSwitch(BaseModel):
+    persona_id: str | None = None
 
 
 class ChatRequest(BaseModel):
@@ -122,10 +125,6 @@ class PersonaUpdate(BaseModel):
     raw_prompt: str | None = Field(default=None, min_length=1, max_length=8_000)
 
 
-class PersonaAssignmentRequest(BaseModel):
-    persona_id: str
-
-
 class AdminCreate(BaseModel):
     external_id: str = Field(pattern=r"^\d{5,20}$")
     display_name: str | None = Field(default=None, max_length=160)
@@ -152,6 +151,7 @@ def conversation_dict(item: Conversation) -> dict[str, object]:
         "conversation_type": item.conversation_type,
         "title": item.title,
         "model_alias": item.model_alias,
+        "persona_id": item.persona_id,
         "owner_id": item.owner_id,
         "summary": item.summary,
         "created_at": item.created_at.isoformat(),
@@ -261,6 +261,21 @@ def switch_model(
         raise HTTPException(404, "会话不存在")
     conversation.model_alias = payload.model_alias
     session.commit()
+    return conversation_dict(conversation)
+
+
+@router.put("/conversations/{conversation_id}/persona")
+def switch_persona(
+    conversation_id: str, payload: PersonaSwitch, session: Session = Depends(get_db)
+) -> dict[str, object]:
+    conversation = session.get(Conversation, conversation_id)
+    if conversation is None:
+        raise HTTPException(404, "会话不存在")
+    if payload.persona_id is not None and session.get(Persona, payload.persona_id) is None:
+        raise HTTPException(404, "人格不存在")
+    conversation.persona_id = payload.persona_id
+    session.commit()
+    session.refresh(conversation)
     return conversation_dict(conversation)
 
 
@@ -867,6 +882,10 @@ def list_personas(session: Session = Depends(get_db)) -> list[dict[str, object]]
 
 @router.post("/personas", dependencies=[Depends(require_loopback)])
 def create_persona(payload: PersonaCreate, session: Session = Depends(get_db)) -> dict[str, object]:
+    try:
+        validate_persona_prompt(payload.raw_prompt)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
     item = Persona(name=payload.name, raw_prompt=payload.raw_prompt)
     session.add(item)
     try:
@@ -888,10 +907,11 @@ def update_persona(
     if payload.name is not None:
         item.name = payload.name
     if payload.raw_prompt is not None:
+        try:
+            validate_persona_prompt(payload.raw_prompt)
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
         item.raw_prompt = payload.raw_prompt
-    item.status = "draft"
-    item.compiled_style = None
-    item.error = None
     try:
         session.commit()
     except IntegrityError as error:
@@ -901,65 +921,17 @@ def update_persona(
     return persona_dict(item)
 
 
-@router.post("/personas/{persona_id}/compile", dependencies=[Depends(require_loopback)])
-def compile_persona_route(
-    persona_id: str, model_alias: str = "default", session: Session = Depends(get_db)
-) -> dict[str, object]:
-    item = session.get(Persona, persona_id)
-    if item is None:
-        raise HTTPException(404, "人格不存在")
-    result = compile_persona(session, item, model_alias)
-    return persona_dict(result)
-
-
 @router.delete("/personas/{persona_id}", dependencies=[Depends(require_loopback)])
 def delete_persona(persona_id: str, session: Session = Depends(get_db)) -> dict[str, bool]:
     item = session.get(Persona, persona_id)
     if item is None:
         raise HTTPException(404, "人格不存在")
+    session.query(Conversation).filter(Conversation.persona_id == persona_id).update(
+        {Conversation.persona_id: None}, synchronize_session=False
+    )
     session.delete(item)
     session.commit()
     return {"deleted": True}
-
-
-def _assign_persona(
-    scope_type: str, user_id: str | None, persona_id: str, session: Session
-) -> dict[str, object]:
-    if scope_type not in {"global", "user"}:
-        raise HTTPException(400, "scope_type 只能是 global 或 user")
-    if scope_type == "user" and not user_id:
-        raise HTTPException(400, "用户人格必须提供 user_id")
-    persona = session.get(Persona, persona_id)
-    if persona is None or persona.status != "valid":
-        raise HTTPException(400, "只能启用已通过编译的人格")
-    session.query(PersonaAssignment).filter(
-        PersonaAssignment.scope_type == scope_type,
-        PersonaAssignment.user_id == user_id,
-    ).delete(synchronize_session=False)
-    item = PersonaAssignment(scope_type=scope_type, user_id=user_id, persona_id=persona_id)
-    session.add(item)
-    session.commit()
-    session.refresh(item)
-    return assignment_dict(item)
-
-
-@router.get("/personas/assignments")
-def list_persona_assignments(session: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return [assignment_dict(item) for item in session.scalars(select(PersonaAssignment))]
-
-
-@router.put("/personas/assignments/global", dependencies=[Depends(require_loopback)])
-def assign_global_persona(
-    payload: PersonaAssignmentRequest, session: Session = Depends(get_db)
-) -> dict[str, object]:
-    return _assign_persona("global", None, payload.persona_id, session)
-
-
-@router.put("/personas/assignments/users/{user_id}", dependencies=[Depends(require_loopback)])
-def assign_user_persona(
-    user_id: str, payload: PersonaAssignmentRequest, session: Session = Depends(get_db)
-) -> dict[str, object]:
-    return _assign_persona("user", user_id, payload.persona_id, session)
 
 
 @router.get("/admins")

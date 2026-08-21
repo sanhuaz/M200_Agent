@@ -3,16 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from collections.abc import AsyncGenerator
 
-from langchain_core.messages import (
-    AIMessage,
-    AIMessageChunk,
-    AnyMessage,
-    HumanMessage,
-    SystemMessage,
-    ToolMessage,
-)
+from langchain_core.messages import AIMessageChunk, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import MessagesState
 from sqlalchemy import select
@@ -20,9 +14,22 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Conversation, KnowledgeBase, Message, ToolRun
 from app.db.session import SessionLocal
+from app.services.context import (
+    SUMMARY_INPUT_TOKENS,
+    SUMMARY_KEEP_MESSAGES,
+    SUMMARY_MAX_TOKENS,
+    ContextOverflowError,
+    build_context_messages,
+    choose_summary_batch,
+    clip_text,
+    load_pending_messages,
+    pending_message_count,
+    pending_prefix,
+    should_compact,
+)
 from app.services.memories import MemoryService
 from app.services.models import model_registry
-from app.services.personas import active_style, style_system_prompt
+from app.services.personas import active_persona, persona_system_prompt
 from app.workflows.agent import build_agent_graph, final_ai_message, skill_descriptions
 
 logger = logging.getLogger(__name__)
@@ -69,6 +76,14 @@ def normalize_tool_result(content: object) -> dict[str, object]:
 
 
 class ChatService:
+    def __init__(self) -> None:
+        self._summary_locks: dict[str, threading.Lock] = {}
+        self._summary_locks_guard = threading.Lock()
+
+    def _summary_lock(self, conversation_id: str) -> threading.Lock:
+        with self._summary_locks_guard:
+            return self._summary_locks.setdefault(conversation_id, threading.Lock())
+
     async def stream(
         self,
         session: Session,
@@ -90,38 +105,49 @@ class ChatService:
         session.commit()
         session.refresh(user_message)
 
-        recent = list(
-            session.scalars(
-                select(Message)
-                .where(Message.conversation_id == conversation.id)
-                .order_by(Message.created_at.desc())
-                .limit(17)
-            )
-        )
-        recent.reverse()
+        profile = model_registry.profile(conversation.model_alias)
+        recent = load_pending_messages(session, conversation)
+        memory_scope_type = "group" if is_group else "user"
+        memory_scope_id = conversation.external_id if is_group else sender_id
         try:
-            memories = await asyncio.to_thread(MemoryService(session).recall, sender_id, text)
+            memories = await asyncio.to_thread(
+                MemoryService(session).recall,
+                sender_id,
+                text,
+                5,
+                scope_type=memory_scope_type,
+                scope_id=memory_scope_id,
+            )
         except Exception as error:
             logger.warning("长期记忆召回降级: %s", error)
             memories = []
-        memory_text = "\n".join(f"- {item.content}" for item in memories) or "- 无"
-        knowledge_bases = list(session.scalars(select(KnowledgeBase).order_by(KnowledgeBase.name)))
-        knowledge_text = (
-            "\n".join(f"- {item.name}: {item.id}" for item in knowledge_bases) or "- 无"
+        memory_text = clip_text(
+            "\n".join(f"- {item.content}" for item in memories) or "- 无",
+            4_096,
         )
-        skills_text = skill_descriptions(session)
-        persona_text = style_system_prompt(active_style(session, sender_id))
+        knowledge_bases = list(session.scalars(select(KnowledgeBase).order_by(KnowledgeBase.name)))
+        knowledge_text = clip_text(
+            "\n".join(f"- {item.name}: {item.id}" for item in knowledge_bases) or "- 无",
+            4_096,
+        )
+        skills_text = clip_text(skill_descriptions(session), 4_096)
+        persona_text = clip_text(
+            persona_system_prompt(active_persona(session, conversation.persona_id)),
+            8_192,
+        )
         system = (
             f"{SYSTEM_PROMPT}\n\n当前用户画像和长期记忆：\n{memory_text}"
             f"\n\n可用知识库：\n{knowledge_text}"
             f"\n\n可按需加载的 Skill（只提供名称和描述）：\n{skills_text}"
-            f"\n\n历史摘要：\n{conversation.summary or '无'}"
+            f"\n\n历史摘要：\n{clip_text(conversation.summary or '无', SUMMARY_MAX_TOKENS)}"
             f"\n\n{persona_text}"
         )
-        messages: list[AnyMessage] = [SystemMessage(system)]
-        messages.extend(
-            HumanMessage(item.content) if item.role == "user" else AIMessage(item.content) for item in recent
-        )
+        try:
+            snapshot = build_context_messages(system, recent, profile)
+        except ContextOverflowError as error:
+            yield {"event": "error", "data": {"message": str(error)}}
+            return
+        messages = snapshot.messages
         emitted = ""
         started_tools: set[str] = set()
         try:
@@ -203,6 +229,7 @@ class ChatService:
                     text,
                     user_message.id,
                     conversation.model_alias,
+                    is_group,
                 )
             )
         except Exception as error:
@@ -216,38 +243,80 @@ class ChatService:
         user_text: str,
         message_id: str,
         model_alias: str,
+        is_group: bool,
     ) -> None:
         with SessionLocal() as session:
-            try:
-                MemoryService(session).extract_from_turn(sender_id, user_text, message_id, model_alias)
-            except Exception as error:
-                logger.warning("自动记忆提取失败: %s", error)
-            messages = list(
-                session.scalars(
-                    select(Message)
-                    .where(Message.conversation_id == conversation_id)
-                    .order_by(Message.created_at)
-                )
-            )
-            if len(messages) <= 18:
-                return
             conversation = session.get(Conversation, conversation_id)
             if conversation is None:
                 return
+            context_rows = load_pending_messages(session, conversation, limit=8)
+            turn_context = "\n".join(f"{item.role}: {item.content}" for item in context_rows[:-1])
+            memory_scope_type = "group" if is_group else "user"
+            memory_scope_id = conversation.external_id if is_group else sender_id
             try:
-                model = model_registry.chat_model(model_alias)
-                summary_source = "\n".join(f"{item.role}: {item.content}" for item in messages[:-8])
-                response = model.invoke(
-                    [
-                        ("system", "将以下历史对话压缩为准确、简短的中文摘要，不添加新事实。"),
-                        ("human", summary_source),
-                    ]
+                MemoryService(session).extract_from_turn(
+                    sender_id,
+                    user_text,
+                    message_id,
+                    model_alias,
+                    scope_type=memory_scope_type,
+                    scope_id=memory_scope_id,
+                    context=turn_context,
                 )
-                if isinstance(response.content, str):
-                    conversation.summary = response.content
-                    session.commit()
             except Exception as error:
-                logger.warning("历史摘要失败: %s", error)
+                session.rollback()
+                logger.warning("自动记忆提取失败: %s", error)
+            with self._summary_lock(conversation_id):
+                self._compact_conversation(session, conversation, model_alias)
+
+    def _compact_conversation(
+        self,
+        session: Session,
+        conversation: Conversation,
+        model_alias: str,
+    ) -> None:
+        pending = pending_prefix(session, conversation)
+        if not should_compact(session, conversation, pending=pending):
+            return
+        pending_count = pending_message_count(session, conversation)
+        if pending_count <= SUMMARY_KEEP_MESSAGES:
+            return
+        candidate_rows = pending[: min(len(pending), pending_count - SUMMARY_KEEP_MESSAGES)]
+        existing_summary = clip_text(conversation.summary or "", SUMMARY_MAX_TOKENS)
+        batch = choose_summary_batch(
+            candidate_rows,
+            existing_summary,
+            max_tokens=SUMMARY_INPUT_TOKENS,
+        )
+        if not batch:
+            return
+        new_material = "\n".join(f"{item.role}: {item.content}" for item in batch)
+        summary_source = (
+            f"已有摘要：\n{existing_summary or '无'}\n\n新增历史：\n{new_material}"
+        )
+        try:
+            model = model_registry.chat_model(model_alias).bind(
+                extra_body={"max_tokens": SUMMARY_MAX_TOKENS}
+            )
+            response = model.invoke(
+                [
+                    (
+                        "system",
+                        (
+                            "将已有摘要和新增历史合并为准确、简短的中文摘要。"
+                            "保留用户明确事实、未完成任务和重要决定，不添加新事实。"
+                        ),
+                    ),
+                    ("human", summary_source),
+                ]
+            )
+            if isinstance(response.content, str) and response.content.strip():
+                conversation.summary = clip_text(response.content.strip(), SUMMARY_MAX_TOKENS)
+                conversation.summary_up_to_message_id = batch[-1].id
+                session.commit()
+        except Exception as error:
+            session.rollback()
+            logger.warning("增量历史摘要失败: %s", error)
 
 
 chat_service = ChatService()

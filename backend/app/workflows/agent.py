@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import threading
+from dataclasses import dataclass, field
 
 import aiosqlite
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, MessagesState, StateGraph
@@ -14,6 +16,11 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.db.models import KnowledgeBase
 from app.services.artifacts import ArtifactError, artifact_envelope, create_artifact
+from app.services.context import (
+    TOOL_RESULT_MAX_CHARS,
+    TOOL_RESULT_TOTAL_CHARS,
+    limit_tool_content,
+)
 from app.services.extensions import (
     ExtensionError,
     ToolContext,
@@ -32,6 +39,38 @@ from app.services.runtime import is_owner
 
 _checkpoint_connection: aiosqlite.Connection | None = None
 _checkpointer: AsyncSqliteSaver | None = None
+MAX_KNOWLEDGE_SEARCHES_PER_TURN = 4
+
+
+@dataclass
+class KnowledgeSearchGuard:
+    max_unique_searches: int = MAX_KNOWLEDGE_SEARCHES_PER_TURN
+    _seen: set[tuple[str, str]] = field(default_factory=set)
+    _force_final: bool = False
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    @staticmethod
+    def _key(query: str, knowledge_base_id: str) -> tuple[str, str]:
+        return (" ".join(query.casefold().split()), knowledge_base_id)
+
+    def reserve(self, query: str, knowledge_base_id: str) -> str:
+        with self._lock:
+            key = self._key(query, knowledge_base_id)
+            if key in self._seen:
+                self._force_final = True
+                return "duplicate"
+            if len(self._seen) >= self.max_unique_searches:
+                self._force_final = True
+                return "limit"
+            self._seen.add(key)
+            if len(self._seen) >= self.max_unique_searches:
+                self._force_final = True
+            return "allowed"
+
+    @property
+    def force_final(self) -> bool:
+        with self._lock:
+            return self._force_final
 
 
 def tool_envelope(
@@ -40,7 +79,7 @@ def tool_envelope(
     pending_confirmation: bool = False,
     artifact_ids: list[str] | None = None,
 ) -> str:
-    return json.dumps(
+    payload = json.dumps(
         {
             "kind": "tool_result",
             "data": data,
@@ -49,6 +88,7 @@ def tool_envelope(
         },
         ensure_ascii=False,
     )
+    return limit_tool_content(payload, TOOL_RESULT_MAX_CHARS)
 
 
 async def initialize_checkpointer() -> None:
@@ -92,15 +132,33 @@ def build_agent_graph(
         workspace_path=settings.workspace_path,
         is_owner=owner,
     )
+    knowledge_search_guard = KnowledgeSearchGuard()
 
     @tool
     def search_knowledge(query: str, knowledge_base_id: str = "") -> str:
-        """在个人知识库中检索证据。knowledge_base_id 可从系统提供的清单选择；留空使用首个知识库。"""
+        """在个人知识库中检索证据。每轮最多四个不同查询；重复查询会停止继续检索。"""
         if not knowledge_base_id:
             first = session.scalar(select(KnowledgeBase).order_by(KnowledgeBase.created_at))
             if first is None:
                 return tool_envelope({"evidence": [], "message": "尚未创建知识库"})
             knowledge_base_id = first.id
+        decision = knowledge_search_guard.reserve(query, knowledge_base_id)
+        if decision == "duplicate":
+            return tool_envelope(
+                {
+                    "evidence": [],
+                    "duplicate": True,
+                    "message": "相同查询和知识库已检索过，请使用已有证据直接回答。",
+                }
+            )
+        if decision == "limit":
+            return tool_envelope(
+                {
+                    "evidence": [],
+                    "limit_reached": True,
+                    "message": "本轮知识检索已达到上限，请使用已有证据直接回答。",
+                }
+            )
         retriever = HybridRetriever(session)
         hits = retriever.search(knowledge_base_id, query)
         return tool_envelope(
@@ -214,15 +272,60 @@ def build_agent_graph(
     if "create-files" in enabled_builtins:
         tools.append(create_files)
     tools.extend(load_python_tools(session, context))
-    model = model_registry.chat_model(model_alias).bind_tools(tools)
+    base_model = model_registry.chat_model(model_alias)
+    model = base_model.bind_tools(tools)
+    tool_node = ToolNode(tools, handle_tool_errors=True)
 
     async def call_model(state: MessagesState) -> dict[str, list[BaseMessage]]:
-        response = await model.ainvoke(state["messages"])
+        messages = state["messages"]
+        if knowledge_search_guard.force_final:
+            messages = [
+                *messages,
+                SystemMessage(
+                    content=(
+                        "知识库检索已经完成或停止。请仅依据已有工具证据立即给出最终回答，"
+                        "不要再调用任何工具；证据不足时明确说明。"
+                    )
+                ),
+            ]
+            response = await base_model.ainvoke(messages)
+        else:
+            response = await model.ainvoke(messages)
         return {"messages": [response]}
+
+    async def call_tools(state: MessagesState) -> dict[str, list[BaseMessage]]:
+        result = await tool_node.ainvoke(state)
+        output = result.get("messages", [])
+        if not isinstance(output, list):
+            return {"messages": []}
+        used = sum(
+            len(str(item.content))
+            for item in state.get("messages", [])
+            if isinstance(item, ToolMessage)
+        )
+        sanitized: list[BaseMessage] = []
+        for item in output:
+            if not isinstance(item, ToolMessage):
+                sanitized.append(item)
+                continue
+            available = TOOL_RESULT_TOTAL_CHARS - used
+            if available <= 0:
+                content = json.dumps(
+                    {
+                        "kind": "tool_result",
+                        "data": {"truncated": True, "reason": "本轮工具上下文预算已用尽"},
+                    },
+                    ensure_ascii=False,
+                )
+            else:
+                content = limit_tool_content(item.content, min(TOOL_RESULT_MAX_CHARS, available))
+            sanitized.append(item.model_copy(update={"content": content}))
+            used += len(content)
+        return {"messages": sanitized}
 
     builder = StateGraph(MessagesState)
     builder.add_node("agent", call_model)
-    builder.add_node("tools", ToolNode(tools, handle_tool_errors=True))
+    builder.add_node("tools", call_tools)
     builder.add_edge(START, "agent")
     builder.add_conditional_edges("agent", tools_condition, {"tools": "tools", END: END})
     builder.add_edge("tools", "agent")

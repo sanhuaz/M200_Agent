@@ -1,21 +1,72 @@
-# M200 Agent v0.2.0
+# M200 Agent v0.3.0
 
 M200 Agent 是一个面向个人、本机单用户场景的 AI Agent 原型。它以 FastAPI、LangGraph 和
 Vue 3 为核心，提供 Web 对话、三层记忆、文档混合检索、NapCat/OneBot v11 QQ 接入，以及
 仅 Owner 可创建的 JMComic 持久下载任务。
 
-这是面向个人本机使用的 V0.2 版本，不是生产级多用户系统。项目默认绑定本机回环地址，不包含
+这是面向个人本机使用的 v0.3 版本，不是生产级多用户系统。项目默认绑定本机回环地址，不包含
 Docker、Redis、Celery、完整 RBAC、OCR、语音/视觉模型、生产日志平台或云部署配置。
 
 ## 当前发布
 
-- 当前版本：`v0.2.0`
+- 当前版本：`v0.3.0`
 - 仓库：<https://github.com/sanhuaz/M200_Agent>
-- v0.2 修改明细：[v0.2.0-修改概述.md](./v0.2.0-修改概述.md)
-- 项目交接说明：[项目交接文档.md](./项目交接文档.md)
+- v0.2 历史修改明细：[v0.2.0-修改概述.md](./v0.2.0-修改概述.md)
 
 v0.2 在 v0.1 的聊天、记忆、RAG、NapCat 和漫画任务基础上，补充了动态 Tools、Agent
 Skills、结构化人格、管理员管理、用户级记忆隔离、文件产物以及漫画发送后的显式清理流程。
+
+## v0.3.0 更新内容
+
+v0.3 面向长期运行的个人 Agent 场景，重点完善上下文管理、记忆隔离、知识库索引体验和多知识库
+LangGraph 链路评测。
+
+### 长上下文与会话记忆
+
+- 按 DeepSeek V4 Flash 配置 1,000,000 Token 硬上限；日常输入软上限 131,072 Token，单轮输出上限
+  16,384 Token。
+- 新增统一上下文预算构建器，按当前问题、系统约束、近期消息、历史摘要、长期记忆和低优先级扩展
+  逐级装配，不再固定只取最近若干条消息。
+- 工具结果增加单次和单轮总量限制；RAG 证据按完整 Chunk 裁剪并保留来源信息。
+- 新增增量会话摘要：历史达到约 64K Token 或 40 条消息时触发，始终保留最近 12 条原文；摘要失败
+  不移动边界，也不删除历史。
+- 长期记忆按全局、QQ 用户和 QQ 群组分域隔离；私聊个人记忆不会注入群聊。
+- QQ 新增 `/new`、`/reset-context` 和 `/context` 命令，支持归档短期会话、查看上下文用量和摘要状态。
+- 人格保存后直接保留原始提示词；Web 与 QQ 会话可独立选择人格或关闭人格，不再调用 LLM 编译，也不保留全局人格分配。
+
+### 知识库与 LangGraph 链路
+
+- 知识库索引状态支持前端实时刷新，`queued`、处理中、成功和失败状态无需再次操作页面即可更新。
+- Web 对话框保留模型 `default` 下拉框，并新增独立的人格选择下拉框；人格切换只影响当前会话及后续消息。
+- QQ 新增 `/persona`、`/persona list`、`/persona use <名称或ID>` 和 `/persona off`；私聊用户可切换自己的会话，群聊仅 Owner 可切换共享人格。
+- LangGraph 知识检索增加停止与去重策略：相同“查询 + 知识库 ID”每轮只执行一次，每轮最多执行 4
+  次不同知识检索；重复或达到上限后强制模型基于已有证据生成最终回答。
+- 同一问题仍允许分别检索 `AI学习` 和 `ALLinRAG`，不会因为知识库名称不同而直接判错。
+- 新增 [LangGraph 多知识库评测器](./scripts/langgraph_rag_eval.py)，记录真实工具调用、知识库选择、
+  检索证据、最终回答、LLM Judge 评分和链路延迟。
+
+### 150 题真实评测结果
+
+评测题集包含高频题 60 道、长尾题 60 道和模糊题 30 道，实际运行完整 LangGraph 检索链路。判分以
+证据相关性和回答质量为准：`ALLinRAG` 与 `AI学习` 存在有效重合时，`ALLinRAG` 命中可以通过。
+
+- 完成：150/150；运行错误：0。
+- 检索相关性：3.793/4；检索充分性：3.793/4。
+- 回答正确性：3.813/4；回答忠实性：3.820/4；引用质量：2.940/4。
+- 端到端平均分：3.800/4；端到端通过率：94.67%。
+- 证据判定选路失败：8/150（5.33%）；明确判定为有效重合命中：7/150（4.67%）。
+- `ALLinRAG` 被检索：133/150 题；没有按知识库名称机械判错。
+- 新停止策略覆盖的 21 道题中，实际检索均值 3.143 次，最大 4 次。
+
+逐题 CSV、完整工具轨迹和 Judge 原始输出属于本地评测产物，不纳入公开仓库。
+
+### v0.3 验证与边界
+
+- 当前验证：40 项 Pytest 通过、Ruff 通过、后端 Pyright 0 错误。
+- 真实 DeepSeek V4 Flash 普通调用、流式调用、Tool Call 和 150 题 LangGraph 评测均已执行。
+- 150 题的 Judge 使用当前模型自评；停止策略完整覆盖的是异常复测题和后续新增题，之前已正常完成的题
+  保留原始基线结果，未全部重新运行。
+- 当前评测结果用于本机个人 Agent 的工程基线，不代表公网多用户服务或独立人工金标结果。
 
 ## 功能
 
@@ -32,7 +83,7 @@ Skills、结构化人格、管理员管理、用户级记忆隔离、文件产�
 - JMComic 搜索、Owner 直接下载、单 Worker、PDF 产物、QQ 私聊发送与显式清理。
 - 动态 Tool Registry：内置 Tool、审核后启用的 Python Tool、文件创建 Tool。
 - Agent Skills：`SKILL.md` 导入、启停、自动/手动加载；包内脚本只展示不执行。
-- 结构化人格编译、全局/用户人格分配、全局/QQ 用户记忆隔离和 Owner 管理。
+- 原始提示词人格管理；Web 与 QQ 会话可独立选择人格或关闭人格；长期记忆按全局、QQ 用户和群组隔离，并由 Owner 管理。
 - 文件产物隔离、SHA-256 记录、Web 下载及 QQ 私聊发送。
 - Vue 3 管理端：聊天、知识库、Tools、Skills、人格、长期记忆、管理员、任务和状态页面。
 
@@ -95,7 +146,7 @@ Copy-Item ".env.example" ".env"
 至少需要配置一个支持原生 Tool Calls 的 OpenAI 兼容模型：
 
 ```env
-MODEL_PROFILES_JSON=[{"alias":"default","model":"your-tool-capable-model","base_url":"https://provider.example/v1","api_key_env":"PERSONAL_AGENT_LLM_API_KEY","context_window":32768,"timeout_seconds":120}]
+MODEL_PROFILES_JSON=[{"alias":"default","model":"your-tool-capable-model","base_url":"https://provider.example/v1","api_key_env":"PERSONAL_AGENT_LLM_API_KEY","context_window":1000000,"input_soft_limit":131072,"max_output_tokens":16384,"timeout_seconds":120}]
 PERSONAL_AGENT_LLM_API_KEY=your-key
 ```
 
@@ -173,7 +224,8 @@ Token: 与 .env 中 ONEBOT_TOKEN 完全一致
 
 - 私聊默认响应。
 - 群聊仅响应 `@机器人` 或 `/ai` 前缀。
-- `/help`、`/model list`、`/kb`、`/memory`、`/jm` 可用于查询。
+- `/help`、`/new`、`/reset-context`、`/context`、`/model list`、`/kb`、`/memory`、`/jm` 可用于查询或管理会话。
+- 会话上下文采用增量摘要和 Token 预算；`/new` 只归档短期对话，不删除长期记忆。群聊共享群上下文，但不会召回成员私聊记忆。
 - `/tools`、`/skills`、`/skill <name> <request>` 可查看和手动触发已启用扩展。
 - `/model use`、漫画下载/删除和管理操作仅 Owner 可用。Tool/Skill 管理仍使用 `/confirm` 二次确认。
 - `/jm download <漫画ID>` 立即创建下载任务；QQ 发送成功后可用 `/jm delete <任务ID>` 删除本地产物。
@@ -205,12 +257,12 @@ Chroma 语义召回 20 条
 - 成功发送后，Owner 可通过 QQ 命令或 Web 任务页显式删除该任务的本地产物；任务审计记录保留。
 - 用户应确保对下载内容拥有合法保存权利。
 
-## v0.2 扩展边界
+## 扩展边界
 
 - Tool ZIP 必须包含 `tool.json` 和 `plugin.py:create_tools`，导入后默认停用，不自动安装依赖。
 - Skill ZIP 必须包含与目录同名的 `SKILL.md`；启动只读取名称/描述，完整内容按需加载。
-- 人格原文只用于编辑，运行时只使用通过模型编译和字段校验的 `PersonaStyle` JSON，不能修改
-  系统规则、工具、权限、密钥或文件根目录。
+- 人格原始提示词保存后直接用于选中会话；保存时执行长度和提示注入校验，运行时由系统规则包裹，不能修改
+  系统规则、工具、权限、记忆范围、密钥或文件根目录。
 - 文件只能写入 `workspace/generated/<user-id>/<artifact-id>/`，不自动执行；多文件自动 ZIP。
 - `local-owner` 永久存在不可删除，QQ Owner 由数据库实时管理；`.env` Owner 仅首次迁移导入。
 
@@ -233,7 +285,7 @@ Chroma 语义召回 20 条
 ## v0.2.0 验证范围
 
 本次发布前已通过 `scripts/check.ps1` 完整离线检查，包括依赖一致性、Python 编译、Ruff、Pyright、
-26 项 Pytest、Vue TypeScript 检查和 Vite 构建。开发过程中还分别联调过主模型 SSE、原生 Tool
+34 项 Pytest、Vue TypeScript 检查和 Vite 构建。开发过程中还分别联调过主模型 SSE、原生 Tool
 Calls、在线 Embedding、本地 BGE、FTS5/向量混合检索、在线 Reranker、长期记忆、JMComic 下载、
 NapCat WebSocket、QQ 回复和文件发送。第三方服务会受账号、网络、接口和上游版本影响，发布结果不
 代表这些外部链路在其他机器或未来始终可用。
@@ -241,7 +293,7 @@ NapCat WebSocket、QQ 回复和文件发送。第三方服务会受账号、网�
 自动测试不调用真实模型、JMComic 或 QQ；页面启动或 HTTP 200 也不能替代真实业务验证。
 
 当前前端仍集中在单个 `App.vue` 中，通过页面路径切换管理标签，并未拆成 Vue Router 多组件工程。
-用户专属人格分配已经提供后端接口，当前 Web 页面只直接提供全局人格启用入口。
+v0.3 起人格不再编译或全局分配；Web 和 QQ 会话独立选择人格，默认关闭。
 
 ## 安全与发布边界
 

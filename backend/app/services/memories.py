@@ -4,7 +4,7 @@ import re
 from datetime import UTC, datetime
 
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -29,13 +29,36 @@ class MemoryService:
     def __init__(self, session: Session) -> None:
         self.session = session
 
-    def recall(self, user_id: str, query: str, limit: int = 5) -> list[Memory]:
+    @staticmethod
+    def _scope_key(scope_type: str, scope_id: str) -> str:
+        if scope_type == "group":
+            return f"group:{scope_id}"
+        return scope_id
+
+    @staticmethod
+    def _scope_filter(scope_type: str, scope_id: str):
+        return or_(
+            and_(Memory.scope_type == "global", Memory.user_id.is_(None)),
+            and_(Memory.scope_type == scope_type, Memory.user_id == scope_id),
+        )
+
+    def recall(
+        self,
+        user_id: str,
+        query: str,
+        limit: int = 5,
+        *,
+        scope_type: str = "user",
+        scope_id: str | None = None,
+    ) -> list[Memory]:
+        # 群聊使用群作用域，不把当前发言者的私聊记忆带入群上下文。
+        key = scope_id or user_id
+        scope_filter = self._scope_filter(scope_type, key)
         has_memory = self.session.scalar(
             select(Memory.id)
             .where(
                 Memory.status == "active",
-                ((Memory.scope_type == "global") & Memory.user_id.is_(None))
-                | ((Memory.scope_type == "user") & (Memory.user_id == user_id)),
+                scope_filter,
             )
             .limit(1)
         )
@@ -50,8 +73,7 @@ class MemoryService:
             terms = [term for term in re.findall(r"[\w\u4e00-\u9fff]+", query) if len(term) >= 2]
             fallback = select(Memory).where(
                 Memory.status == "active",
-                ((Memory.scope_type == "global") & Memory.user_id.is_(None))
-                | ((Memory.scope_type == "user") & (Memory.user_id == user_id)),
+                scope_filter,
             )
             if terms:
                 fallback = fallback.where(
@@ -60,7 +82,7 @@ class MemoryService:
                 )
             return list(self.session.scalars(fallback.order_by(Memory.last_seen_at.desc()).limit(limit)))
         vector_rows: list[dict[str, object]] = []
-        for scope in ("global", user_id):
+        for scope in ("global", self._scope_key(scope_type, key)):
             collection = safe_collection_name("memory", scope, profile)
             vector_rows.extend(vector_store.query(collection, query_embedding, limit))
         def score(row: dict[str, object]) -> float:
@@ -77,8 +99,7 @@ class MemoryService:
                 select(Memory).where(
                     Memory.id.in_(ids),
                     Memory.status == "active",
-                    ((Memory.scope_type == "global") & Memory.user_id.is_(None))
-                    | ((Memory.scope_type == "user") & (Memory.user_id == user_id)),
+                    scope_filter,
                 )
             )
         }
@@ -91,12 +112,17 @@ class MemoryService:
         content: str,
         source_message_id: str | None = None,
         extraction_model: str | None = None,
+        *,
+        scope_type: str = "user",
+        scope_id: str | None = None,
     ) -> Memory:
         if SENSITIVE_PATTERN.search(content):
             raise ValueError("疑似凭证内容不能写入长期记忆")
+        key = scope_id or user_id
         active = self.session.scalar(
             select(Memory).where(
-                Memory.user_id == user_id,
+                Memory.scope_type == scope_type,
+                Memory.user_id == key,
                 Memory.fact_key == fact_key,
                 Memory.status == "active",
             )
@@ -109,12 +135,14 @@ class MemoryService:
         if active:
             active.status = "archived"
             vector_store.delete_ids(
-                safe_collection_name("memory", user_id, get_settings().default_embedding_profile),
+                safe_collection_name(
+                    "memory", self._scope_key(scope_type, key), get_settings().default_embedding_profile
+                ),
                 [active.id],
             )
         memory = Memory(
-            scope_type="user",
-            user_id=user_id,
+            scope_type=scope_type,
+            user_id=key,
             fact_key=fact_key[:200],
             content=content,
             source_message_id=source_message_id,
@@ -125,11 +153,11 @@ class MemoryService:
         profile = get_settings().default_embedding_profile
         provider = get_embedding_provider(profile)
         vector_store.upsert_documents(
-            safe_collection_name("memory", user_id, profile),
+            safe_collection_name("memory", self._scope_key(scope_type, key), profile),
             [memory.id],
             [memory.content],
             provider.embed_documents([memory.content]),
-                [{"user_id": user_id, "fact_key": fact_key}],
+            [{"scope_type": scope_type, "scope_id": key, "fact_key": fact_key}],
         )
         self.session.commit()
         return memory
@@ -190,6 +218,10 @@ class MemoryService:
         user_text: str,
         source_message_id: str | None,
         model_alias: str,
+        *,
+        scope_type: str = "user",
+        scope_id: str | None = None,
+        context: str = "",
     ) -> list[Memory]:
         if SENSITIVE_PATTERN.search(user_text):
             return []
@@ -210,9 +242,21 @@ class MemoryService:
                     (
                         "从用户消息中提取稳定事实、长期偏好或明确长期事件。"
                         "不要提取临时请求、猜测、第三方隐私或任何凭证。没有则返回空列表。"
+                        + (
+                            "当前是QQ群作用域，只提取群共同决定、项目事实或群级偏好，"
+                            "不要提取发言者个人信息。"
+                            if scope_type == "group"
+                            else ""
+                        )
                     ),
                 ),
-                ("human", user_text),
+                (
+                    "human",
+                    (
+                        f"相关近期对话（仅用于指代消解，不得把助手猜测写入记忆）：\n{context}\n\n"
+                        f"本轮用户消息：\n{user_text}"
+                    ),
+                ),
             ]
         )
         result = ExtractedFacts.model_validate(raw_result)
@@ -223,6 +267,8 @@ class MemoryService:
                 fact.content,
                 source_message_id,
                 model_alias,
+                scope_type=scope_type,
+                scope_id=scope_id,
             )
             for fact in result.facts
             if fact.fact_key.strip() and fact.content.strip()

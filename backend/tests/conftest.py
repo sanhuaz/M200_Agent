@@ -22,7 +22,9 @@ os.environ["MODEL_PROFILES_JSON"] = json.dumps(
             "model": "unconfigured",
             "base_url": "https://api.example.com/v1",
             "api_key_env": "PERSONAL_AGENT_TEST_KEY",
-            "context_window": 32768,
+            "context_window": 1000000,
+            "input_soft_limit": 131072,
+            "max_output_tokens": 16384,
             "timeout_seconds": 5,
         }
     ]
