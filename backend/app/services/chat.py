@@ -9,7 +9,7 @@ from collections.abc import AsyncGenerator
 from langchain_core.messages import AIMessageChunk, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import MessagesState
-from sqlalchemy import select
+from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app.db.models import Conversation, KnowledgeBase, Message, ToolRun
@@ -27,6 +27,8 @@ from app.services.context import (
     pending_prefix,
     should_compact,
 )
+from app.services.extensions import list_packages
+from app.services.manga_intent import MangaIntent, detect_manga_intent
 from app.services.memories import MemoryService
 from app.services.models import model_registry
 from app.services.personas import active_persona, persona_system_prompt
@@ -36,7 +38,6 @@ logger = logging.getLogger(__name__)
 SYSTEM_PROMPT = """你是 PersonalAgent，一个本地个人助理。
 优先使用已经提供的用户画像和长期记忆，但不要把它们当作当前用户刚说的话。
 文档问题需要使用 search_knowledge，并在回答中写明文件、标题和页码或位置。
-漫画搜索可以直接执行；Owner 请求下载时必须使用 request_manga_download，任务会立即创建，无需二次确认。
 QQ 私聊发起的漫画任务成功后，系统会自动把文件发送给 Owner；不要声称没有文件发送能力。
 只有 Owner 明确要求删除某个已发送任务时，才能调用 delete_manga_download；不要自行清理产物。
 不要声称工具成功，除非工具结果明确表示成功。"""
@@ -75,6 +76,79 @@ def normalize_tool_result(content: object) -> dict[str, object]:
     return result
 
 
+def _has_immediate_search_results(
+    session: Session,
+    conversation: Conversation,
+    current_message_id: str,
+) -> bool:
+    """只认可上一轮自然语言聊天产生的非空漫画搜索结果。"""
+
+    current_message = session.get(Message, current_message_id)
+    if current_message is None:
+        return False
+    prior_user = session.scalar(
+        select(Message)
+        .where(
+            Message.conversation_id == conversation.id,
+            Message.role == "user",
+            Message.id != current_message_id,
+            Message.created_at < current_message.created_at,
+        )
+        .order_by(desc(Message.created_at))
+        .limit(1)
+    )
+    if prior_user is None:
+        return False
+    prior_assistant = session.scalar(
+        select(Message)
+        .where(
+            Message.conversation_id == conversation.id,
+            Message.role == "assistant",
+            Message.created_at >= prior_user.created_at,
+            Message.created_at < current_message.created_at,
+        )
+        .order_by(desc(Message.created_at))
+        .limit(1)
+    )
+    if prior_assistant is None:
+        return False
+    runs = session.scalars(
+        select(ToolRun)
+        .where(
+            ToolRun.conversation_id == conversation.id,
+            ToolRun.tool_name == "search_manga",
+            ToolRun.status == "succeeded",
+            ToolRun.created_at >= prior_user.created_at,
+            ToolRun.created_at <= prior_assistant.created_at,
+        )
+        .order_by(desc(ToolRun.created_at))
+    )
+    for run in runs:
+        payload = normalize_tool_result(run.result)
+        data = payload.get("data")
+        if isinstance(data, dict) and isinstance(data.get("results"), list) and data["results"]:
+            return True
+    return False
+
+
+def _manga_system_instruction(intent: MangaIntent) -> str:
+    if not intent.actions:
+        return (
+            "\n\n漫画工具默认关闭。本轮没有通过明确漫画意图门禁时，不得调用任何漫画工具；"
+            "不要把普通词语、话题或能力询问当成漫画搜索。"
+        )
+    action_names = {
+        "search": "搜索",
+        "download": "下载",
+        "delete": "删除",
+    }
+    allowed = "、".join(action_names[action] for action in sorted(intent.actions))
+    return (
+        f"\n\n本轮程序已确认用户明确请求漫画{allowed}，只能在完成参数提取后调用对应漫画工具；"
+        "不得额外调用未授权的漫画动作。"
+    )
+
+
 class ChatService:
     def __init__(self) -> None:
         self._summary_locks: dict[str, threading.Lock] = {}
@@ -107,6 +181,20 @@ class ChatService:
 
         profile = model_registry.profile(conversation.model_alias)
         recent = load_pending_messages(session, conversation)
+        previous_search_results = _has_immediate_search_results(
+            session, conversation, user_message.id
+        )
+        requested_manga_intent = detect_manga_intent(
+            text, previous_search_results=previous_search_results
+        )
+        manga_enabled = any(
+            item.name == "manga" and item.builtin and item.enabled
+            for item in list_packages(session, "tool")
+        )
+        allowed_manga_actions = (
+            requested_manga_intent.actions if manga_enabled else frozenset()
+        )
+        manga_intent = MangaIntent(allowed_manga_actions)
         memory_scope_type = "group" if is_group else "user"
         memory_scope_id = conversation.external_id if is_group else sender_id
         try:
@@ -141,6 +229,7 @@ class ChatService:
             f"\n\n可按需加载的 Skill（只提供名称和描述）：\n{skills_text}"
             f"\n\n历史摘要：\n{clip_text(conversation.summary or '无', SUMMARY_MAX_TOKENS)}"
             f"\n\n{persona_text}"
+            f"{_manga_system_instruction(manga_intent)}"
         )
         try:
             snapshot = build_context_messages(system, recent, profile)
@@ -158,6 +247,7 @@ class ChatService:
                 conversation.id,
                 platform=platform,
                 is_group=is_group,
+                allowed_manga_actions=allowed_manga_actions,
             )
             config: RunnableConfig = {"configurable": {"thread_id": f"{conversation.id}:{user_message.id}"}}
             input_state: MessagesState = {"messages": messages}

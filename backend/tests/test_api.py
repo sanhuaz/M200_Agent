@@ -50,11 +50,40 @@ class FakeToolModel:
         return AIMessage(content="离线模型回答")
 
 
+class ToolNamesModel:
+    def __init__(self) -> None:
+        self.tool_names: list[str] = []
+
+    def bind_tools(self, tools):
+        self.tool_names = [str(item.name) for item in tools]
+        return self
+
+    async def ainvoke(self, _messages):
+        return AIMessage(content="普通聊天回答")
+
+
+class UnauthorizedMangaModel(ToolNamesModel):
+    async def ainvoke(self, _messages):
+        return AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "search_manga",
+                    "args": {"query": "海贼王"},
+                    "id": "unauthorized-manga-call",
+                    "type": "tool_call",
+                }
+            ],
+        )
+
+
 class FakeMangaToolModel:
     def __init__(self) -> None:
         self.calls = 0
+        self.tool_names: list[str] = []
 
-    def bind_tools(self, _tools):
+    def bind_tools(self, tools):
+        self.tool_names = [str(item.name) for item in tools]
         return self
 
     async def ainvoke(self, _messages):
@@ -101,8 +130,10 @@ class FakeFileToolModel:
 class FakeMangaDownloadModel:
     def __init__(self) -> None:
         self.calls = 0
+        self.tool_names: list[str] = []
 
-    def bind_tools(self, _tools):
+    def bind_tools(self, tools):
+        self.tool_names = [str(item.name) for item in tools]
         return self
 
     async def ainvoke(self, _messages):
@@ -154,6 +185,47 @@ def test_manga_array_tool_result_is_fed_back_without_attribute_error(monkeypatch
         assert response.status_code == 200
         assert "候选已返回" in response.text
         assert "AttributeError" not in response.text
+    assert "search_manga" in fake_model.tool_names
+    assert "request_manga_download" not in fake_model.tool_names
+    assert "delete_manga_download" not in fake_model.tool_names
+
+
+def test_ordinary_chat_does_not_expose_manga_tools(monkeypatch) -> None:
+    fake_model = ToolNamesModel()
+    monkeypatch.setattr(model_registry, "chat_model", lambda _alias: fake_model)
+    monkeypatch.setattr(
+        manga_service,
+        "search",
+        lambda _query: (_ for _ in ()).throw(AssertionError("普通聊天不应搜索漫画")),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/chat/stream",
+            json={"message": "海贼王这个词是什么意思", "sender_id": "ordinary-chat-user"},
+        )
+        assert response.status_code == 200
+        assert "普通聊天回答" in response.text
+    assert "search_manga" not in fake_model.tool_names
+    assert "request_manga_download" not in fake_model.tool_names
+    assert "delete_manga_download" not in fake_model.tool_names
+
+
+def test_forged_manga_tool_call_is_rejected_without_execution(monkeypatch) -> None:
+    fake_model = UnauthorizedMangaModel()
+    monkeypatch.setattr(model_registry, "chat_model", lambda _alias: fake_model)
+    monkeypatch.setattr(
+        manga_service,
+        "search",
+        lambda _query: (_ for _ in ()).throw(AssertionError("未授权调用不应执行搜索")),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/chat/stream",
+            json={"message": "海贼王这个词是什么意思", "sender_id": "forged-manga-user"},
+        )
+        assert response.status_code == 200
+        assert "本轮未检测到明确的漫画操作意图" in response.text
+        assert "event: tool_finished" not in response.text
 
 
 def test_create_files_tool_emits_artifact_event(monkeypatch) -> None:
@@ -169,7 +241,8 @@ def test_create_files_tool_emits_artifact_event(monkeypatch) -> None:
 
 
 def test_owner_manga_download_starts_without_confirmation(monkeypatch) -> None:
-    monkeypatch.setattr(model_registry, "chat_model", lambda _alias: FakeMangaDownloadModel())
+    fake_model = FakeMangaDownloadModel()
+    monkeypatch.setattr(model_registry, "chat_model", lambda _alias: fake_model)
     monkeypatch.setattr(
         agent_workflow,
         "create_manga_download_job",
@@ -180,12 +253,15 @@ def test_owner_manga_download_starts_without_confirmation(monkeypatch) -> None:
     with TestClient(app) as client:
         response = client.post(
             "/api/v1/chat/stream",
-            json={"message": "下载 123", "sender_id": "local-owner"},
+            json={"message": "下载 JM123", "sender_id": "local-owner"},
         )
         assert response.status_code == 200
         assert "event: task_created" in response.text
         assert "event: pending_confirmation" not in response.text
         assert "系统会自动发送文件" in response.text
+    assert "request_manga_download" in fake_model.tool_names
+    assert "search_manga" not in fake_model.tool_names
+    assert "delete_manga_download" not in fake_model.tool_names
 
 
 def test_manga_download_api_returns_task_without_token(monkeypatch) -> None:

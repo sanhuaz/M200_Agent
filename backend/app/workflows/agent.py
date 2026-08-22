@@ -40,6 +40,11 @@ from app.services.runtime import is_owner
 _checkpoint_connection: aiosqlite.Connection | None = None
 _checkpointer: AsyncSqliteSaver | None = None
 MAX_KNOWLEDGE_SEARCHES_PER_TURN = 4
+MANGA_TOOL_ACTIONS = {
+    "search_manga": "search",
+    "request_manga_download": "download",
+    "delete_manga_download": "delete",
+}
 
 
 @dataclass
@@ -91,6 +96,24 @@ def tool_envelope(
     return limit_tool_content(payload, TOOL_RESULT_MAX_CHARS)
 
 
+def reject_unauthorized_manga_calls(
+    response: BaseMessage,
+    allowed_manga_actions: frozenset[str],
+) -> BaseMessage:
+    """即使模型伪造未注册工具调用，也只能安全结束当前轮。"""
+
+    calls = getattr(response, "tool_calls", None)
+    if not isinstance(calls, list):
+        return response
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        action = MANGA_TOOL_ACTIONS.get(str(call.get("name") or ""))
+        if action is not None and action not in allowed_manga_actions:
+            return AIMessage(content="本轮未检测到明确的漫画操作意图，未执行漫画工具。")
+    return response
+
+
 async def initialize_checkpointer() -> None:
     global _checkpoint_connection, _checkpointer
     if _checkpointer is None:
@@ -121,6 +144,7 @@ def build_agent_graph(
     *,
     platform: str = "web",
     is_group: bool = False,
+    allowed_manga_actions: frozenset[str] = frozenset(),
 ):
     settings = get_settings()
     owner = is_owner(requester_id)
@@ -182,12 +206,16 @@ def build_agent_graph(
 
     @tool
     def search_manga(query: str) -> str:
-        """根据关键词搜索漫画，只返回候选，不会开始下载。"""
+        """在程序确认用户明确请求搜索漫画后，根据关键词搜索并只返回候选。"""
+        if "search" not in allowed_manga_actions:
+            return tool_envelope({"error": "本轮没有明确的漫画搜索意图"})
         return tool_envelope({"results": manga_service.search(query)})
 
     @tool
     def request_manga_download(album_id: str) -> str:
-        """Owner 立即创建指定漫画 ID 的下载任务，无需二次确认；非 Owner 无权下载。"""
+        """在程序确认用户明确请求下载后，Owner 立即创建指定漫画 ID 的任务。"""
+        if "download" not in allowed_manga_actions:
+            return tool_envelope({"error": "本轮没有明确的漫画下载意图"})
         try:
             job = create_manga_download_job(album_id, requester_id, conversation_id)
         except (PermissionError, ValueError) as error:
@@ -206,7 +234,9 @@ def build_agent_graph(
 
     @tool
     def delete_manga_download(job_id: str) -> str:
-        """删除已成功发送的漫画任务产物。仅限 Owner 私聊明确要求删除指定任务时调用。"""
+        """在程序确认明确删除意图后，删除已成功发送的漫画任务产物。"""
+        if "delete" not in allowed_manga_actions:
+            return tool_envelope({"error": "本轮没有明确的漫画删除意图"})
         if is_group:
             return tool_envelope({"error": "群聊禁止删除漫画产物"})
         try:
@@ -268,7 +298,12 @@ def build_agent_graph(
     if "knowledge-search" in enabled_builtins:
         tools.append(search_knowledge)
     if "manga" in enabled_builtins:
-        tools.extend([search_manga, request_manga_download, delete_manga_download])
+        if "search" in allowed_manga_actions:
+            tools.append(search_manga)
+        if "download" in allowed_manga_actions:
+            tools.append(request_manga_download)
+        if "delete" in allowed_manga_actions:
+            tools.append(delete_manga_download)
     if "create-files" in enabled_builtins:
         tools.append(create_files)
     tools.extend(load_python_tools(session, context))
@@ -291,7 +326,7 @@ def build_agent_graph(
             response = await base_model.ainvoke(messages)
         else:
             response = await model.ainvoke(messages)
-        return {"messages": [response]}
+        return {"messages": [reject_unauthorized_manga_calls(response, allowed_manga_actions)]}
 
     async def call_tools(state: MessagesState) -> dict[str, list[BaseMessage]]:
         result = await tool_node.ainvoke(state)
