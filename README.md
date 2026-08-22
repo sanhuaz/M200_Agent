@@ -11,10 +11,6 @@ Docker、Redis、Celery、完整 RBAC、OCR、语音/视觉模型、生产日志
 
 - 当前版本：`v0.3.1`
 - 仓库：<https://github.com/sanhuaz/M200_Agent>
-- v0.2 历史修改明细：[v0.2.0-修改概述.md](./v0.2.0-修改概述.md)
-
-v0.2 在 v0.1 的聊天、记忆、RAG、NapCat 和漫画任务基础上，补充了动态 Tools、Agent
-Skills、结构化人格、管理员管理、用户级记忆隔离、文件产物以及漫画发送后的显式清理流程。
 
 ## 功能
 
