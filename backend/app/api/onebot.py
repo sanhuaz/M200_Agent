@@ -265,11 +265,33 @@ class OneBotManager:
     async def _command(self, text: str, user_id: str, external_id: str) -> str | None:
         if text == "/help":
             return (
-                "命令：/new、/reset-context、/context、/model list、/model use <alias>、/kb、/memory、"
-                "/persona、/persona list、/persona use <名称或ID>、/persona off、"
-                "/memory delete <id>、/tools、/skills、/skill <name> <请求>、"
-                "/jm <关键词>、/jm download <漫画ID>、/jm delete <任务ID>、"
-                "/confirm <token>、/cancel <token>"
+                "可用命令：\n\n"
+                "【会话与模型】\n"
+                "/new\n"
+                "/reset-context\n"
+                "/context\n"
+                "/model list\n"
+                "/model use <alias>\n\n"
+                "【知识库与记忆】\n"
+                "/kb\n"
+                "/memory\n"
+                "/memory delete <id>\n\n"
+                "【人格】\n"
+                "/persona\n"
+                "/persona list\n"
+                "/persona use <名称或ID>\n"
+                "/persona off\n\n"
+                "【Tools 与 Skills】\n"
+                "/tools\n"
+                "/skills\n"
+                "/skill <name> <请求>\n\n"
+                "【漫画】\n"
+                "/jm <关键词>\n"
+                "/jm download <漫画ID>\n"
+                "/jm delete <任务ID>\n\n"
+                "【确认】\n"
+                "/confirm <token>\n"
+                "/cancel <token>"
             )
         if text in {"/new", "/reset-context"}:
             if external_id.startswith("group:") and not is_owner(user_id):

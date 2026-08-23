@@ -8,6 +8,18 @@ from app.db.models import Job
 from app.db.session import SessionLocal
 
 
+def test_help_returns_grouped_multiline_commands() -> None:
+    response = asyncio.run(OneBotManager()._command("/help", "10001", "private:10001"))
+
+    assert response is not None
+    assert response.startswith("可用命令：\n\n【会话与模型】\n")
+    assert "\n\n【知识库与记忆】\n" in response
+    assert "\n\n【人格】\n" in response
+    assert "\n\n【Tools 与 Skills】\n" in response
+    assert "\n\n【漫画】\n" in response
+    assert response.endswith("/cancel <token>")
+
+
 def test_successful_qq_delivery_is_recorded(monkeypatch) -> None:
     with SessionLocal.begin() as session:
         job = Job(
