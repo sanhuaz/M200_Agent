@@ -9,7 +9,7 @@ Docker、Redis、Celery、完整 RBAC、OCR、语音/视觉模型、生产日志
 
 ## 当前发布
 
-- 当前版本：`v0.3.1`
+- 当前版本：`v0.3.2`
 - 仓库：<https://github.com/sanhuaz/M200_Agent>
 
 ## 功能
@@ -23,7 +23,7 @@ Docker、Redis、Celery、完整 RBAC、OCR、语音/视觉模型、生产日志
 - Chroma 语义召回 + SQLite FTS5/jieba 关键词召回 + RRF 融合。
 - 可选在线 Reranker，失败时明确降级到 RRF，不伪装成重排成功。
 - 本地 BGE 或 OpenAI 兼容在线 Embedding；切换配置时使用影子索引重建。
-- NapCat OneBot v11 WebSocket Client 接入、消息去重和群聊触发规则。
+- NapCat OneBot v11 WebSocket Client 接入、消息去重、群聊触发规则和分组命令帮助。
 - JMComic 搜索、Owner 直接下载、单 Worker、PDF 产物、QQ 私聊发送与显式清理。
 - 动态 Tool Registry：内置 Tool、审核后启用的 Python Tool、文件创建 Tool。
 - Agent Skills：`SKILL.md` 导入、启停、自动/手动加载；包内脚本只展示不执行。
@@ -146,6 +146,15 @@ pnpm run dev
 .\scripts\start.ps1
 ```
 
+停止由项目脚本启动的前后端：
+
+```powershell
+.\scripts\stop.ps1
+```
+
+停止脚本只会结束经命令行和程序路径确认属于本项目的 `8000`、`5176` 监听进程；遇到未知进程占用
+端口时会拒绝执行，避免误杀其他项目。
+
 访问地址：
 
 - Web：http://127.0.0.1:5176
@@ -168,7 +177,8 @@ Token: 与 .env 中 ONEBOT_TOKEN 完全一致
 
 - 私聊默认响应。
 - 群聊仅响应 `@机器人` 或 `/ai` 前缀。
-- `/help`、`/new`、`/reset-context`、`/context`、`/model list`、`/kb`、`/memory`、`/jm` 可用于查询或管理会话。
+- `/help` 按会话与模型、知识库与记忆、人格、Tools 与 Skills、漫画、确认分组显示完整命令。
+- `/new`、`/reset-context`、`/context`、`/model list`、`/kb`、`/memory`、`/jm` 可用于查询或管理会话。
 - 会话上下文采用增量摘要和 Token 预算；`/new` 只归档短期对话，不删除长期记忆。群聊共享群上下文，但不会召回成员私聊记忆。
 - `/tools`、`/skills`、`/skill <name> <request>` 可查看和手动触发已启用扩展。
 - `/model use`、漫画下载/删除和管理操作仅 Owner 可用。Tool/Skill 管理仍使用 `/confirm` 二次确认。
@@ -242,7 +252,14 @@ Chroma 语义召回 20 条
 
 ## 版本更新记录
 
-### v0.3.1（当前）
+### v0.3.2（当前）
+
+- QQ `/help` 改为分组多行输出，覆盖会话、模型、知识库、记忆、人格、Tools、Skills、漫画和确认命令。
+- 新增 `scripts/stop.ps1`，按固定端口定位前后端，并在校验进程命令行和程序路径后安全停止。
+- 停止脚本支持服务未运行时重复执行；发现未知进程占用项目端口时整体拒绝停止，避免误杀。
+- FastAPI 与前端包版本同步更新为 `0.3.2`。
+
+### v0.3.1
 
 - 漫画工具改为显式意图门禁：普通聊天不再把漫画工具交给 LLM 自由选择。
 - 程序按当前消息识别搜索、下载和删除意图，只临时开放对应的漫画工具；未授权动作无法执行。
