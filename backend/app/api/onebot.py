@@ -167,6 +167,7 @@ class OneBotManager:
                         external_id=external_id,
                         conversation_type="group" if group_id else "private",
                         title=f"QQ {external_id}",
+                        model_alias=model_registry.default_alias(),
                         owner_id=user_id,
                     )
                     session.add(conversation)
@@ -308,6 +309,7 @@ class OneBotManager:
                         external_id=external_id,
                         conversation_type="group" if external_id.startswith("group:") else "private",
                         title=f"QQ {external_id}",
+                        model_alias=model_registry.default_alias(),
                         owner_id=user_id,
                     )
                     session.add(conversation)
@@ -385,6 +387,7 @@ class OneBotManager:
                         external_id=external_id,
                         conversation_type="group" if external_id.startswith("group:") else "private",
                         title=f"QQ {external_id}",
+                        model_alias=model_registry.default_alias(),
                         owner_id=user_id,
                     )
                     session.add(conversation)
@@ -417,6 +420,7 @@ class OneBotManager:
                         external_id=external_id,
                         conversation_type="group" if external_id.startswith("group:") else "private",
                         title=f"QQ {external_id}",
+                        model_alias=model_registry.default_alias(),
                         owner_id=user_id,
                     )
                     session.add(conversation)

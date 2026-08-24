@@ -6,7 +6,7 @@ import logging
 import threading
 from collections.abc import AsyncGenerator
 
-from langchain_core.messages import AIMessageChunk, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import MessagesState
 from sqlalchemy import desc, select
@@ -252,11 +252,15 @@ class ChatService:
             config: RunnableConfig = {"configurable": {"thread_id": f"{conversation.id}:{user_message.id}"}}
             input_state: MessagesState = {"messages": messages}
             async for chunk, _metadata in graph.astream(input_state, config=config, stream_mode="messages"):
-                if isinstance(chunk, AIMessageChunk) and isinstance(chunk.content, str) and chunk.content:
-                    emitted += chunk.content
-                    yield {"event": "token", "data": {"text": chunk.content}}
-                if isinstance(chunk, AIMessageChunk):
-                    for call in chunk.tool_call_chunks:
+                if isinstance(chunk, (AIMessage, AIMessageChunk)):
+                    if isinstance(chunk.content, str) and chunk.content:
+                        emitted += chunk.content
+                        if profile.streaming:
+                            yield {"event": "token", "data": {"text": chunk.content}}
+                    tool_calls = (
+                        chunk.tool_call_chunks if isinstance(chunk, AIMessageChunk) else chunk.tool_calls
+                    )
+                    for call in tool_calls:
                         call_id = str(call.get("id") or "")
                         if call_id and call_id not in started_tools:
                             started_tools.add(call_id)
@@ -300,7 +304,9 @@ class ChatService:
                 if isinstance(final.content, str)
                 else json.dumps(final.content, ensure_ascii=False)
             )
-            if not emitted and answer:
+            if not profile.streaming and answer:
+                yield {"event": "token", "data": {"text": answer}}
+            elif not emitted and answer:
                 yield {"event": "token", "data": {"text": answer}}
             assistant_message = Message(
                 conversation_id=conversation.id,
@@ -385,9 +391,7 @@ class ChatService:
             f"已有摘要：\n{existing_summary or '无'}\n\n新增历史：\n{new_material}"
         )
         try:
-            model = model_registry.chat_model(model_alias).bind(
-                extra_body={"max_tokens": SUMMARY_MAX_TOKENS}
-            )
+            model = model_registry.chat_model(model_alias).bind(max_tokens=SUMMARY_MAX_TOKENS)
             response = model.invoke(
                 [
                     (

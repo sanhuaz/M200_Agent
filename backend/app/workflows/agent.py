@@ -136,6 +136,16 @@ async def close_checkpointer() -> None:
     _checkpointer = None
 
 
+async def delete_conversation_checkpoints(conversation_id: str, message_ids: list[str]) -> None:
+    """删除网页会话对应的每轮 LangGraph 状态。"""
+
+    if _checkpointer is None:
+        return
+    await _checkpointer.setup()
+    for message_id in message_ids:
+        await _checkpointer.adelete_thread(f"{conversation_id}:{message_id}")
+
+
 def build_agent_graph(
     session: Session,
     model_alias: str,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator
@@ -17,10 +18,27 @@ class ModelProfile(BaseModel):
     model: str
     base_url: str
     api_key_env: str
+    reasoning_effort: Literal["low", "medium", "high"] | None = None
+    streaming: bool = True
+    temperature: float | None = Field(default=None, ge=0, le=2)
     context_window: int = 1_000_000
     input_soft_limit: int = 131_072
     max_output_tokens: int = 16_384
     timeout_seconds: float = 120.0
+
+    @field_validator("context_window", "input_soft_limit", "max_output_tokens")
+    @classmethod
+    def positive_integer(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("模型 Token 配置必须为正数")
+        return value
+
+    @field_validator("timeout_seconds")
+    @classmethod
+    def positive_timeout(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("模型超时时间必须为正数")
+        return value
 
 
 class Settings(BaseSettings):

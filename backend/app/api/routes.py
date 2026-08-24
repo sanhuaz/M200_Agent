@@ -7,11 +7,12 @@ import os
 import shutil
 import sys
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select, text
+from sqlalchemy import delete, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -50,6 +51,14 @@ from app.services.jobs import (
     job_worker,
 )
 from app.services.manga import manga_service
+from app.services.model_profiles import (
+    create_profile,
+    delete_profile,
+    list_profiles,
+    set_default_profile,
+    test_connection,
+    update_profile,
+)
 from app.services.models import model_registry
 from app.services.personas import persona_dict, validate_persona_prompt
 from app.services.runtime import admin_dict
@@ -61,11 +70,43 @@ settings = get_settings()
 
 class ConversationCreate(BaseModel):
     title: str = "新会话"
-    model_alias: str = "default"
+    model_alias: str | None = None
 
 
 class ModelSwitch(BaseModel):
     model_alias: str
+
+
+class ModelProfileCreate(BaseModel):
+    alias: str = Field(min_length=1, max_length=40, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$")
+    model: str = Field(min_length=1, max_length=240)
+    base_url: str = Field(min_length=1, max_length=500)
+    api_key: str | None = Field(default=None, max_length=500)
+    reasoning_effort: Literal["low", "medium", "high"] | None = None
+    streaming: bool = True
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    context_window: int = Field(default=1_000_000, gt=0)
+    input_soft_limit: int = Field(default=131_072, gt=0)
+    max_output_tokens: int = Field(default=16_384, gt=0)
+    timeout_seconds: float = Field(default=120, gt=0)
+
+
+class ModelProfileUpdate(BaseModel):
+    model: str | None = Field(default=None, min_length=1, max_length=240)
+    base_url: str | None = Field(default=None, min_length=1, max_length=500)
+    api_key: str | None = Field(default=None, max_length=500)
+    clear_api_key: bool = False
+    reasoning_effort: Literal["low", "medium", "high"] | None = None
+    streaming: bool | None = None
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    context_window: int | None = Field(default=None, gt=0)
+    input_soft_limit: int | None = Field(default=None, gt=0)
+    max_output_tokens: int | None = Field(default=None, gt=0)
+    timeout_seconds: float | None = Field(default=None, gt=0)
+
+
+class ModelConnectionTest(ModelProfileCreate):
+    pass
 
 
 class PersonaSwitch(BaseModel):
@@ -104,6 +145,14 @@ class MangaDownloadRequest(BaseModel):
 class ConfirmationResolve(BaseModel):
     requester_id: str = "local-owner"
     approve: bool = True
+
+
+class BulkDeleteTokens(BaseModel):
+    tokens: list[str] = Field(min_length=1)
+
+
+class BulkDeleteJobIds(BaseModel):
+    ids: list[str] = Field(min_length=1)
 
 
 class ExtensionGithubImport(BaseModel):
@@ -213,15 +262,86 @@ def health(session: Session = Depends(get_db)) -> dict[str, object]:
     }
 
 
-@router.get("/models")
-def list_models() -> list[dict[str, object]]:
-    return model_registry.list()
+@router.get("/models", dependencies=[Depends(require_loopback)])
+def list_models(session: Session = Depends(get_db)) -> list[dict[str, object]]:
+    return list_profiles(session)
+
+
+@router.post("/models", dependencies=[Depends(require_loopback)])
+def create_model_profile(
+    payload: ModelProfileCreate, session: Session = Depends(get_db)
+) -> dict[str, object]:
+    try:
+        profile = create_profile(session, payload.model_dump(exclude={"api_key"}), payload.api_key)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    return next(item for item in list_profiles(session) if item["alias"] == profile.alias)
+
+
+@router.post("/models/test-connection", dependencies=[Depends(require_loopback)])
+def test_model_connection(payload: ModelConnectionTest) -> dict[str, object]:
+    existing_alias = None
+    try:
+        model_registry.profile(payload.alias)
+        existing_alias = payload.alias
+    except ValueError:
+        pass
+    try:
+        return test_connection(
+            payload.model_dump(exclude={"api_key"}), payload.api_key, existing_alias=existing_alias
+        )
+    except (RuntimeError, ValueError) as error:
+        raise HTTPException(400, str(error)) from error
+
+
+@router.put("/models/{alias}", dependencies=[Depends(require_loopback)])
+def edit_model_profile(
+    alias: str, payload: ModelProfileUpdate, session: Session = Depends(get_db)
+) -> dict[str, object]:
+    try:
+        profile = update_profile(
+            session,
+            alias,
+            payload.model_dump(exclude_unset=True, exclude={"api_key", "clear_api_key"}),
+            payload.api_key,
+            payload.clear_api_key,
+        )
+    except KeyError as error:
+        raise HTTPException(404, f"未知模型配置: {error.args[0]}") from error
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    return next(item for item in list_profiles(session) if item["alias"] == profile.alias)
+
+
+@router.put("/models/{alias}/default", dependencies=[Depends(require_loopback)])
+def make_default_model(alias: str, session: Session = Depends(get_db)) -> dict[str, object]:
+    try:
+        profile = set_default_profile(session, alias)
+    except KeyError as error:
+        raise HTTPException(404, f"未知模型配置: {error.args[0]}") from error
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    return next(item for item in list_profiles(session) if item["alias"] == profile.alias)
+
+
+@router.delete("/models/{alias}", dependencies=[Depends(require_loopback)])
+def remove_model_profile(alias: str, session: Session = Depends(get_db)) -> dict[str, bool]:
+    try:
+        delete_profile(session, alias)
+    except KeyError as error:
+        raise HTTPException(404, f"未知模型配置: {error.args[0]}") from error
+    except PermissionError as error:
+        raise HTTPException(400, str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(409, str(error)) from error
+    return {"deleted": True}
 
 
 @router.post("/conversations")
 def create_conversation(payload: ConversationCreate, session: Session = Depends(get_db)) -> dict[str, object]:
-    model_registry.profile(payload.model_alias)
-    item = Conversation(title=payload.title, model_alias=payload.model_alias)
+    model_alias = payload.model_alias or model_registry.default_alias()
+    model_registry.profile(model_alias)
+    item = Conversation(title=payload.title, model_alias=model_alias)
     session.add(item)
     session.commit()
     session.refresh(item)
@@ -249,6 +369,42 @@ def list_messages(conversation_id: str, session: Session = Depends(get_db)) -> l
         }
         for item in items
     ]
+
+
+@router.delete("/conversations/{conversation_id}", dependencies=[Depends(require_loopback)])
+async def remove_conversation(conversation_id: str, session: Session = Depends(get_db)) -> dict[str, object]:
+    conversation = session.get(Conversation, conversation_id)
+    if conversation is None:
+        raise HTTPException(404, "会话不存在")
+    if conversation.platform != "web":
+        raise HTTPException(403, "仅允许删除网页会话")
+    message_ids = list(
+        session.scalars(
+            select(Message.id).where(Message.conversation_id == conversation_id)
+        )
+    )
+    from app.workflows.agent import delete_conversation_checkpoints
+
+    try:
+        await delete_conversation_checkpoints(conversation_id, message_ids)
+    except Exception as error:
+        session.rollback()
+        raise HTTPException(500, "会话工作流状态清理失败，未删除会话") from error
+    session.execute(
+        update(Job).where(Job.conversation_id == conversation_id).values(conversation_id=None)
+    )
+    session.execute(
+        update(Confirmation)
+        .where(Confirmation.conversation_id == conversation_id)
+        .values(conversation_id=None)
+    )
+    session.execute(
+        update(Artifact).where(Artifact.conversation_id == conversation_id).values(conversation_id=None)
+    )
+    session.execute(delete(ToolRun).where(ToolRun.conversation_id == conversation_id))
+    session.delete(conversation)
+    session.commit()
+    return {"deleted": True, "conversation_id": conversation_id}
 
 
 @router.put("/conversations/{conversation_id}/model")
@@ -283,7 +439,10 @@ def switch_persona(
 async def chat_stream(payload: ChatRequest, session: Session = Depends(get_db)) -> StreamingResponse:
     conversation = session.get(Conversation, payload.conversation_id) if payload.conversation_id else None
     if conversation is None:
-        conversation = Conversation(owner_id=payload.sender_id)
+        conversation = Conversation(
+            owner_id=payload.sender_id,
+            model_alias=model_registry.default_alias(),
+        )
         session.add(conversation)
         session.commit()
         session.refresh(conversation)
@@ -623,6 +782,20 @@ def request_manga_download(payload: MangaDownloadRequest) -> dict[str, object]:
     }
 
 
+@router.post("/confirmations/bulk-delete", dependencies=[Depends(require_loopback)])
+def bulk_delete_confirmations(
+    payload: BulkDeleteTokens, session: Session = Depends(get_db)
+) -> dict[str, int]:
+    tokens = list(dict.fromkeys(payload.tokens))
+    items = session.scalars(select(Confirmation).where(Confirmation.token.in_(tokens))).all()
+    if len(items) != len(tokens):
+        raise HTTPException(404, "部分确认记录不存在，未删除任何记录")
+    for item in items:
+        session.delete(item)
+    session.commit()
+    return {"deleted": len(items)}
+
+
 @router.post("/confirmations/{token}")
 def confirm(token: str, payload: ConfirmationResolve) -> dict[str, object]:
     try:
@@ -644,9 +817,10 @@ def confirm(token: str, payload: ConfirmationResolve) -> dict[str, object]:
 def list_confirmations(
     status: str = "pending", session: Session = Depends(get_db)
 ) -> list[dict[str, object]]:
-    items = session.scalars(
-        select(Confirmation).where(Confirmation.status == status).order_by(Confirmation.created_at.desc())
-    ).all()
+    query = select(Confirmation).order_by(Confirmation.created_at.desc())
+    if status != "all":
+        query = query.where(Confirmation.status == status)
+    items = session.scalars(query).all()
     return [
         {
             "token": item.token,
@@ -676,6 +850,21 @@ def cancel_task(job_id: str, session: Session = Depends(get_db)) -> dict[str, ob
         item.cancel_requested = True
     session.commit()
     return job_dict(item)
+
+
+@router.post("/tasks/bulk-delete", dependencies=[Depends(require_loopback)])
+def bulk_delete_tasks(payload: BulkDeleteJobIds, session: Session = Depends(get_db)) -> dict[str, int]:
+    ids = list(dict.fromkeys(payload.ids))
+    items = session.scalars(select(Job).where(Job.id.in_(ids))).all()
+    if len(items) != len(ids):
+        raise HTTPException(404, "部分任务记录不存在，未删除任何记录")
+    active = [item.id for item in items if item.status not in {"succeeded", "failed", "cancelled"}]
+    if active:
+        raise HTTPException(409, "排队中或运行中的任务不能删除，未删除任何记录")
+    for item in items:
+        session.delete(item)
+    session.commit()
+    return {"deleted": len(items)}
 
 
 @router.get("/tasks/{job_id}/artifact")
