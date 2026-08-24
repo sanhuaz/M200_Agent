@@ -4,17 +4,17 @@ M200 Agent 是一个面向个人、本机单用户场景的 AI Agent 原型。�
 Vue 3 为核心，提供 Web 对话、三层记忆、文档混合检索、NapCat/OneBot v11 QQ 接入，以及
 仅 Owner 可创建的 JMComic 持久下载任务。
 
-这是面向个人本机使用的 v0.3 版本，不是生产级多用户系统。项目默认绑定本机回环地址，不包含
+这是面向个人本机使用的 v0.4 版本，不是生产级多用户系统。项目默认绑定本机回环地址，不包含
 Docker、Redis、Celery、完整 RBAC、OCR、语音/视觉模型、生产日志平台或云部署配置。
 
 ## 当前发布
 
-- 当前版本：`v0.3.2`
+- 当前版本：`v0.4.0`
 - 仓库：<https://github.com/sanhuaz/M200_Agent>
 
 ## 功能
 
-- OpenAI 兼容文本模型，多模型配置并按会话切换。
+- OpenAI 兼容文本模型，多模型配置并按会话切换；模型管理页可设主默认模型并同步现有会话。
 - LangGraph 原生 Function Calling，不使用正则模拟工具调用。
 - SQLite 保存会话、消息、用户事实、确认请求和后台任务。
 - LangGraph SQLite Checkpointer 保存工作流中断与恢复状态。
@@ -29,7 +29,7 @@ Docker、Redis、Celery、完整 RBAC、OCR、语音/视觉模型、生产日志
 - Agent Skills：`SKILL.md` 导入、启停、自动/手动加载；包内脚本只展示不执行。
 - 原始提示词人格管理；Web 与 QQ 会话可独立选择人格或关闭人格；长期记忆按全局、QQ 用户和群组隔离，并由 Owner 管理。
 - 文件产物隔离、SHA-256 记录、Web 下载及 QQ 私聊发送。
-- Vue 3 管理端：聊天、知识库、Tools、Skills、人格、长期记忆、管理员、任务和状态页面。
+- Vue 3 管理端：聊天、模型管理、知识库、Tools、Skills、人格、长期记忆、管理员、任务和状态页面；网页会话可删除，任务与确认记录支持批量清理。
 
 ## 架构
 
@@ -87,14 +87,24 @@ Set-Location ..
 Copy-Item ".env.example" ".env"
 ```
 
-至少需要配置一个支持原生 Tool Calls 的 OpenAI 兼容模型：
+至少需要配置一个支持原生 Tool Calls 的 OpenAI 兼容模型。下面的 JSON 只在首次启动时导入；项目初始化后，
+可在 Web 管理端 `/models` 的“模型管理”页面快捷调整模型名称、`base_url`、思考强度、流式输出、温度和请求限制：
 
 ```env
-MODEL_PROFILES_JSON=[{"alias":"default","model":"your-tool-capable-model","base_url":"https://provider.example/v1","api_key_env":"PERSONAL_AGENT_LLM_API_KEY","context_window":1000000,"input_soft_limit":131072,"max_output_tokens":16384,"timeout_seconds":120}]
+MODEL_PROFILES_JSON=[{"alias":"default","model":"your-tool-capable-model","base_url":"https://provider.example/v1","api_key_env":"PERSONAL_AGENT_LLM_API_KEY","reasoning_effort":null,"streaming":true,"temperature":null,"context_window":1000000,"input_soft_limit":131072,"max_output_tokens":16384,"timeout_seconds":120}]
 PERSONAL_AGENT_LLM_API_KEY=your-key
 ```
 
-API Key 通过 `api_key_env` 间接引用，不应写进 JSON、源码、日志或 Git。
+API Key 通过 `api_key_env` 间接引用，不应写进 JSON、源码、日志或 Git。通过模型管理页录入的新密钥只写入本机
+被 Git 忽略的 `.env`，数据库和 `GET /api/v1/models` 不保存或返回密钥。模型配置修改从下一次请求生效；关闭流式
+输出时仍使用聊天 SSE 接口，但正文会在生成完成后一次性返回。`reasoning_effort` 按 OpenAI 兼容标准传递，服务商
+不支持时应使用“测试连接”确认兼容性。
+
+模型管理页的“设为主默认模型”会把网页、QQ 和归档会话统一切换到已配置模型，并作为后续新会话的默认值；
+进行中的请求继续使用开始请求时的配置。`PUT /api/v1/models/{alias}/default` 可执行同样的本机操作。
+网页会话删除接口为 `DELETE /api/v1/conversations/{id}`，QQ 会话会被拒绝；删除只清理会话消息、工具轨迹和
+工作流状态，长期记忆、任务记录和产物文件保留。任务中心的 `POST /api/v1/tasks/bulk-delete` 只接受已结束任务，
+`POST /api/v1/confirmations/bulk-delete` 可删除待确认或已处理的确认记录，删除任务记录不会删除本地下载文件。
 
 Embedding 可选择：
 
@@ -236,7 +246,7 @@ Chroma 语义召回 20 条
 - Vue TypeScript 检查
 - Vite 构建
 
-当前前端仍集中在单个 `App.vue` 中，通过页面路径切换管理标签，并未拆成 Vue Router 多组件工程。
+当前前端仍集中在单个 `App.vue` 中，通过浏览器路径同步侧边栏和内容工作区，并未拆成 Vue Router 多组件工程。
 
 ## 安全与发布边界
 
@@ -252,7 +262,15 @@ Chroma 语义召回 20 条
 
 ## 版本更新记录
 
-### v0.3.2（当前）
+### v0.4.0（当前）
+
+- 管理端重构为中文侧边栏、顶部状态栏和卡片化工作区，支持亮暗主题、桌面折叠侧栏与窄屏抽屉。
+- 新增主聊天模型管理，可维护 OpenAI 兼容配置、测试连接、设置全局默认模型并从下一次请求实时生效。
+- 网页会话支持安全删除，QQ 会话受后端保护；聊天加载和发送后默认定位到最新消息，用户上翻时不强制跟随。
+- 任务中心支持批量删除确认记录和已结束任务；活动任务原子拒绝删除，本地下载文件不会随记录删除。
+- FastAPI 与前端包版本同步更新为 `0.4.0`，并完成后端检查、前端类型检查和生产构建验证。
+
+### v0.3.2
 
 - QQ `/help` 改为分组多行输出，覆盖会话、模型、知识库、记忆、人格、Tools、Skills、漫画和确认命令。
 - 新增 `scripts/stop.ps1`，按固定端口定位前后端，并在校验进程命令行和程序路径后安全停止。
