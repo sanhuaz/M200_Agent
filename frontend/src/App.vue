@@ -3,7 +3,8 @@ import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import {
   ChatDotRound, Collection, DataAnalysis, Delete, Expand, Fold, MagicStick, Memo, Menu,
-  Monitor, Moon, PictureFilled, Setting, Sunny, Tools, UserFilled,
+  Monitor, Moon, PictureFilled, Setting, Sunny, Tools, UserFilled, Bell, CircleCheck, Refresh,
+  VideoPause, VideoPlay, Warning,
 } from '@element-plus/icons-vue'
 import { API, api, streamChat } from './services/api'
 
@@ -37,6 +38,14 @@ type ExtensionRow = { id: string; kind: string; name: string; version: string; d
 type PersonaRow = { id: string; name: string; raw_prompt: string; created_at?: string; updated_at?: string }
 type AdminRow = { id: string; external_id: string; display_name?: string; platform: string; enabled: boolean }
 type HealthItem = { alias?: string; model?: string; configured?: boolean }
+type LogProgress = { current?: number; total?: number; percent?: number; unit?: string }
+type LogEvent = {
+  id: string; timestamp: string; session_id: string; source: string; level: string; kind: string
+  title: string; message: string; details?: unknown; operation_id?: string; trace_id?: string
+  parent_operation_id?: string; progress?: LogProgress
+}
+type NapcatStatus = { url: string; configured: boolean; status: string; two_factor: boolean; last_error?: string | null; last_log_at?: string | null }
+type ActiveLogResponse = { session_id: string; operations: LogEvent[]; napcat: NapcatStatus; onebot: { connection: string; qq: string; self_id?: string | null; nickname?: string | null } }
 type HealthData = {
   status?: string
   database?: string
@@ -44,6 +53,9 @@ type HealthData = {
   worker?: string
   onebot?: string
   reranker?: string
+  qq?: string
+  napcat?: NapcatStatus
+  logs?: { session_id?: string; events?: number }
   python_executable?: string
   models?: HealthItem[]
   embedding_profiles?: HealthItem[]
@@ -98,6 +110,21 @@ const isNarrow = ref(window.innerWidth < 1024)
 const conversationListOpen = ref(true)
 const extensionExpanded = ref(true)
 const systemExpanded = ref(true)
+const logTab = ref<'operation' | 'napcat'>('operation')
+const logEvents = ref<LogEvent[]>([])
+const activeLogOperations = ref<LogEvent[]>([])
+const logSourceFilter = ref('')
+const logLevelFilter = ref('')
+const logQuery = ref('')
+const logAutoScroll = ref(true)
+const logDisplayPaused = ref(false)
+const expandedLogIds = ref<string[]>([])
+const logsContainer = ref<HTMLElement | null>(null)
+const napcatConfig = ref<NapcatStatus>({ url: 'http://127.0.0.1:6099', configured: false, status: 'not_configured', two_factor: false })
+const napcatToken = ref('')
+const napcatSaving = ref(false)
+const napcatTesting = ref(false)
+let logEventSource: EventSource | null = null
 const theme = ref<ThemeName>('light')
 let followsSystemTheme = false
 let systemThemeQuery: MediaQueryList | undefined
@@ -107,7 +134,7 @@ const DOCUMENT_REFRESH_INTERVAL_MS = 1000
 let documentRefreshTimer: number | undefined
 const routePaths: Record<string, string> = {
   chat: '/chat', models: '/models', knowledge: '/knowledge', tools: '/tools', skills: '/skills',
-  personas: '/personas', memory: '/memories', admin: '/admin', tasks: '/tasks', status: '/status',
+  personas: '/personas', memory: '/memories', admin: '/admin', tasks: '/tasks', status: '/status', logs: '/logs',
 }
 const pageDetails: Record<string, { title: string; description: string }> = {
   chat: { title: '对话', description: '与 M200 Agent 对话并管理会话模型和人格' },
@@ -120,6 +147,7 @@ const pageDetails: Record<string, { title: string; description: string }> = {
   tasks: { title: '任务中心', description: '处理待确认操作并跟踪后台任务' },
   admin: { title: '管理员', description: '维护拥有高权限操作能力的 QQ Owner' },
   status: { title: '系统状态', description: '查看本地服务、模型和检索组件状态' },
+  logs: { title: '实时日志', description: '查看 M200 操作事件与 NapCat 原生日志流' },
 }
 const currentPage = computed(() => pageDetails[activeTab.value] || pageDetails.chat)
 const sidebarToggleLabel = computed(() => isNarrow.value
@@ -128,7 +156,9 @@ const sidebarToggleLabel = computed(() => isNarrow.value
 const statusLabels: Record<string, string> = {
   ok: '正常', degraded: '降级', connected: '已连接', unavailable: '不可用', installed: '已安装',
   running: '运行中', stopped: '已停止', configured_disconnected: '已配置未连接',
-  needs_configuration: '需要配置', enabled: '已启用', disabled: '已停用',
+  needs_configuration: '需要配置', enabled: '已启用', disabled: '已停用', online: 'QQ 在线',
+  offline: 'QQ 离线', not_configured: '未配置', connecting: '连接中', auth_failed: '认证失败',
+  disconnected: '未连接', error: '错误', unknown: '未知',
 }
 
 function applyTheme(value: ThemeName) {
@@ -173,8 +203,8 @@ function statusLabel(value: unknown) {
 function statusType(value: unknown): '' | 'success' | 'warning' | 'danger' | 'info' {
   const key = String(value || '')
   if (['ok', 'connected', 'installed', 'running', 'enabled'].includes(key)) return 'success'
-  if (['degraded', 'configured_disconnected', 'needs_configuration', 'stopped', 'disabled'].includes(key)) return 'warning'
-  if (key === 'unavailable') return 'danger'
+  if (['degraded', 'configured_disconnected', 'needs_configuration', 'stopped', 'disabled', 'offline', 'not_configured', 'connecting', 'disconnected', 'unknown'].includes(key)) return 'warning'
+  if (['unavailable', 'auth_failed', 'error'].includes(key)) return 'danger'
   return 'info'
 }
 
@@ -192,6 +222,154 @@ function newModelDraft(): ModelProfileDraft {
     timeout_seconds: 120,
     api_key: '',
   }
+}
+
+const filteredLogEvents = computed(() => {
+  const query = logQuery.value.trim().toLocaleLowerCase()
+  return logEvents.value.filter((item) => {
+    if (logTab.value === 'napcat' ? item.source !== 'napcat' : item.source === 'napcat') return false
+    if (logSourceFilter.value && item.source !== logSourceFilter.value) return false
+    if (logLevelFilter.value && item.level !== logLevelFilter.value) return false
+    if (query && !JSON.stringify(item).toLocaleLowerCase().includes(query)) return false
+    return true
+  })
+})
+
+const logSources = computed(() => Array.from(new Set(logEvents.value.filter((item) => item.source !== 'napcat').map((item) => item.source))).sort())
+
+function logLevelLabel(level: string) {
+  return ({ info: '信息', warn: '警告', error: '错误', debug: '调试' } as Record<string, string>)[level] || level
+}
+
+function logKindLabel(kind: string) {
+  return ({ started: '开始', progress: '进度', succeeded: '成功', failed: '失败', cancelled: '取消', message: '消息', queued: '排队' } as Record<string, string>)[kind] || kind
+}
+
+function logTime(value: string) {
+  try { return new Date(value).toLocaleTimeString('zh-CN', { hour12: false }) } catch { return value }
+}
+
+function logLevelType(level: string): '' | 'success' | 'warning' | 'danger' | 'info' {
+  if (level === 'error') return 'danger'
+  if (level === 'warn') return 'warning'
+  if (level === 'info') return 'success'
+  return 'info'
+}
+
+function logOperationPercent(item: LogEvent) {
+  const percent = Number(item.progress?.percent)
+  return Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0
+}
+
+async function scrollLogsToBottom(force = false) {
+  await nextTick()
+  const element = logsContainer.value
+  if (!element || (!force && (!logAutoScroll.value || logDisplayPaused.value))) return
+  element.scrollTop = element.scrollHeight
+}
+
+function appendLogEvent(item: LogEvent) {
+  const index = logEvents.value.findIndex((entry) => entry.id === item.id)
+  if (index >= 0) logEvents.value[index] = item
+  else logEvents.value.push(item)
+  if (logEvents.value.length > 2000) logEvents.value.splice(0, logEvents.value.length - 2000)
+  if (item.operation_id && ['started', 'progress'].includes(item.kind)) {
+    const operationIndex = activeLogOperations.value.findIndex((entry) => entry.operation_id === item.operation_id)
+    if (operationIndex >= 0) activeLogOperations.value[operationIndex] = item
+    else activeLogOperations.value.push(item)
+  } else if (item.operation_id && ['succeeded', 'failed', 'cancelled', 'finished'].includes(item.kind)) {
+    activeLogOperations.value = activeLogOperations.value.filter((entry) => entry.operation_id !== item.operation_id)
+  }
+  void scrollLogsToBottom()
+}
+
+function closeLogStream() {
+  logEventSource?.close()
+  logEventSource = null
+}
+
+function openLogStream() {
+  closeLogStream()
+  const stream = new EventSource(`${API}/logs/stream`)
+  logEventSource = stream
+  const receive = (event: MessageEvent<string>) => {
+    try { appendLogEvent(JSON.parse(event.data) as LogEvent) } catch { /* 忽略异常 SSE 帧 */ }
+  }
+  stream.addEventListener('log', receive)
+  stream.addEventListener('operation', receive)
+  stream.addEventListener('status', (event) => {
+    try {
+      const data = JSON.parse((event as MessageEvent<string>).data) as { napcat?: NapcatStatus; onebot?: { qq?: string } }
+      if (data.napcat) napcatConfig.value = data.napcat
+      if (data.onebot?.qq) health.value = { ...health.value, qq: data.onebot.qq }
+    } catch { /* 忽略状态帧 */ }
+  })
+  stream.onerror = () => {
+    if (activeTab.value === 'logs') ElMessage.warning('日志流暂时断开，浏览器会自动重连')
+  }
+}
+
+async function loadLogs() {
+  const [history, active, config] = await Promise.all([
+    api<{ session_id: string; events: LogEvent[] }>('/logs?limit=2000'),
+    api<ActiveLogResponse>('/logs/active'),
+    api<{ napcat: NapcatStatus }>('/logs/config'),
+  ])
+  logEvents.value = history.events || []
+  activeLogOperations.value = active.operations || []
+  napcatConfig.value = config.napcat
+  await scrollLogsToBottom(true)
+}
+
+async function enterLogsPage() {
+  try {
+    await loadLogs()
+    openLogStream()
+  } catch (error) {
+    ElMessage.error(`日志加载失败：${(error as Error).message}`)
+  }
+}
+
+function toggleLogDetails(id: string) {
+  expandedLogIds.value = expandedLogIds.value.includes(id)
+    ? expandedLogIds.value.filter((item) => item !== id)
+    : [...expandedLogIds.value, id]
+}
+
+async function saveNapcatConfig() {
+  napcatSaving.value = true
+  try {
+    const payload: Record<string, unknown> = { url: napcatConfig.value.url }
+    if (napcatToken.value.trim()) payload.token = napcatToken.value.trim()
+    const result = await api<{ napcat: NapcatStatus }>('/logs/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+    napcatConfig.value = result.napcat
+    napcatToken.value = ''
+    ElMessage.success('NapCat 配置已保存并开始连接')
+  } catch (error) {
+    ElMessage.error(`NapCat 配置保存失败：${(error as Error).message}`)
+  } finally { napcatSaving.value = false }
+}
+
+async function testNapcatConfig() {
+  napcatTesting.value = true
+  try {
+    const payload: Record<string, unknown> = { url: napcatConfig.value.url }
+    if (napcatToken.value.trim()) payload.token = napcatToken.value.trim()
+    await api('/logs/test-connection', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+    ElMessage.success('NapCat 登录和实时日志接口测试成功')
+  } catch (error) {
+    ElMessage.error(`NapCat 测试失败：${(error as Error).message}`)
+  } finally { napcatTesting.value = false }
+}
+
+async function clearNapcatToken() {
+  if (!window.confirm('确定清除本机保存的 NapCat Token？日志流将断开。')) return
+  try {
+    const result = await api<{ napcat: NapcatStatus }>('/logs/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ clear_token: true }) })
+    napcatConfig.value = result.napcat
+    napcatToken.value = ''
+    ElMessage.success('NapCat Token 已清除')
+  } catch (error) { ElMessage.error(`清除 Token 失败：${(error as Error).message}`) }
 }
 
 function modelDraftFrom(item: ModelProfile): ModelProfileDraft {
@@ -336,17 +514,23 @@ async function deleteModel() {
 initializeTheme()
 
 function syncRoute() {
+  const previous = activeTab.value
   const route = Object.entries(routePaths).find(([, path]) => window.location.pathname === path)?.[0]
   if (route) activeTab.value = route
   mobileSidebarOpen.value = false
+  if (previous === 'logs' && activeTab.value !== 'logs') closeLogStream()
+  if (previous !== 'logs' && activeTab.value === 'logs') void enterLogsPage()
 }
 
 function changeTab(tab: string | number) {
   const name = String(tab)
+  const previous = activeTab.value
   activeTab.value = name
   const path = routePaths[name] || '/chat'
   if (window.location.pathname !== path) window.history.pushState({}, '', path)
   mobileSidebarOpen.value = false
+  if (previous === 'logs' && name !== 'logs') closeLogStream()
+  if (name === 'logs') void enterLogsPage()
   if (name === 'memory' || name === 'tasks') loadMemoryTasks()
   if (name === 'models' && !editingModelAlias.value && models.value.length) {
     selectModel(models.value.find((item) => item.is_default) || models.value[0])
@@ -733,6 +917,7 @@ onMounted(async () => {
   window.addEventListener('resize', handleResize)
   try { await loadBase(); await loadDocuments(); await loadMemoryTasks(); await loadManagement() }
   catch (error) { ElMessage.error((error as Error).message) }
+  if (activeTab.value === 'logs') await enterLogsPage()
 })
 
 onUnmounted(() => {
@@ -740,6 +925,7 @@ onUnmounted(() => {
   window.removeEventListener('resize', handleResize)
   systemThemeQuery?.removeEventListener('change', handleSystemThemeChange)
   stopDocumentRefresh()
+  closeLogStream()
 })
 </script>
 
@@ -779,6 +965,7 @@ onUnmounted(() => {
         <div v-show="sidebarCollapsed || systemExpanded" class="nav-children">
           <button class="nav-item" aria-label="管理员" title="管理员" :class="{ active: activeTab === 'admin' }" @click="changeTab('admin')"><el-icon><UserFilled /></el-icon><span>管理员</span></button>
           <button class="nav-item" aria-label="系统状态" title="系统状态" :class="{ active: activeTab === 'status' }" @click="changeTab('status')"><el-icon><DataAnalysis /></el-icon><span>系统状态</span></button>
+          <button class="nav-item" aria-label="实时日志" title="实时日志" :class="{ active: activeTab === 'logs' }" @click="changeTab('logs')"><el-icon><Bell /></el-icon><span>实时日志</span></button>
         </div>
       </nav>
 
@@ -938,6 +1125,41 @@ onUnmounted(() => {
             </div>
             <p class="hint">仅成功、失败、已取消任务可删除；排队中和运行中任务必须先完成或取消。本地下载文件不会因删除记录而删除。</p>
             <div class="table-wrap"><el-table :data="tasks" @selection-change="taskSelectionChange"><el-table-column type="selection" width="48" :selectable="taskSelectable" /><el-table-column prop="id" label="ID" min-width="210" /><el-table-column prop="type" label="类型" min-width="150" /><el-table-column prop="status" label="状态" width="110" /><el-table-column prop="result.delivery_status" label="QQ 发送" width="120" /><el-table-column prop="error" label="错误" min-width="200" /><el-table-column label="操作" width="250"><template #default="scope"><el-button v-if="['queued', 'running'].includes(scope.row.status)" size="small" @click="cancelTask(scope.row.id)">取消</el-button><el-link v-if="scope.row.status === 'succeeded' && !scope.row.result?.artifact_deleted" :href="`${API}/tasks/${scope.row.id}/artifact`" target="_blank" type="primary">下载产物</el-link><el-button v-if="scope.row.status === 'succeeded' && scope.row.type === 'manga_download' && !scope.row.result?.artifact_deleted" size="small" type="danger" plain @click="deleteTaskArtifact(scope.row)">删除本地文件</el-button><el-tag v-if="scope.row.result?.artifact_deleted" type="info">已删除</el-tag></template></el-table-column></el-table></div>
+          </section>
+        </template>
+
+        <template v-else-if="activeTab === 'logs'">
+          <div class="status-grid log-status-grid">
+            <article class="status-card"><span>日志中心</span><el-icon><Bell /></el-icon><strong>{{ health.logs?.events ?? logEvents.length }}</strong><small>当前会话事件</small><el-tag type="success">运行中</el-tag></article>
+            <article class="status-card"><span>NapCat 日志流</span><el-icon><Refresh /></el-icon><strong>{{ statusLabel(napcatConfig.status) }}</strong><small>{{ napcatConfig.configured ? napcatConfig.url : '尚未配置 Token' }}</small><el-tag :type="statusType(napcatConfig.status)">{{ napcatConfig.status }}</el-tag></article>
+            <article class="status-card"><span>QQ 状态</span><el-icon><CircleCheck /></el-icon><strong>{{ statusLabel(health.qq) }}</strong><small>与 NapCat 进程、OneBot 分开显示</small><el-tag :type="statusType(health.qq)">{{ health.qq || 'unknown' }}</el-tag></article>
+            <article class="status-card"><span>OneBot 状态</span><el-icon><ChatDotRound /></el-icon><strong>{{ statusLabel(health.onebot) }}</strong><small>反向 WebSocket</small><el-tag :type="statusType(health.onebot)">{{ health.onebot || 'unknown' }}</el-tag></article>
+          </div>
+
+          <section class="panel stack log-config-panel">
+            <div class="panel-heading"><div><span class="section-kicker">本机连接</span><h2>NapCat WebUI 日志配置</h2></div><el-tag :type="napcatConfig.configured ? 'success' : 'warning'">{{ napcatConfig.configured ? 'Token 已配置' : '未配置' }}</el-tag></div>
+            <p class="hint">仅允许回环地址。Token 只在后端内存和本机被忽略的 <code>.env</code> 中使用，不会回填、返回或写入日志；NapCat 启用 2FA 时不支持自动续期。</p>
+            <div class="form-row log-config-row"><el-input v-model="napcatConfig.url" placeholder="http://127.0.0.1:6099" /><el-input v-model="napcatToken" type="password" show-password autocomplete="new-password" placeholder="输入 Token；留空表示保留已有值" /><el-button :loading="napcatTesting" @click="testNapcatConfig">测试连接</el-button><el-button type="primary" :loading="napcatSaving" @click="saveNapcatConfig">保存并连接</el-button><el-button type="danger" plain :disabled="!napcatConfig.configured" @click="clearNapcatToken">清除 Token</el-button></div>
+            <p v-if="napcatConfig.last_error" class="log-error-note">最近连接提示：{{ napcatConfig.last_error }}</p>
+          </section>
+
+          <section class="panel stack logs-panel">
+            <div class="log-tabs" role="tablist" aria-label="日志类型">
+              <button class="log-tab" :class="{ active: logTab === 'operation' }" role="tab" :aria-selected="logTab === 'operation'" @click="logTab = 'operation'; logSourceFilter = ''"><el-icon><Setting /></el-icon>操作日志</button>
+              <button class="log-tab" :class="{ active: logTab === 'napcat' }" role="tab" :aria-selected="logTab === 'napcat'" @click="logTab = 'napcat'; logSourceFilter = ''"><el-icon><Refresh /></el-icon>NapCat 日志</button>
+            </div>
+            <template v-if="logTab === 'operation'">
+              <div v-if="activeLogOperations.length" class="active-operations"><div class="panel-heading"><div><span class="section-kicker">进行中</span><h2>当前正在执行</h2></div><span class="count-badge">{{ activeLogOperations.length }}</span></div><div class="active-operation-list"><article v-for="item in activeLogOperations" :key="item.operation_id" class="active-operation"><div class="active-operation-heading"><strong>{{ item.title }}</strong><span>{{ item.message }}</span><el-tag size="small" type="warning">{{ logKindLabel(item.kind) }}</el-tag></div><el-progress v-if="item.progress" :percentage="logOperationPercent(item)" :stroke-width="8" :format="() => `${logOperationPercent(item)}%${item.progress?.unit ? ` · ${item.progress.unit}` : ''}`" /><small v-if="item.operation_id">操作 ID：{{ item.operation_id }}</small></article></div></div>
+              <div class="log-filters"><el-select v-model="logSourceFilter" clearable placeholder="全部来源"><el-option v-for="source in logSources" :key="source" :label="source" :value="source" /></el-select><el-select v-model="logLevelFilter" clearable placeholder="全部级别"><el-option label="信息" value="info" /><el-option label="警告" value="warn" /><el-option label="错误" value="error" /><el-option label="调试" value="debug" /></el-select><el-input v-model="logQuery" clearable placeholder="搜索标题、内容或详情" /><el-button :type="logDisplayPaused ? 'warning' : 'default'" @click="logDisplayPaused = !logDisplayPaused"><el-icon><VideoPlay v-if="logDisplayPaused" /><VideoPause v-else /></el-icon>{{ logDisplayPaused ? '继续显示' : '暂停显示' }}</el-button><el-switch v-model="logAutoScroll" active-text="自动滚动" /></div>
+            </template>
+            <div ref="logsContainer" class="log-list" :class="{ 'log-list-paused': logDisplayPaused }" aria-live="polite">
+              <article v-for="item in filteredLogEvents" :key="item.id" class="log-entry" :class="[`log-level-${item.level}`, { expanded: expandedLogIds.includes(item.id) }]">
+                <div class="log-entry-main"><time>{{ logTime(item.timestamp) }}</time><el-tag size="small" effect="plain" :type="logLevelType(item.level)">{{ logLevelLabel(item.level) }}</el-tag><span class="log-source">{{ item.source }}</span><span class="log-kind">{{ logKindLabel(item.kind) }}</span><strong>{{ item.title }}</strong><p>{{ item.message }}</p><button class="log-detail-toggle" :aria-expanded="expandedLogIds.includes(item.id)" @click="toggleLogDetails(item.id)">{{ expandedLogIds.includes(item.id) ? '收起详情' : '详情' }}</button></div>
+                <div v-if="item.progress" class="log-entry-progress"><el-progress :percentage="logOperationPercent(item)" :stroke-width="6" :show-text="false" /><small>{{ logOperationPercent(item) }}%<template v-if="item.progress.unit"> · {{ item.progress.unit }}</template></small></div>
+                <pre v-if="expandedLogIds.includes(item.id)" class="log-details">{{ JSON.stringify(item.details, null, 2) }}</pre>
+              </article>
+              <div v-if="!filteredLogEvents.length" class="empty-copy">当前筛选条件下没有日志。</div>
+            </div>
           </section>
         </template>
 

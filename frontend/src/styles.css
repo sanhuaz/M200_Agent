@@ -178,6 +178,62 @@ h3 { margin: 0; }
 .model-security-note { margin: 0; padding: 11px 13px; color: var(--text-soft); font-size: 12px; line-height: 1.65; border-radius: 10px; background: var(--surface-soft); }
 .model-security-note code { color: var(--primary-strong); }
 .model-actions { padding-top: 2px; }
+
+.log-status-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 18px; }
+.log-status-grid .status-card { min-height: 154px; }
+.log-status-grid .status-card small { max-width: 100%; overflow: hidden; color: var(--text-soft); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.log-config-panel { margin-bottom: 18px; }
+.log-config-row > .el-input:first-child { flex: 1 1 260px; max-width: 360px; }
+.log-config-row > .el-input:nth-child(2) { flex: 1 1 300px; max-width: 430px; }
+.log-error-note { margin: 0; padding: 9px 12px; color: var(--danger); font-size: 12px; border-radius: 9px; background: color-mix(in srgb, var(--danger) 10%, transparent); }
+.log-tabs { display: flex; gap: 6px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
+.log-tab { display: inline-flex; min-height: 38px; align-items: center; gap: 8px; padding: 0 15px; color: var(--text-soft); font-weight: 750; border: 1px solid transparent; border-radius: 10px; background: transparent; cursor: pointer; }
+.log-tab:hover { color: var(--text); background: var(--surface-hover); }
+.log-tab:focus-visible, .log-detail-toggle:focus-visible { outline: 3px solid color-mix(in srgb, var(--primary) 34%, transparent); outline-offset: 2px; }
+.log-tab.active { color: var(--primary-strong); border-color: var(--border); background: var(--primary-soft); box-shadow: inset 0 -2px 0 var(--primary); }
+.active-operations { display: grid; gap: 14px; padding: 15px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-soft); }
+.active-operation-list { display: grid; gap: 10px; }
+.active-operation { display: grid; gap: 8px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.active-operation-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
+.active-operation-heading span { flex: 1; min-width: 160px; overflow: hidden; color: var(--text-soft); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.active-operation small { color: var(--text-soft); font-size: 10px; }
+.log-filters { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.log-filters > .el-select { width: 150px; }
+.log-filters > .el-input { flex: 1 1 260px; max-width: 460px; }
+.log-list { display: grid; max-height: 660px; gap: 8px; padding: 2px 4px 2px 0; overflow-y: auto; overscroll-behavior: contain; }
+.log-list-paused { border: 1px dashed var(--primary); border-radius: 10px; }
+.log-entry { display: grid; gap: 8px; padding: 11px 13px; border: 1px solid var(--border); border-left: 3px solid var(--border); border-radius: 10px; background: var(--surface); transition: background .16s ease, border-color .16s ease; }
+.log-entry:hover { border-color: var(--primary); background: var(--surface-hover); }
+.log-entry.log-level-warn { border-left-color: #e1a33a; }
+.log-entry.log-level-error { border-left-color: var(--danger); }
+.log-entry.log-level-info { border-left-color: var(--primary); }
+.log-entry-main { display: grid; grid-template-columns: 70px auto auto auto minmax(120px, auto) minmax(0, 1fr) auto; gap: 8px; align-items: center; min-width: 0; }
+.log-entry-main time, .log-source, .log-kind { color: var(--text-soft); font-size: 11px; white-space: nowrap; }
+.log-entry-main p { min-width: 0; margin: 0; overflow: hidden; color: var(--text-soft); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.log-detail-toggle { padding: 2px 5px; color: var(--primary-strong); font-size: 11px; border: 0; border-radius: 5px; background: transparent; cursor: pointer; }
+.log-detail-toggle:hover { background: var(--primary-soft); }
+.log-entry-progress { display: flex; align-items: center; gap: 10px; padding-left: 78px; }
+.log-entry-progress .el-progress { flex: 1; }
+.log-entry-progress small { width: 90px; color: var(--text-soft); font-size: 11px; text-align: right; }
+.log-details { max-height: 280px; margin: 0; padding: 10px; overflow: auto; color: var(--text-soft); font-family: ui-monospace, Consolas, monospace; font-size: 11px; line-height: 1.5; white-space: pre-wrap; border-radius: 8px; background: var(--surface-soft); }
+
+@media (max-width: 1180px) {
+  .log-status-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .log-entry-main { grid-template-columns: 65px auto auto minmax(100px, auto) minmax(0, 1fr) auto; }
+  .log-entry-main .log-kind { display: none; }
+}
+
+@media (max-width: 700px) {
+  .log-status-grid { grid-template-columns: 1fr; }
+  .log-config-row > .el-input:first-child, .log-config-row > .el-input:nth-child(2) { max-width: none; }
+  .log-entry-main { grid-template-columns: auto auto minmax(0, 1fr) auto; gap: 6px; }
+  .log-entry-main time { grid-column: 1; }
+  .log-entry-main .log-source { grid-column: 2; }
+  .log-entry-main strong { grid-column: 3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .log-entry-main p { grid-column: 1 / -1; white-space: normal; }
+  .log-entry-main .el-tag { display: none; }
+  .log-entry-progress { padding-left: 0; }
+}
 .result { display: flex; min-height: 58px; align-items: center; justify-content: space-between; gap: 14px; padding: 11px 0; border-bottom: 1px solid var(--border); }
 .result:last-child { border-bottom: 0; }
 .result > span:not(.list-icon) { display: grid; gap: 3px; }
@@ -291,4 +347,13 @@ h3 { margin: 0; }
   .topbar-actions .el-tag { display: none; }
   .toolbar-selects { flex-direction: column; }
   .toolbar-selects .el-select { width: 100%; }
+}
+
+/* 日志页状态卡覆盖通用状态网格，在所有通用规则之后保持四列/响应式。 */
+.status-grid.log-status-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+@media (max-width: 1180px) {
+  .status-grid.log-status-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 520px) {
+  .status-grid.log-status-grid { grid-template-columns: 1fr; }
 }
