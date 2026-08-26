@@ -9,7 +9,7 @@ Docker、Redis、Celery、完整 RBAC、OCR、语音/视觉模型、生产日志
 
 ## 当前发布
 
-- 当前版本：`v0.4.0`
+- 当前版本：`v0.4.1`
 - 仓库：<https://github.com/sanhuaz/M200_Agent>
 
 ## 功能
@@ -30,6 +30,7 @@ Docker、Redis、Celery、完整 RBAC、OCR、语音/视觉模型、生产日志
 - 原始提示词人格管理；Web 与 QQ 会话可独立选择人格或关闭人格；长期记忆按全局、QQ 用户和群组隔离，并由 Owner 管理。
 - 文件产物隔离、SHA-256 记录、Web 下载及 QQ 私聊发送。
 - Vue 3 管理端：聊天、模型管理、知识库、Tools、Skills、人格、长期记忆、管理员、任务和状态页面；网页会话可删除，任务与确认记录支持批量清理。
+- 实时日志中心：侧栏 `/logs` 提供 M200 结构化操作日志和 NapCat 原生日志双标签，实时显示启动、模型、Tool、记忆、RAG、索引、任务、下载和 OneBot 状态。
 
 ## 架构
 
@@ -136,6 +137,16 @@ OWNER_QQ_IDS=["your-owner-qq"]
 
 `.env` 已被 `.gitignore` 排除。
 
+实时日志页的 NapCat 配置也可以写入 `.env`：
+
+```env
+NAPCAT_WEBUI_URL=http://127.0.0.1:6099
+NAPCAT_WEBUI_TOKEN=
+```
+
+推荐直接在 `/logs` 页面填写地址和 Token，后端使用 NapCat 官方 WebUI 登录并订阅实时 SSE 日志。地址必须是
+`127.0.0.1`、`localhost` 或 `::1` 回环地址；Token 只写入本机被 Git 忽略的 `.env` 并同步当前进程环境，接口、页面、运行日志和归档日志都不会返回或记录 Token。NapCat 启用 2FA 时，页面会提示不支持自动续期。
+
 ## 启动
 
 分别启动后端和前端：
@@ -164,6 +175,13 @@ pnpm run dev
 
 停止脚本只会结束经命令行和程序路径确认属于本项目的 `8000`、`5176` 监听进程；遇到未知进程占用
 端口时会拒绝执行，避免误杀其他项目。
+
+`start.ps1` 为每次启动创建 `logs/current/<session-id>/` 会话目录；后端会将最近 2000 条事件写入内存并以
+UTF-8 JSONL 分片持久化，单分片达到 50 MiB 自动轮换。运行 `stop.ps1` 时，后端先收到停止刷新请求；两个项目端口
+均释放且 ZIP 校验成功后，当前会话才会压缩到 `logs/archives/m200-agent-<开始时间>-<会话ID>.zip`，原始目录随后删除。
+历史 ZIP 永久保留并由用户手动清理；归档失败会保留原始日志。日志允许记录完整 QQ 号、消息、RAG 查询、Tool
+参数、文件路径和错误堆栈，但 API Key、NapCat Token、Authorization、密码、Cookie 等凭据始终强制脱敏，单条事件
+超过 64 KiB 会截断并标记；模型不逐 Token 记录，二进制内容不写入日志。
 
 访问地址：
 
@@ -195,6 +213,10 @@ Token: 与 .env 中 ONEBOT_TOKEN 完全一致
 - `/jm download <漫画ID>` 立即创建下载任务；QQ 发送成功后可用 `/jm delete <任务ID>` 删除本地产物。
 - 健康检查中的 OneBot 状态分为 `connected`、`configured_disconnected`、
   `needs_configuration`。
+- `/logs` 页会分别显示 NapCat 进程日志流、QQ `get_login_info` 在线状态和 OneBot WebSocket 连接，三者不互相替代。
+- 日志接口：`GET /api/v1/logs`、`GET /api/v1/logs/active`、`GET /api/v1/logs/stream`；NapCat 配置使用
+  `GET/PUT /api/v1/logs/config`，草稿连接测试使用 `POST /api/v1/logs/test-connection`，停止脚本使用
+  `POST /api/v1/logs/finalize`，这些管理接口仅接受回环请求。
 
 ## 文档检索
 
@@ -245,6 +267,7 @@ Chroma 语义召回 20 条
 - Pytest
 - Vue TypeScript 检查
 - Vite 构建
+- 日志中心事件、凭据递归脱敏、活动操作快照和 NapCat 配置边界
 
 当前前端仍集中在单个 `App.vue` 中，通过浏览器路径同步侧边栏和内容工作区，并未拆成 Vue Router 多组件工程。
 
@@ -262,7 +285,16 @@ Chroma 语义召回 20 条
 
 ## 版本更新记录
 
-### v0.4.0（当前）
+### v0.4.1（当前）
+
+- 新增本机实时日志中心与 `/logs` 双标签页，覆盖启动、对话、模型、Tool、记忆、RAG、任务、索引、漫画下载和 OneBot 操作事件。
+- 操作事件同时维护最近 2000 条内存快照、活动操作状态和 UTF-8 JSONL 会话文件，支持 SSE 实时推送、筛选、暂停显示和下载进度。
+- 接入 NapCat WebUI 实时 SSE 日志与 Token 配置，限制为回环地址并支持凭据续期、断线退避及 QQ 在线状态检查。
+- API Key、NapCat Token、Authorization、密码和 Cookie 等凭据递归脱敏；超长事件截断，模型正文不按 Token 逐条记录。
+- `start.ps1` 创建日志会话，`stop.ps1` 在安全停止并确认端口释放后将日志校验归档为 ZIP，归档失败时保留原始文件。
+- FastAPI 与前端包版本同步更新为 `0.4.1`，并完成后端检查、前端类型检查和生产构建验证。
+
+### v0.4.0
 
 - 管理端重构为中文侧边栏、顶部状态栏和卡片化工作区，支持亮暗主题、桌面折叠侧栏与窄屏抽屉。
 - 新增主聊天模型管理，可维护 OpenAI 兼容配置、测试连接、设置全局默认模型并从下一次请求实时生效。
