@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Chunk, Document, KnowledgeBase
 from app.services.embeddings import get_embedding_provider
+from app.services.operation_logs import operation_logs
 from app.services.vector_store import safe_collection_name, vector_store
 
 SUPPORTED_SUFFIXES = {".txt", ".md", ".markdown", ".html", ".htm", ".pdf", ".docx"}
@@ -151,9 +152,25 @@ def index_document(session: Session, document_id: str) -> dict[str, object]:
         raise ValueError("知识库不存在")
     document.status = "indexing"
     session.commit()
+    operation_logs.emit(
+        source="indexer",
+        kind="started",
+        title="文档解析",
+        message=f"开始解析文档：{document.filename}",
+        operation_id=document_id,
+        details={"document_id": document_id, "path": document.path},
+    )
     blocks = chunk_blocks(parse_document(Path(document.path)))
     if not blocks:
         raise ValueError("文档没有可索引内容")
+    operation_logs.update_operation(
+        document_id,
+        source="indexer",
+        title="文档切块",
+        message=f"已生成 {len(blocks)} 个文本块",
+        details={"document_id": document_id, "chunks": len(blocks)},
+        progress={"current": len(blocks), "total": len(blocks), "percent": 25, "unit": "块"},
+    )
     old_chunk_ids = list(session.scalars(select(Chunk.id).where(Chunk.document_id == document.id)))
     session.execute(
         text(
@@ -177,6 +194,14 @@ def index_document(session: Session, document_id: str) -> dict[str, object]:
     session.flush()
     provider = get_embedding_provider(knowledge_base.embedding_profile)
     embeddings = provider.embed_documents([chunk.content for chunk in chunks])
+    operation_logs.update_operation(
+        document_id,
+        source="indexer",
+        title="Embedding",
+        message=f"已完成 {len(chunks)} 个文本块向量化",
+        details={"document_id": document_id, "chunks": len(chunks)},
+        progress={"current": len(chunks), "total": len(chunks), "percent": 70, "unit": "块"},
+    )
     collection = safe_collection_name("docs", knowledge_base.id, knowledge_base.embedding_profile)
     vector_store.delete_ids(collection, old_chunk_ids)
     vector_store.upsert_documents(
@@ -206,6 +231,13 @@ def index_document(session: Session, document_id: str) -> dict[str, object]:
     document.status = "ready"
     document.error = None
     session.commit()
+    operation_logs.finish_operation(
+        document_id,
+        source="indexer",
+        title="文档索引完成",
+        message=f"{document.filename} 已完成索引",
+        details={"document_id": document_id, "chunks": len(chunks)},
+    )
     return {"document_id": document.id, "chunks": len(chunks)}
 
 
@@ -226,6 +258,14 @@ def reindex_knowledge_base(
         .order_by(Chunk.document_id, Chunk.position)
     ).all()
     provider = get_embedding_provider(embedding_profile)
+    operation_logs.emit(
+        source="indexer",
+        kind="started",
+        title="知识库重建",
+        message=f"开始切换 Embedding：{embedding_profile}",
+        operation_id=knowledge_base_id,
+        details={"knowledge_base_id": knowledge_base_id, "embedding_profile": embedding_profile},
+    )
     contents = [chunk.content for chunk, _filename in rows]
     embeddings = provider.embed_documents(contents) if contents else []
     new_collection = safe_collection_name("docs", knowledge_base.id, embedding_profile)
@@ -254,6 +294,17 @@ def reindex_knowledge_base(
         vector_store.delete_collection(new_collection)
         raise
     vector_store.delete_collection(safe_collection_name("docs", knowledge_base.id, old_profile))
+    operation_logs.finish_operation(
+        knowledge_base_id,
+        source="indexer",
+        title="知识库重建完成",
+        message="知识库 Embedding 已切换",
+        details={
+            "knowledge_base_id": knowledge_base_id,
+            "chunks": len(rows),
+            "embedding_profile": embedding_profile,
+        },
+    )
     return {
         "knowledge_base_id": knowledge_base.id,
         "embedding_profile": embedding_profile,

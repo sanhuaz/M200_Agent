@@ -39,6 +39,7 @@ from app.services.jobs import (
 )
 from app.services.manga import manga_service
 from app.services.models import model_registry
+from app.services.operation_logs import operation_logs
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -51,6 +52,52 @@ class OneBotManager:
         self.self_id: str | None = None
         self._send_lock = asyncio.Lock()
         self._pending: dict[str, asyncio.Future[dict[str, object]]] = {}
+        self.qq_status = "unknown"
+        self.qq_nickname: str | None = None
+        self._monitor_task: asyncio.Task[None] | None = None
+
+    def status(self) -> dict[str, object]:
+        return {
+            "connection": "connected" if self.websocket is not None else "disconnected",
+            "qq": self.qq_status,
+            "self_id": self.self_id,
+            "nickname": self.qq_nickname,
+        }
+
+    def start_monitor(self) -> None:
+        if self._monitor_task is None or self._monitor_task.done():
+            self._monitor_task = asyncio.create_task(self._monitor_login(), name="onebot-login-monitor")
+
+    async def stop_monitor(self) -> None:
+        task, self._monitor_task = self._monitor_task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def _monitor_login(self) -> None:
+        while True:
+            try:
+                if self.websocket is None:
+                    self.qq_status = "offline"
+                else:
+                    response = await self.action("get_login_info", {})
+                    raw_data = response.get("data")
+                    data: dict[str, object] = raw_data if isinstance(raw_data, dict) else {}
+                    if response.get("status") == "ok" and int(str(response.get("retcode", -1))) == 0:
+                        self.qq_status = "online"
+                        self.self_id = str(data.get("user_id") or self.self_id or "")
+                        self.qq_nickname = str(data.get("nickname") or "") or None
+                    else:
+                        self.qq_status = "offline"
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self.qq_status = "unknown" if self.websocket is not None else "offline"
+                logger.debug("OneBot 登录状态检查失败：%s", type(error).__name__)
+            await asyncio.sleep(30)
 
     async def serve(self, websocket: WebSocket) -> None:
         token = self._extract_token(websocket)
@@ -63,6 +110,10 @@ class OneBotManager:
             return
         await websocket.accept()
         self.websocket = websocket
+        self.qq_status = "unknown"
+        operation_logs.emit(
+            source="onebot", kind="started", title="OneBot 连接", message="OneBot WebSocket 已连接"
+        )
         try:
             while True:
                 payload = await websocket.receive_json()
@@ -73,13 +124,32 @@ class OneBotManager:
                         future.set_result(payload)
                     continue
                 if payload.get("post_type") == "message":
+                    operation_logs.emit(
+                        source="onebot",
+                        kind="message",
+                        title="收到 QQ 消息",
+                        message=str(payload.get("raw_message") or payload.get("message") or ""),
+                        details={
+                            "user_id": payload.get("user_id"),
+                            "group_id": payload.get("group_id"),
+                            "message_id": payload.get("message_id"),
+                        },
+                    )
                     asyncio.create_task(self._handle_message(payload))
         except WebSocketDisconnect:
             logger.info("NapCat OneBot 已断开")
+            operation_logs.emit(
+                source="onebot",
+                level="warn",
+                kind="failed",
+                title="OneBot 连接断开",
+                message="OneBot WebSocket 已断开",
+            )
         finally:
             if self.websocket is websocket:
                 self.websocket = None
                 self.self_id = None
+                self.qq_status = "offline"
             for future in self._pending.values():
                 if not future.done():
                     future.set_exception(ConnectionError("OneBot 连接已断开"))

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 from collections.abc import AsyncGenerator
 
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
@@ -31,6 +32,7 @@ from app.services.extensions import list_packages
 from app.services.manga_intent import MangaIntent, detect_manga_intent
 from app.services.memories import MemoryService
 from app.services.models import model_registry
+from app.services.operation_logs import operation_logs
 from app.services.personas import active_persona, persona_system_prompt
 from app.workflows.agent import build_agent_graph, final_ai_message, skill_descriptions
 
@@ -179,6 +181,20 @@ class ChatService:
         session.commit()
         session.refresh(user_message)
 
+        started_at = time.perf_counter()
+        operation_id = operation_logs.start_operation(
+            source="chat",
+            title="对话请求",
+            message=f"收到{platform.upper()}消息",
+            details={
+                "conversation_id": conversation.id,
+                "platform": platform,
+                "sender_id": sender_id,
+                "message_id": user_message.id,
+                "text": text,
+            },
+        )
+
         profile = model_registry.profile(conversation.model_alias)
         recent = load_pending_messages(session, conversation)
         previous_search_results = _has_immediate_search_results(
@@ -197,7 +213,15 @@ class ChatService:
         manga_intent = MangaIntent(allowed_manga_actions)
         memory_scope_type = "group" if is_group else "user"
         memory_scope_id = conversation.external_id if is_group else sender_id
+        memory_operation: str | None = None
         try:
+            memory_operation = operation_logs.start_operation(
+                source="memory",
+                title="长期记忆召回",
+                message="开始召回相关记忆",
+                parent_operation_id=operation_id,
+                details={"conversation_id": conversation.id, "sender_id": sender_id, "query": text},
+            )
             memories = await asyncio.to_thread(
                 MemoryService(session).recall,
                 sender_id,
@@ -206,8 +230,24 @@ class ChatService:
                 scope_type=memory_scope_type,
                 scope_id=memory_scope_id,
             )
+            operation_logs.finish_operation(
+                memory_operation,
+                source="memory",
+                title="长期记忆召回完成",
+                message=f"命中 {len(memories)} 条记忆",
+                details={"hits": len(memories), "scope_type": memory_scope_type},
+            )
         except Exception as error:
             logger.warning("长期记忆召回降级: %s", error)
+            if memory_operation is not None:
+                operation_logs.finish_operation(
+                    memory_operation,
+                    source="memory",
+                    title="长期记忆召回失败",
+                    message="记忆召回降级为空",
+                    success=False,
+                    details={"error": f"{type(error).__name__}: {error}"},
+                )
             memories = []
         memory_text = clip_text(
             "\n".join(f"- {item.content}" for item in memories) or "- 无",
@@ -234,11 +274,20 @@ class ChatService:
         try:
             snapshot = build_context_messages(system, recent, profile)
         except ContextOverflowError as error:
+            operation_logs.finish_operation(
+                operation_id,
+                source="chat",
+                title="对话失败",
+                message="上下文超过模型限制",
+                success=False,
+                details={"error": str(error)},
+            )
             yield {"event": "error", "data": {"message": str(error)}}
             return
         messages = snapshot.messages
         emitted = ""
         started_tools: set[str] = set()
+        model_operation: str | None = None
         try:
             graph = build_agent_graph(
                 session,
@@ -251,6 +300,20 @@ class ChatService:
             )
             config: RunnableConfig = {"configurable": {"thread_id": f"{conversation.id}:{user_message.id}"}}
             input_state: MessagesState = {"messages": messages}
+            model_operation = operation_logs.start_operation(
+                source="model",
+                title="模型调用",
+                message=f"开始调用主聊天模型 {profile.model}",
+                parent_operation_id=operation_id,
+                trace_id=user_message.id,
+                details={
+                    "alias": profile.alias,
+                    "model": profile.model,
+                    "streaming": profile.streaming,
+                    "reasoning_effort": profile.reasoning_effort,
+                    "conversation_id": conversation.id,
+                },
+            )
             async for chunk, _metadata in graph.astream(input_state, config=config, stream_mode="messages"):
                 if isinstance(chunk, (AIMessage, AIMessageChunk)):
                     if isinstance(chunk.content, str) and chunk.content:
@@ -264,6 +327,19 @@ class ChatService:
                         call_id = str(call.get("id") or "")
                         if call_id and call_id not in started_tools:
                             started_tools.add(call_id)
+                            operation_logs.emit(
+                                source="tool",
+                                kind="started",
+                                title="工具调用开始",
+                                message=str(call.get("name") or "未知工具"),
+                                operation_id=call_id,
+                                parent_operation_id=operation_id,
+                                details={
+                                    "tool_call_id": call_id,
+                                    "name": call.get("name"),
+                                    "arguments": call.get("args") or call.get("arguments") or {},
+                                },
+                            )
                             yield {
                                 "event": "tool_started",
                                 "data": {"tool_call_id": call_id, "name": call.get("name")},
@@ -283,6 +359,18 @@ class ChatService:
                         "name": chunk.name,
                         "result": chunk.content,
                     }
+                    operation_logs.finish_operation(
+                        str(chunk.tool_call_id or "tool-result"),
+                        source="tool",
+                        title="工具调用完成",
+                        message=str(chunk.name or "未知工具"),
+                        parent_operation_id=operation_id,
+                        details={
+                            "tool_call_id": chunk.tool_call_id,
+                            "name": chunk.name,
+                            "result": chunk.content,
+                        },
+                    )
                     yield {"event": "tool_finished", "data": data}
                     tool_result = normalize_tool_result(chunk.content)
                     if tool_result.get("pending_confirmation"):
@@ -316,6 +404,28 @@ class ChatService:
             )
             session.add(assistant_message)
             session.commit()
+            operation_logs.finish_operation(
+                model_operation,
+                source="model",
+                title="模型调用完成",
+                message="模型回复已生成",
+                details={
+                    "output_chars": len(answer),
+                    "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 1),
+                },
+            )
+            operation_logs.finish_operation(
+                operation_id,
+                source="chat",
+                title="对话完成",
+                message="回复已写入会话",
+                details={
+                    "message_id": assistant_message.id,
+                    "output_chars": len(answer),
+                    "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 1),
+                    "tools": len(started_tools),
+                },
+            )
             yield {"event": "final", "data": {"message_id": assistant_message.id, "text": answer}}
             asyncio.create_task(
                 asyncio.to_thread(
@@ -330,6 +440,26 @@ class ChatService:
             )
         except Exception as error:
             logger.exception("聊天执行失败")
+            if model_operation is not None:
+                operation_logs.finish_operation(
+                    model_operation,
+                    source="model",
+                    title="模型调用失败",
+                    message="模型请求失败",
+                    success=False,
+                    details={"error": f"{type(error).__name__}: {error}"},
+                )
+            operation_logs.finish_operation(
+                operation_id,
+                source="chat",
+                title="对话失败",
+                message="请求未完成",
+                success=False,
+                details={
+                    "error": f"{type(error).__name__}: {error}",
+                    "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 1),
+                },
+            )
             yield {"event": "error", "data": {"message": f"{type(error).__name__}: {error}"}}
 
     def _post_turn(
@@ -349,7 +479,14 @@ class ChatService:
             turn_context = "\n".join(f"{item.role}: {item.content}" for item in context_rows[:-1])
             memory_scope_type = "group" if is_group else "user"
             memory_scope_id = conversation.external_id if is_group else sender_id
+            memory_operation: str | None = None
             try:
+                memory_operation = operation_logs.start_operation(
+                    source="memory",
+                    title="自动提取记忆",
+                    message="开始从对话提取长期记忆",
+                    details={"conversation_id": conversation_id, "message_id": message_id},
+                )
                 MemoryService(session).extract_from_turn(
                     sender_id,
                     user_text,
@@ -359,9 +496,25 @@ class ChatService:
                     scope_id=memory_scope_id,
                     context=turn_context,
                 )
+                operation_logs.finish_operation(
+                    memory_operation,
+                    source="memory",
+                    title="自动提取记忆完成",
+                    message="长期记忆提取已完成",
+                    details={"conversation_id": conversation_id},
+                )
             except Exception as error:
                 session.rollback()
                 logger.warning("自动记忆提取失败: %s", error)
+                if memory_operation is not None:
+                    operation_logs.finish_operation(
+                        memory_operation,
+                        source="memory",
+                        title="自动提取记忆失败",
+                        message="长期记忆提取失败",
+                        success=False,
+                        details={"error": f"{type(error).__name__}: {error}"},
+                    )
             with self._summary_lock(conversation_id):
                 self._compact_conversation(session, conversation, model_alias)
 
@@ -390,7 +543,14 @@ class ChatService:
         summary_source = (
             f"已有摘要：\n{existing_summary or '无'}\n\n新增历史：\n{new_material}"
         )
+        summary_operation: str | None = None
         try:
+            summary_operation = operation_logs.start_operation(
+                source="memory",
+                title="会话摘要压缩",
+                message="开始压缩历史摘要",
+                details={"conversation_id": conversation.id},
+            )
             model = model_registry.chat_model(model_alias).bind(max_tokens=SUMMARY_MAX_TOKENS)
             response = model.invoke(
                 [
@@ -408,9 +568,36 @@ class ChatService:
                 conversation.summary = clip_text(response.content.strip(), SUMMARY_MAX_TOKENS)
                 conversation.summary_up_to_message_id = batch[-1].id
                 session.commit()
+                operation_logs.finish_operation(
+                    summary_operation,
+                    source="memory",
+                    title="会话摘要完成",
+                    message="历史摘要已更新",
+                    details={
+                        "conversation_id": conversation.id,
+                        "message_id": conversation.summary_up_to_message_id,
+                    },
+                )
+            else:
+                operation_logs.finish_operation(
+                    summary_operation,
+                    source="memory",
+                    title="会话摘要跳过",
+                    message="模型未返回有效摘要",
+                    details={"conversation_id": conversation.id},
+                )
         except Exception as error:
             session.rollback()
             logger.warning("增量历史摘要失败: %s", error)
+            if summary_operation is not None:
+                operation_logs.finish_operation(
+                    summary_operation,
+                    source="memory",
+                    title="会话摘要失败",
+                    message="历史摘要更新失败",
+                    success=False,
+                    details={"error": f"{type(error).__name__}: {error}"},
+                )
 
 
 chat_service = ChatService()

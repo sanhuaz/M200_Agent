@@ -15,6 +15,7 @@ from app.db.models import Document, Job
 from app.db.session import SessionLocal
 from app.services.documents import index_document, reindex_knowledge_base
 from app.services.manga import manga_service
+from app.services.operation_logs import operation_logs
 from app.services.runtime import is_owner
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,9 @@ class JobWorker:
                 session.execute(update(Job).where(Job.status == "running").values(status="queued"))
             self._stop = asyncio.Event()
             self._task = asyncio.create_task(self._run(), name="personal-agent-worker")
+            operation_logs.emit(
+                source="worker", kind="started", title="Worker 启动", message="后台任务 Worker 已启动"
+            )
 
     @property
     def running(self) -> bool:
@@ -45,6 +49,9 @@ class JobWorker:
             await self._task
             self._task = None
         self._stop = None
+        operation_logs.emit(
+            source="worker", kind="succeeded", title="Worker 停止", message="后台任务 Worker 已停止"
+        )
 
     async def _run(self) -> None:
         assert self._stop is not None
@@ -64,6 +71,14 @@ class JobWorker:
             if job is None:
                 return None
             job.status = "running"
+            operation_logs.emit(
+                source="worker",
+                kind="started",
+                title="任务开始",
+                message=f"开始执行 {job.type}",
+                operation_id=job.id,
+                details={"job_id": job.id, "type": job.type},
+            )
             return job.id
 
     async def _execute(self, job_id: str) -> None:
@@ -74,12 +89,27 @@ class JobWorker:
             try:
                 if job.cancel_requested:
                     job.status = "cancelled"
+                    operation_logs.finish_operation(
+                        job.id,
+                        source="worker",
+                        title="任务取消",
+                        message=f"任务 {job.id} 已取消",
+                        success=False,
+                        details={"job_id": job.id, "status": "cancelled"},
+                    )
                 elif job.type == "document_index":
                     result = await asyncio.to_thread(
                         index_document, session, json.loads(job.payload)["document_id"]
                     )
                     job.result = json.dumps(result, ensure_ascii=False)
                     job.status = "succeeded"
+                    operation_logs.finish_operation(
+                        job.id,
+                        source="worker",
+                        title="任务完成",
+                        message=f"文档索引任务 {job.id} 已完成",
+                        details={"job_id": job.id, "type": job.type},
+                    )
                 elif job.type == "knowledge_base_reindex":
                     payload = json.loads(job.payload)
                     result = await asyncio.to_thread(
@@ -90,14 +120,30 @@ class JobWorker:
                     )
                     job.result = json.dumps(result, ensure_ascii=False)
                     job.status = "succeeded"
+                    operation_logs.finish_operation(
+                        job.id,
+                        source="worker",
+                        title="任务完成",
+                        message=f"知识库重建任务 {job.id} 已完成",
+                        details={"job_id": job.id, "type": job.type},
+                    )
                 elif job.type == "manga_download":
                     album_id = str(json.loads(job.payload)["album_id"])
-                    path = await manga_service.download_pdf(album_id, get_settings().download_path / job.id)
+                    path = await manga_service.download_pdf(
+                        album_id, get_settings().download_path / job.id, operation_id=job.id
+                    )
                     job.result = json.dumps(
                         {"album_id": album_id, "path": str(path.resolve()), "size": path.stat().st_size},
                         ensure_ascii=False,
                     )
                     job.status = "succeeded"
+                    operation_logs.finish_operation(
+                        job.id,
+                        source="worker",
+                        title="任务完成",
+                        message=f"漫画下载任务 {job.id} 已完成",
+                        details={"job_id": job.id, "type": job.type, "path": str(path.resolve())},
+                    )
                 else:
                     raise ValueError(f"未知任务类型: {job.type}")
             except Exception as error:
@@ -109,9 +155,24 @@ class JobWorker:
                 if job.retry_count < 2 and job.type == "manga_download":
                     job.retry_count += 1
                     job.status = "queued"
+                    operation_logs.update_operation(
+                        job.id,
+                        source="worker",
+                        title="任务重试",
+                        message=f"任务将在稍后重试（第 {job.retry_count} 次）",
+                        details={"job_id": job.id, "retry_count": job.retry_count},
+                    )
                 else:
                     job.status = "failed"
                     job.error = f"{type(error).__name__}: {error}"
+                    operation_logs.finish_operation(
+                        job.id,
+                        source="worker",
+                        title="任务失败",
+                        message=f"任务 {job.id} 执行失败",
+                        success=False,
+                        details={"job_id": job.id, "type": job.type, "error": job.error},
+                    )
                     if job.type == "document_index":
                         payload = json.loads(job.payload)
                         document = session.get(Document, payload.get("document_id"))
@@ -145,6 +206,20 @@ def create_job(
         )
         session.add(job)
         session.flush()
+        operation_logs.emit(
+            source="worker",
+            kind="queued",
+            title="任务排队",
+            message=f"已创建 {job_type} 任务",
+            operation_id=job.id,
+            details={
+                "job_id": job.id,
+                "type": job_type,
+                "requester_id": requester_id,
+                "conversation_id": conversation_id,
+                "payload": payload,
+            },
+        )
         return job
 
 

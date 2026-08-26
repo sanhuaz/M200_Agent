@@ -9,11 +9,14 @@ from io import TextIOWrapper
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.onebot import onebot_manager
 from app.api.onebot import router as onebot_router
 from app.api.routes import router
 from app.core.config import get_settings
 from app.db.session import initialize_database, verify_schema
 from app.services.jobs import job_worker
+from app.services.napcat_logs import napcat_connector
+from app.services.operation_logs import operation_logs
 from app.services.runtime import bootstrap_runtime
 from app.workflows.agent import close_checkpointer, initialize_checkpointer
 
@@ -27,17 +30,45 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
-    initialize_database()
-    verify_schema()
-    from app.db.session import SessionLocal
+    operation_logs.install_logging_handler()
+    operation_logs.emit(source="startup", kind="started", title="项目启动", message="后端生命周期开始")
+    try:
+        operation_logs.emit(source="startup", title="数据库", message="初始化数据库")
+        initialize_database()
+        verify_schema()
+        from app.db.session import SessionLocal
 
-    with SessionLocal() as session:
-        bootstrap_runtime(session)
-    await initialize_checkpointer()
-    job_worker.start()
-    yield
-    await job_worker.stop()
-    await close_checkpointer()
+        with SessionLocal() as session:
+            bootstrap_runtime(session)
+        operation_logs.emit(
+            source="startup", kind="succeeded", title="数据库", message="数据库和运行时配置已就绪"
+        )
+        await initialize_checkpointer()
+        operation_logs.emit(
+            source="startup", kind="succeeded", title="Checkpoint", message="工作流 Checkpoint 已就绪"
+        )
+        job_worker.start()
+        onebot_manager.start_monitor()
+        await napcat_connector.start()
+        operation_logs.emit(
+            source="startup",
+            kind="succeeded",
+            title="后台服务",
+            message="Worker、OneBot 状态监控和 NapCat 日志桥已启动",
+        )
+        operation_logs.emit(source="startup", kind="succeeded", title="项目启动", message="后端启动完成")
+        yield
+    finally:
+        operation_logs.emit(
+            source="shutdown", kind="started", title="项目停止", message="后端生命周期开始收尾"
+        )
+        await napcat_connector.stop()
+        await onebot_manager.stop_monitor()
+        await job_worker.stop()
+        await close_checkpointer()
+        operation_logs.emit(source="shutdown", kind="succeeded", title="项目停止", message="后端资源已释放")
+        operation_logs.flush()
+        operation_logs.close()
 
 
 app = FastAPI(

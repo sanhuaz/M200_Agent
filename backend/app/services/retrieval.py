@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, replace
 
 import httpx
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.db.models import Chunk, Document, KnowledgeBase
 from app.services.embeddings import get_embedding_provider
+from app.services.operation_logs import operation_logs
 from app.services.vector_store import safe_collection_name, vector_store
 
 
@@ -60,6 +62,18 @@ class HybridRetriever:
         self.reranker_status = "disabled"
 
     def search(self, knowledge_base_id: str, query: str, recall: int = 20, top_n: int = 5) -> list[SearchHit]:
+        started = time.perf_counter()
+        operation_id = operation_logs.start_operation(
+            source="rag",
+            title="RAG 检索",
+            message="开始知识库检索",
+            details={
+                "knowledge_base_id": knowledge_base_id,
+                "query": query,
+                "recall": recall,
+                "top_n": top_n,
+            },
+        )
         kb = self.session.get(KnowledgeBase, knowledge_base_id)
         if kb is None:
             raise ValueError("知识库不存在")
@@ -73,9 +87,34 @@ class HybridRetriever:
         keyword_hits = self._keyword_search(kb.id, query, recall)
         fused = reciprocal_rank_fusion([vector_hits, keyword_hits])
         if get_settings().rerank_enabled:
-            return self._rerank(query, fused, top_n)
-        self.reranker_status = "disabled"
-        return fused[:top_n]
+            result = self._rerank(query, fused, top_n)
+        else:
+            self.reranker_status = "disabled"
+            result = fused[:top_n]
+        operation_logs.finish_operation(
+            operation_id,
+            source="rag",
+            title="RAG 检索完成",
+            message=f"命中 {len(result)} 条结果",
+            details={
+                "knowledge_base_id": knowledge_base_id,
+                "query": query,
+                "vector_hits": len(vector_hits),
+                "keyword_hits": len(keyword_hits),
+                "rrf_hits": len(fused),
+                "reranker": self.reranker_status,
+                "hits": [
+                    {
+                        "filename": item.filename,
+                        "score": item.rerank_score or item.rrf_score,
+                        "evidence": item.content[:500],
+                    }
+                    for item in result
+                ],
+                "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+            },
+        )
+        return result
 
     def _hydrate(self, chunk_id: str, **scores: float) -> SearchHit | None:
         row = self.session.execute(
