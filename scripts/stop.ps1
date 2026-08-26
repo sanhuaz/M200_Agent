@@ -2,6 +2,9 @@ $ErrorActionPreference = "Stop"
 
 $ProjectRoot = (Resolve-Path -LiteralPath (Split-Path -Parent $PSScriptRoot)).Path
 $TargetPorts = @(8000, 5176)
+$LogRoot = [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot "logs"))
+$CurrentLogRoot = [System.IO.Path]::GetFullPath((Join-Path $LogRoot "current"))
+$ArchiveLogRoot = [System.IO.Path]::GetFullPath((Join-Path $LogRoot "archives"))
 $FixedPython = "D:\miniconda\envs\langchain1.2\python.exe"
 $PythonExe = $env:PERSONAL_AGENT_PYTHON
 
@@ -94,9 +97,62 @@ function Test-FrontendProcess {
     )
 }
 
+function Archive-CurrentLogs {
+    New-Item -ItemType Directory -Path $ArchiveLogRoot -Force | Out-Null
+    if (-not (Test-Path -LiteralPath $CurrentLogRoot)) { return }
+    $currentRootResolved = (Resolve-Path -LiteralPath $CurrentLogRoot).Path
+    $directories = @(Get-ChildItem -LiteralPath $currentRootResolved -Directory -ErrorAction SilentlyContinue)
+    foreach ($directory in $directories) {
+        $sessionPath = [System.IO.Path]::GetFullPath($directory.FullName)
+        if ((Split-Path -Parent $sessionPath) -ne $currentRootResolved) {
+            throw "日志会话路径不在 logs/current 下，拒绝归档：$sessionPath"
+        }
+        $sessionId = $directory.Name -replace '[^A-Za-z0-9_-]', '_'
+        $started = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
+        $metadataPath = Join-Path $sessionPath "session.json"
+        if (Test-Path -LiteralPath $metadataPath) {
+            try {
+                $metadata = Get-Content -LiteralPath $metadataPath -Raw -Encoding utf8 | ConvertFrom-Json
+                if ($metadata.started_at) {
+                    $started = ([DateTime]::Parse([string]$metadata.started_at)).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
+                }
+                if ($metadata.session_id) { $sessionId = ([string]$metadata.session_id) -replace '[^A-Za-z0-9_-]', '_' }
+            } catch {
+                Write-Warning "无法读取 $metadataPath，使用目录名和当前时间生成归档名。"
+            }
+        }
+        if (-not $sessionId) { $sessionId = "unknown" }
+        $archivePath = Join-Path $ArchiveLogRoot "m200-agent-$started-$sessionId.zip"
+        if (Test-Path -LiteralPath $archivePath) {
+            $existing = Get-Item -LiteralPath $archivePath
+            if ($existing.Length -gt 0) {
+                Write-Host "日志归档已存在：$archivePath"
+                Remove-Item -LiteralPath $sessionPath -Recurse -Force
+                continue
+            }
+            Remove-Item -LiteralPath $archivePath -Force
+        }
+        $temporaryArchive = Join-Path $ArchiveLogRoot (".$sessionId." + [guid]::NewGuid().ToString("N") + ".tmp.zip")
+        try {
+            Compress-Archive -LiteralPath $sessionPath -DestinationPath $temporaryArchive -CompressionLevel Optimal -Force
+            $created = Get-Item -LiteralPath $temporaryArchive -ErrorAction Stop
+            if ($created.Length -le 0) { throw "ZIP 文件为空" }
+            Move-Item -LiteralPath $temporaryArchive -Destination $archivePath -Force
+            $final = Get-Item -LiteralPath $archivePath -ErrorAction Stop
+            if ($final.Length -le 0) { throw "ZIP 文件校验失败" }
+            Remove-Item -LiteralPath $sessionPath -Recurse -Force
+            Write-Host "日志已归档：$archivePath"
+        } catch {
+            if (Test-Path -LiteralPath $temporaryArchive) { Remove-Item -LiteralPath $temporaryArchive -Force -ErrorAction SilentlyContinue }
+            throw "日志归档失败，原始日志已保留：$sessionPath；$($_.Exception.Message)"
+        }
+    }
+}
+
 $listeners = Get-ProjectListeners
 if ($listeners.Count -eq 0) {
     Write-Host "PersonalAgent 当前未运行，端口 8000、5176 均无监听。"
+    Archive-CurrentLogs
     exit 0
 }
 
@@ -129,6 +185,13 @@ if ($validationErrors.Count -gt 0) {
     throw "为避免误杀，未停止任何进程：$([Environment]::NewLine)$details"
 }
 
+try {
+    Invoke-WebRequest -UseBasicParsing -Method Post -Uri "http://127.0.0.1:8000/api/v1/logs/finalize" -TimeoutSec 3 | Out-Null
+    Write-Host "已通知后端刷新停止日志。"
+} catch {
+    Write-Warning "未能通知后端刷新停止日志，将继续执行安全停止：$($_.Exception.Message)"
+}
+
 foreach ($processId in $processesToStop.Keys) {
     if (Get-Process -Id $processId -ErrorAction SilentlyContinue) {
         Stop-Process -Id $processId -ErrorAction Stop
@@ -148,3 +211,4 @@ if ($remainingListeners.Count -gt 0) {
 }
 
 Write-Host "PersonalAgent 已停止，端口 8000、5176 均已释放。"
+Archive-CurrentLogs
