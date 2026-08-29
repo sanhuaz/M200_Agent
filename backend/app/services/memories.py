@@ -16,6 +16,23 @@ from app.services.vector_store import safe_collection_name, vector_store
 SENSITIVE_PATTERN = re.compile(r"(?i)(api[_ -]?key|token|password|passwd|secret|密码|密钥)\s*[:=：]")
 
 
+def memory_scope_key(scope_type: str, scope_id: str) -> str:
+    """Return the stable vector-store scope key used by runtime recall.
+
+    Group conversations currently pass their ``group:<id>`` external id as the
+    scope id.  Keep the existing key shape for compatibility with already
+    indexed vectors; management operations must call this same helper instead
+    of rebuilding the collection name independently.
+    """
+    if scope_type == "group":
+        return f"group:{scope_id}"
+    return scope_id
+
+
+def memory_collection_name(scope_type: str, scope_id: str, profile: str) -> str:
+    return safe_collection_name("memory", memory_scope_key(scope_type, scope_id), profile)
+
+
 class ExtractedFact(BaseModel):
     fact_key: str = Field(description="稳定、简短的事实键，例如 preference.language")
     content: str = Field(description="一条可以独立理解的中文事实")
@@ -31,9 +48,7 @@ class MemoryService:
 
     @staticmethod
     def _scope_key(scope_type: str, scope_id: str) -> str:
-        if scope_type == "group":
-            return f"group:{scope_id}"
-        return scope_id
+        return memory_scope_key(scope_type, scope_id)
 
     @staticmethod
     def _scope_filter(scope_type: str, scope_id: str):
@@ -82,8 +97,8 @@ class MemoryService:
                 )
             return list(self.session.scalars(fallback.order_by(Memory.last_seen_at.desc()).limit(limit)))
         vector_rows: list[dict[str, object]] = []
-        for scope in ("global", self._scope_key(scope_type, key)):
-            collection = safe_collection_name("memory", scope, profile)
+        for current_scope_type, current_scope_id in (("global", "global"), (scope_type, key)):
+            collection = memory_collection_name(current_scope_type, current_scope_id, profile)
             vector_rows.extend(vector_store.query(collection, query_embedding, limit))
         def score(row: dict[str, object]) -> float:
             value = row.get("score")
@@ -135,9 +150,7 @@ class MemoryService:
         if active:
             active.status = "archived"
             vector_store.delete_ids(
-                safe_collection_name(
-                    "memory", self._scope_key(scope_type, key), get_settings().default_embedding_profile
-                ),
+                memory_collection_name(scope_type, key, get_settings().default_embedding_profile),
                 [active.id],
             )
         memory = Memory(
@@ -153,7 +166,7 @@ class MemoryService:
         profile = get_settings().default_embedding_profile
         provider = get_embedding_provider(profile)
         vector_store.upsert_documents(
-            safe_collection_name("memory", self._scope_key(scope_type, key), profile),
+            memory_collection_name(scope_type, key, profile),
             [memory.id],
             [memory.content],
             provider.embed_documents([memory.content]),
@@ -187,7 +200,7 @@ class MemoryService:
         if active:
             active.status = "archived"
             vector_store.delete_ids(
-                safe_collection_name("memory", "global", get_settings().default_embedding_profile),
+                memory_collection_name("global", "global", get_settings().default_embedding_profile),
                 [active.id],
             )
         memory = Memory(
@@ -203,7 +216,7 @@ class MemoryService:
         profile = get_settings().default_embedding_profile
         provider = get_embedding_provider(profile)
         vector_store.upsert_documents(
-            safe_collection_name("memory", "global", profile),
+            memory_collection_name("global", "global", profile),
             [memory.id],
             [memory.content],
             provider.embed_documents([memory.content]),
