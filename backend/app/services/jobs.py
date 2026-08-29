@@ -7,12 +7,29 @@ import shutil
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 from sqlalchemy import select, update
 
 from app.core.config import get_settings
-from app.db.models import Document, Job
+from app.db.models import (
+    CompanionPreference,
+    Conversation,
+    Document,
+    EmotionAssessment,
+    Job,
+    Message,
+    SafetyEvent,
+)
 from app.db.session import SessionLocal
+from app.services.companion import (
+    COMPANION_ANALYSIS_RETRY_JOB_TYPE,
+    SafetyMode,
+    SupportMode,
+    analyze_message,
+    detect_support_mode,
+    resolve_analyzer_alias,
+)
 from app.services.documents import index_document, reindex_knowledge_base
 from app.services.manga import manga_service
 from app.services.operation_logs import operation_logs
@@ -20,6 +37,22 @@ from app.services.runtime import is_owner
 
 logger = logging.getLogger(__name__)
 JobNotifier = Callable[[Job], Awaitable[None]]
+
+
+def _companion_retry_context(session, message: Message) -> str:
+    messages = list(
+        session.scalars(
+            select(Message)
+            .where(
+                Message.conversation_id == message.conversation_id,
+                Message.created_at < message.created_at,
+            )
+            .order_by(Message.created_at.desc())
+            .limit(6)
+        )
+    )
+    messages.reverse()
+    return "\n".join(f"{item.role}: {item.content}" for item in messages)
 
 
 class JobWorker:
@@ -80,6 +113,109 @@ class JobWorker:
                 details={"job_id": job.id, "type": job.type},
             )
             return job.id
+
+    async def _execute_companion_analysis_retry(self, session, job: Job) -> dict[str, object]:
+        try:
+            payload = json.loads(job.payload)
+        except json.JSONDecodeError as error:
+            raise ValueError("companion_retry_invalid_payload") from error
+        assessment_id = str(payload.get("assessment_id") or "")
+        user_message_id = str(payload.get("user_message_id") or "")
+        assessment = session.get(EmotionAssessment, assessment_id)
+        message = session.get(Message, user_message_id)
+        if assessment is None or message is None:
+            return {"status": "skipped", "reason": "target_missing", "assessment_id": assessment_id}
+        if assessment.schema_valid:
+            return {"status": "skipped", "reason": "already_valid", "assessment_id": assessment_id}
+        conversation = session.get(Conversation, message.conversation_id)
+        if conversation is None:
+            raise ValueError("companion_retry_conversation_missing")
+
+        forced_value = payload.get("forced_mode")
+        if isinstance(forced_value, str) and forced_value in {"listen", "reflect", "advice"}:
+            forced_mode = cast(SupportMode, forced_value)
+        else:
+            forced_mode = detect_support_mode(message.content)
+        preferred_alias = str(payload.get("analyzer_model_alias") or assessment.model_alias or "")
+        analyzer_alias = resolve_analyzer_alias(preferred_alias or None, conversation.model_alias)
+        safety_value = payload.get("safety_mode")
+        if safety_value not in {"standard", "unfiltered"}:
+            preference = session.scalar(
+                select(CompanionPreference).where(
+                    CompanionPreference.scope_type == "qq_user",
+                    CompanionPreference.scope_id == assessment.scope_id,
+                )
+            )
+            safety_value = getattr(preference, "safety_mode", "standard") if preference else "standard"
+        safety_mode: SafetyMode = cast(
+            SafetyMode, safety_value if safety_value in {"standard", "unfiltered"} else "standard"
+        )
+        analysis = await asyncio.to_thread(
+            analyze_message,
+            message.content,
+            _companion_retry_context(session, message),
+            analyzer_alias,
+            forced_mode=forced_mode,
+            safety_mode=safety_mode,
+            allow_repair=False,
+        )
+        if not analysis.schema_valid:
+            raise ValueError("companion_retry_schema_invalid")
+
+        assessment.candidate_emotions = json.dumps(analysis.candidate_emotions, ensure_ascii=False)
+        assessment.primary_emotion = analysis.primary_emotion
+        assessment.intensity = analysis.intensity
+        assessment.support_need = analysis.support_need
+        assessment.confidence = analysis.confidence
+        assessment.risk_level = analysis.risk_level
+        assessment.next_action = analysis.next_action
+        assessment.model_alias = analysis.model_alias or assessment.model_alias
+        assessment.prompt_version = analysis.prompt_version
+        assessment.classifier_version = analysis.classifier_version
+        assessment.schema_valid = True
+        if analysis.risk_level in {"high", "critical"}:
+            safety_action = (
+                "unfiltered_passthrough"
+                if safety_mode == "unfiltered"
+                else analysis.next_action
+            )
+            existing_safety = session.scalar(
+                select(SafetyEvent)
+                .where(
+                    SafetyEvent.message_id == message.id,
+                    SafetyEvent.risk_level.in_(["high", "critical"]),
+                    SafetyEvent.action == safety_action,
+                )
+                .limit(1)
+            )
+            if existing_safety is None:
+                session.add(
+                    SafetyEvent(
+                        message_id=message.id,
+                        scope_id=assessment.scope_id,
+                        risk_level=analysis.risk_level,
+                        action=safety_action,
+                        details=json.dumps(
+                            {
+                                "source": "analysis_retry",
+                                "safety_mode": safety_mode,
+                                "rules": [],
+                                "model_alias": analysis.model_alias or analyzer_alias,
+                                "prompt_version": analysis.prompt_version,
+                                "classifier_version": analysis.classifier_version,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                )
+        return {
+            "status": "valid",
+            "assessment_id": assessment_id,
+            "risk_level": analysis.risk_level,
+            "model_alias": analysis.model_alias,
+            "next_action": analysis.next_action,
+            "safety_mode": safety_mode,
+        }
 
     async def _execute(self, job_id: str) -> None:
         with SessionLocal() as session:
@@ -144,6 +280,17 @@ class JobWorker:
                         message=f"漫画下载任务 {job.id} 已完成",
                         details={"job_id": job.id, "type": job.type, "path": str(path.resolve())},
                     )
+                elif job.type == COMPANION_ANALYSIS_RETRY_JOB_TYPE:
+                    result = await self._execute_companion_analysis_retry(session, job)
+                    job.result = json.dumps(result, ensure_ascii=False)
+                    job.status = "succeeded"
+                    operation_logs.finish_operation(
+                        job.id,
+                        source="worker",
+                        title="陪伴分析恢复完成",
+                        message=f"陪伴分析任务 {job.id} 已完成",
+                        details={"job_id": job.id, "type": job.type, "status": result.get("status")},
+                    )
                 else:
                     raise ValueError(f"未知任务类型: {job.type}")
             except Exception as error:
@@ -152,7 +299,25 @@ class JobWorker:
                 job = session.get(Job, job_id)
                 if job is None:
                     return
-                if job.retry_count < 2 and job.type == "manga_download":
+                if job.type == COMPANION_ANALYSIS_RETRY_JOB_TYPE:
+                    safe_errors = {
+                        "companion_retry_invalid_payload",
+                        "companion_retry_conversation_missing",
+                        "companion_retry_schema_invalid",
+                    }
+                    job.error = (
+                        str(error)
+                        if str(error) in safe_errors
+                        else "companion_retry_failed"
+                    )
+                else:
+                    job.error = f"{type(error).__name__}: {error}"
+                should_retry = (
+                    job.type == "manga_download" and job.retry_count < 2
+                ) or (
+                    job.type == COMPANION_ANALYSIS_RETRY_JOB_TYPE and job.retry_count < 1
+                )
+                if should_retry:
                     job.retry_count += 1
                     job.status = "queued"
                     operation_logs.update_operation(
@@ -164,7 +329,6 @@ class JobWorker:
                     )
                 else:
                     job.status = "failed"
-                    job.error = f"{type(error).__name__}: {error}"
                     operation_logs.finish_operation(
                         job.id,
                         source="worker",
@@ -189,6 +353,58 @@ class JobWorker:
 
 
 job_worker = JobWorker()
+
+
+def create_companion_analysis_retry_job(
+    *,
+    assessment_id: str,
+    user_message_id: str,
+    requester_id: str,
+    conversation_id: str,
+    forced_mode: SupportMode | None,
+    analyzer_model_alias: str | None = None,
+    safety_mode: SafetyMode = "standard",
+) -> Job | None:
+    """Queue one idempotent, non-user-visible recovery task for a failed assessment."""
+    with SessionLocal.begin() as session:
+        existing = session.get(Job, assessment_id)
+        if existing is not None:
+            if existing.type == COMPANION_ANALYSIS_RETRY_JOB_TYPE:
+                return existing
+            logger.warning("陪伴分析任务 ID 冲突，跳过恢复任务: assessment=%s", assessment_id)
+            return None
+        job = Job(
+            id=assessment_id,
+            type=COMPANION_ANALYSIS_RETRY_JOB_TYPE,
+            requester_id=requester_id,
+            conversation_id=conversation_id,
+            payload=json.dumps(
+                {
+                    "assessment_id": assessment_id,
+                    "user_message_id": user_message_id,
+                    "forced_mode": forced_mode,
+                    "analyzer_model_alias": analyzer_model_alias,
+                    "safety_mode": safety_mode,
+                },
+                ensure_ascii=False,
+            ),
+        )
+        session.add(job)
+        session.flush()
+        operation_logs.emit(
+            source="worker",
+            kind="queued",
+            title="陪伴分析恢复排队",
+            message=f"已创建陪伴分析恢复任务 {job.id}",
+            operation_id=job.id,
+            details={
+                "job_id": job.id,
+                "type": job.type,
+                "assessment_id": assessment_id,
+                "user_message_id": user_message_id,
+            },
+        )
+        return job
 
 
 def create_job(
