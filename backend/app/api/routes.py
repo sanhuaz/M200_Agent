@@ -13,7 +13,7 @@ import httpx
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, select, text, update
+from sqlalchemy import delete, desc, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -23,19 +23,34 @@ from app.db.models import (
     AdminIdentity,
     Artifact,
     Chunk,
+    CompanionPreference,
     Confirmation,
     Conversation,
     Document,
+    EmotionAssessment,
     ExtensionPackage,
     Job,
     KnowledgeBase,
     Memory,
     Message,
     Persona,
+    RelationshipProfile,
+    ResponseFeedback,
+    SafetyEvent,
     ToolRun,
 )
 from app.db.session import get_db
 from app.services.chat import chat_service
+from app.services.companion import (
+    _safe_relation_value,
+    assessment_dict,
+    feedback_dict,
+    get_or_create_preference,
+    parse_emotion_labels_strict,
+    preference_dict,
+    relationship_dict,
+    safety_event_dict,
+)
 from app.services.confirmations import resolve_confirmation, utc_isoformat
 from app.services.documents import SUPPORTED_SUFFIXES
 from app.services.embeddings import get_embedding_provider
@@ -47,6 +62,7 @@ from app.services.extensions import (
     package_dict,
 )
 from app.services.jobs import (
+    COMPANION_ANALYSIS_RETRY_JOB_TYPE,
     create_job,
     create_manga_download_job,
     delete_manga_artifact,
@@ -65,7 +81,7 @@ from app.services.models import model_registry
 from app.services.napcat_logs import napcat_connector
 from app.services.operation_logs import operation_logs
 from app.services.personas import persona_dict, validate_persona_prompt
-from app.services.runtime import admin_dict
+from app.services.runtime import admin_dict, is_owner
 from app.services.vector_store import safe_collection_name, vector_store
 
 router = APIRouter()
@@ -201,10 +217,71 @@ class NapCatLogTest(BaseModel):
     token: str | None = Field(default=None, max_length=2_000)
 
 
+class CompanionPreferenceUpdate(BaseModel):
+    qq_user_id: str = Field(min_length=5, max_length=20, pattern=r"^\d+$")
+    companion_enabled: bool | None = None
+    support_mode: Literal["auto", "listen", "reflect", "advice"] | None = None
+    memory_enabled: bool | None = None
+    safety_mode: Literal["standard", "unfiltered"] | None = None
+    analyzer_model_alias: str | None = Field(default=None, max_length=80)
+    boundaries: dict[str, object] | None = None
+
+
+class RelationshipUpdate(BaseModel):
+    qq_user_id: str = Field(min_length=5, max_length=20, pattern=r"^\d+$")
+    nickname: str | None = Field(default=None, max_length=120)
+    shared_summary: str | None = Field(default=None, max_length=4_000)
+    boundaries: dict[str, object] | None = None
+    version: int = Field(default=0, ge=0)
+
+
+class AssessmentCorrection(BaseModel):
+    qq_user_id: str = Field(min_length=5, max_length=20, pattern=r"^\d+$")
+    emotions: list[str] = Field(min_length=1, max_length=3)
+    support_need: Literal[
+        "listen", "comfort", "reflect", "advice", "celebrate", "space", "unknown"
+    ] | None = None
+    note: str | None = Field(default=None, max_length=500)
+
+
+class ResponseFeedbackCreate(BaseModel):
+    qq_user_id: str = Field(min_length=5, max_length=20, pattern=r"^\d+$")
+    feedback: Literal["helpful", "unhelpful", "no-advice"]
+    note: str | None = Field(default=None, max_length=500)
+
+
+class CompanionPrivacyDelete(BaseModel):
+    qq_user_id: str = Field(min_length=5, max_length=20, pattern=r"^\d+$")
+    confirm_text: str
+    categories: list[Literal["relationships", "assessments", "feedback", "safety", "preferences"]] = Field(
+        default_factory=lambda: ["relationships", "assessments", "feedback", "safety", "preferences"]
+    )
+
+
 def require_loopback(request: Request) -> None:
     host = request.client.host if request.client else ""
     if host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
         raise HTTPException(403, "本机管理接口只允许回环地址访问")
+
+
+def require_companion_owner(qq_user_id: str) -> None:
+    if not is_owner(qq_user_id):
+        raise HTTPException(403, "情感陪伴仅对已启用的 QQ Owner 开放")
+
+
+def _default_preference_dict(qq_user_id: str) -> dict[str, object]:
+    return {
+        "scope_type": "qq_user",
+        "scope_id": qq_user_id,
+        "companion_enabled": True,
+        "support_mode": "auto",
+        "memory_enabled": False,
+        "safety_mode": "standard",
+        "analyzer_model_alias": None,
+        "boundaries": {},
+        "created_at": None,
+        "updated_at": None,
+    }
 
 
 def conversation_dict(item: Conversation) -> dict[str, object]:
@@ -278,6 +355,314 @@ def health(session: Session = Depends(get_db)) -> dict[str, object]:
             },
         ],
         "reranker": "enabled" if settings.rerank_enabled else "disabled",
+    }
+
+
+@router.get("/companion/preferences", dependencies=[Depends(require_loopback)])
+def get_companion_preferences(
+    qq_user_id: str, session: Session = Depends(get_db)
+) -> dict[str, object]:
+    require_companion_owner(qq_user_id)
+    item = session.scalar(
+        select(CompanionPreference).where(
+            CompanionPreference.scope_type == "qq_user",
+            CompanionPreference.scope_id == qq_user_id,
+        )
+    )
+    return preference_dict(item) if item is not None else _default_preference_dict(qq_user_id)
+
+
+@router.put("/companion/preferences", dependencies=[Depends(require_loopback)])
+def update_companion_preferences(
+    payload: CompanionPreferenceUpdate, session: Session = Depends(get_db)
+) -> dict[str, object]:
+    require_companion_owner(payload.qq_user_id)
+    item = get_or_create_preference(session, payload.qq_user_id)
+    if payload.companion_enabled is not None:
+        item.companion_enabled = payload.companion_enabled
+    if payload.support_mode is not None:
+        item.support_mode = payload.support_mode
+    if payload.memory_enabled is not None:
+        item.memory_enabled = payload.memory_enabled
+    if payload.safety_mode is not None:
+        item.safety_mode = payload.safety_mode
+    if "analyzer_model_alias" in payload.model_fields_set:
+        alias = (payload.analyzer_model_alias or "").strip()
+        if alias:
+            try:
+                model_registry.profile(alias)
+            except ValueError as error:
+                raise HTTPException(400, str(error)) from error
+            item.analyzer_model_alias = alias
+        else:
+            item.analyzer_model_alias = None
+    if payload.boundaries is not None:
+        serialized = json.dumps(payload.boundaries, ensure_ascii=False)
+        if _safe_relation_value(serialized) is None:
+            raise HTTPException(400, "边界配置包含不允许保存的敏感内容")
+        item.boundaries = serialized
+    session.commit()
+    session.refresh(item)
+    return preference_dict(item)
+
+
+@router.get("/companion/relationships/{persona_key}", dependencies=[Depends(require_loopback)])
+def get_companion_relationship(
+    persona_key: str, qq_user_id: str, session: Session = Depends(get_db)
+) -> dict[str, object]:
+    require_companion_owner(qq_user_id)
+    item = session.scalar(
+        select(RelationshipProfile).where(
+            RelationshipProfile.scope_id == qq_user_id,
+            RelationshipProfile.persona_key == persona_key,
+        )
+    )
+    persona_id = item.persona_id if item is not None else None
+    return relationship_dict(item, qq_user_id, persona_id)
+
+
+@router.get("/companion/relationships", dependencies=[Depends(require_loopback)])
+def list_companion_relationships(
+    qq_user_id: str, session: Session = Depends(get_db)
+) -> list[dict[str, object]]:
+    require_companion_owner(qq_user_id)
+    items = session.scalars(
+        select(RelationshipProfile)
+        .where(RelationshipProfile.scope_id == qq_user_id)
+        .order_by(RelationshipProfile.persona_key)
+    ).all()
+    return [relationship_dict(item, qq_user_id, item.persona_id) for item in items]
+
+
+@router.put("/companion/relationships/{persona_key}", dependencies=[Depends(require_loopback)])
+def update_companion_relationship(
+    persona_key: str, payload: RelationshipUpdate, session: Session = Depends(get_db)
+) -> dict[str, object]:
+    require_companion_owner(payload.qq_user_id)
+    item = session.scalar(
+        select(RelationshipProfile).where(
+            RelationshipProfile.scope_id == payload.qq_user_id,
+            RelationshipProfile.persona_key == persona_key,
+        )
+    )
+    if item is not None and payload.version != item.version:
+        raise HTTPException(409, "关系资料已被更新，请刷新后重试")
+    if item is None:
+        if payload.version != 0:
+            raise HTTPException(409, "关系资料版本不匹配")
+        item = RelationshipProfile(
+            scope_id=payload.qq_user_id,
+            persona_key=persona_key,
+            persona_id=None if persona_key == "default" else persona_key,
+            version=1,
+        )
+        session.add(item)
+    else:
+        item.version += 1
+    if payload.nickname is not None:
+        item.nickname = _safe_relation_value(payload.nickname)
+        if payload.nickname.strip() and item.nickname is None:
+            raise HTTPException(400, "称呼包含不允许保存的敏感内容")
+    if payload.shared_summary is not None:
+        item.shared_summary = _safe_relation_value(payload.shared_summary) or ""
+        if payload.shared_summary.strip() and not item.shared_summary:
+            raise HTTPException(400, "关系摘要包含不允许保存的敏感内容")
+    if payload.boundaries is not None:
+        serialized = json.dumps(payload.boundaries, ensure_ascii=False)
+        if _safe_relation_value(serialized) is None:
+            raise HTTPException(400, "关系边界包含不允许保存的敏感内容")
+        item.boundaries = serialized
+    session.commit()
+    session.refresh(item)
+    return relationship_dict(item, payload.qq_user_id, item.persona_id)
+
+
+@router.delete("/companion/relationships/{persona_key}", dependencies=[Depends(require_loopback)])
+def delete_companion_relationship(
+    persona_key: str,
+    qq_user_id: str,
+    version: int | None = None,
+    session: Session = Depends(get_db),
+) -> dict[str, object]:
+    require_companion_owner(qq_user_id)
+    item = session.scalar(
+        select(RelationshipProfile).where(
+            RelationshipProfile.scope_id == qq_user_id,
+            RelationshipProfile.persona_key == persona_key,
+        )
+    )
+    if item is None:
+        return {"deleted": False, "persona_key": persona_key}
+    if version is not None and version != item.version:
+        raise HTTPException(409, "关系资料已被更新，请刷新后重试")
+    session.delete(item)
+    session.commit()
+    return {"deleted": True, "persona_key": persona_key}
+
+
+@router.get("/companion/assessments", dependencies=[Depends(require_loopback)])
+def list_companion_assessments(
+    qq_user_id: str, limit: int = 50, session: Session = Depends(get_db)
+) -> list[dict[str, object]]:
+    require_companion_owner(qq_user_id)
+    limit = max(1, min(limit, 100))
+    items = session.scalars(
+        select(EmotionAssessment)
+        .where(EmotionAssessment.scope_id == qq_user_id)
+        .order_by(desc(EmotionAssessment.created_at))
+        .limit(limit)
+    ).all()
+    return [assessment_dict(item, session) for item in items]
+
+
+@router.post("/companion/assessments/{message_id}/correction", dependencies=[Depends(require_loopback)])
+def correct_companion_assessment(
+    message_id: str,
+    payload: AssessmentCorrection,
+    session: Session = Depends(get_db),
+) -> dict[str, object]:
+    require_companion_owner(payload.qq_user_id)
+    normalized_emotions: list[str] = []
+    for label in payload.emotions:
+        parsed, invalid = parse_emotion_labels_strict(label)
+        if invalid or len(parsed) != 1:
+            raise HTTPException(400, "包含未知情绪标签")
+        if parsed[0] not in normalized_emotions:
+            normalized_emotions.append(parsed[0])
+    if not normalized_emotions:
+        raise HTTPException(400, "至少需要一个合法情绪标签")
+    item = session.scalar(
+        select(EmotionAssessment).where(
+            EmotionAssessment.user_message_id == message_id,
+            EmotionAssessment.scope_id == payload.qq_user_id,
+        )
+    )
+    if item is None:
+        raise HTTPException(404, "找不到属于该 QQ Owner 的情绪分析")
+    correction = {
+        "emotions": normalized_emotions[:3],
+        "support_need": payload.support_need,
+        "note": payload.note,
+    }
+    item.correction = json.dumps(correction, ensure_ascii=False)
+    session.commit()
+    session.refresh(item)
+    return assessment_dict(item, session)
+
+
+@router.post("/companion/responses/{message_id}/feedback", dependencies=[Depends(require_loopback)])
+def create_companion_feedback(
+    message_id: str,
+    payload: ResponseFeedbackCreate,
+    session: Session = Depends(get_db),
+) -> dict[str, object]:
+    require_companion_owner(payload.qq_user_id)
+    assistant = session.get(Message, message_id)
+    if assistant is None or assistant.role != "assistant":
+        raise HTTPException(404, "助手回复不存在")
+    conversation = session.get(Conversation, assistant.conversation_id)
+    if conversation is None or conversation.external_id != f"private:{payload.qq_user_id}":
+        raise HTTPException(403, "该回复不属于当前 QQ Owner 私聊")
+    item = session.scalar(
+        select(ResponseFeedback).where(ResponseFeedback.assistant_message_id == message_id)
+    )
+    if item is None:
+        item = ResponseFeedback(
+            assistant_message_id=message_id,
+            scope_id=payload.qq_user_id,
+            feedback=payload.feedback,
+        )
+        session.add(item)
+    else:
+        item.feedback = payload.feedback
+    if payload.note is not None:
+        item.correction = json.dumps({"note": payload.note}, ensure_ascii=False)
+    session.commit()
+    session.refresh(item)
+    return feedback_dict(item)
+
+
+@router.get("/companion/privacy/export", dependencies=[Depends(require_loopback)])
+def export_companion_data(
+    qq_user_id: str, session: Session = Depends(get_db)
+) -> dict[str, object]:
+    require_companion_owner(qq_user_id)
+    preference = session.scalar(
+        select(CompanionPreference).where(CompanionPreference.scope_id == qq_user_id)
+    )
+    relationships = session.scalars(
+        select(RelationshipProfile).where(RelationshipProfile.scope_id == qq_user_id)
+    ).all()
+    assessments = session.scalars(
+        select(EmotionAssessment)
+        .where(EmotionAssessment.scope_id == qq_user_id)
+        .order_by(desc(EmotionAssessment.created_at))
+    ).all()
+    feedback = session.scalars(
+        select(ResponseFeedback)
+        .where(ResponseFeedback.scope_id == qq_user_id)
+        .order_by(desc(ResponseFeedback.created_at))
+    ).all()
+    safety = session.scalars(
+        select(SafetyEvent)
+        .where(SafetyEvent.scope_id == qq_user_id)
+        .order_by(desc(SafetyEvent.created_at))
+    ).all()
+    return {
+        "scope_id": qq_user_id,
+        "preferences": preference_dict(preference) if preference else _default_preference_dict(qq_user_id),
+        "relationships": [relationship_dict(item, qq_user_id, item.persona_id) for item in relationships],
+        "assessments": [assessment_dict(item, session) for item in assessments],
+        "feedback": [feedback_dict(item) for item in feedback],
+        "safety_events": [safety_event_dict(item) for item in safety],
+        "note": "导出不包含原始聊天正文、系统提示词、模型推理或凭据。",
+    }
+
+
+@router.delete("/companion/privacy/data", dependencies=[Depends(require_loopback)])
+def delete_companion_data(
+    payload: CompanionPrivacyDelete, session: Session = Depends(get_db)
+) -> dict[str, object]:
+    require_companion_owner(payload.qq_user_id)
+    if payload.confirm_text != "删除陪伴数据":
+        raise HTTPException(400, "请输入“删除陪伴数据”确认删除")
+    categories = set(payload.categories)
+    counts: dict[str, int] = {}
+    targets = {
+        "relationships": (RelationshipProfile, RelationshipProfile.scope_id == payload.qq_user_id),
+        "assessments": (EmotionAssessment, EmotionAssessment.scope_id == payload.qq_user_id),
+        "feedback": (ResponseFeedback, ResponseFeedback.scope_id == payload.qq_user_id),
+        "safety": (SafetyEvent, SafetyEvent.scope_id == payload.qq_user_id),
+        "preferences": (CompanionPreference, CompanionPreference.scope_id == payload.qq_user_id),
+    }
+    results: dict[str, dict[str, object]] = {}
+    for name in categories:
+        model, condition = targets[name]
+        try:
+            if name == "assessments":
+                assessment_ids = session.scalars(
+                    select(EmotionAssessment.id).where(condition)
+                ).all()
+                if assessment_ids:
+                    session.execute(
+                        delete(Job).where(
+                            Job.id.in_(assessment_ids),
+                            Job.type == COMPANION_ANALYSIS_RETRY_JOB_TYPE,
+                        )
+                    )
+            count = session.query(model).where(condition).count()
+            session.execute(delete(model).where(condition))
+            session.commit()
+            counts[name] = count
+            results[name] = {"success": True, "count": count}
+        except Exception as error:
+            session.rollback()
+            counts[name] = 0
+            results[name] = {"success": False, "count": 0, "error": type(error).__name__}
+    return {
+        "deleted": all(item["success"] for item in results.values()),
+        "counts": counts,
+        "results": results,
     }
 
 
@@ -974,7 +1359,14 @@ def list_confirmations(
 
 @router.get("/tasks")
 def list_tasks(session: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return [job_dict(item) for item in session.scalars(select(Job).order_by(Job.created_at.desc()))]
+    return [
+        job_dict(item)
+        for item in session.scalars(
+            select(Job)
+            .where(Job.type != COMPANION_ANALYSIS_RETRY_JOB_TYPE)
+            .order_by(Job.created_at.desc())
+        )
+    ]
 
 
 @router.post("/tasks/{job_id}/cancel")
