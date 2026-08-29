@@ -31,11 +31,56 @@ type ModelProfileDraft = Omit<ModelProfile, 'configured' | 'has_api_key' | 'in_u
 type Message = { id?: string; role: string; content: string }
 type KnowledgeBase = { id: string; name: string; embedding_profile: string }
 type DocumentRow = { id: string; knowledge_base_id: string; filename: string; status: string; error?: string }
-type MemoryRow = { id: string; fact_key: string; content: string; status: string }
+type MemoryCenterFact = {
+  memory_type: 'fact'
+  id: string
+  scope_type: 'global' | 'user' | 'group'
+  scope_id: string | null
+  user_id: string | null
+  fact_key: string
+  content: string
+  status: 'active' | 'archived'
+  source_message_id: string | null
+  created_at: string
+  last_seen_at: string
+  updated_at: string
+}
+type MemoryCenterRelationship = {
+  memory_type: 'relationship'
+  id: string
+  scope_type: 'user'
+  scope_id: string
+  user_id: string
+  persona_key: string
+  persona_id: string | null
+  persona_name: string
+  nickname: string | null
+  shared_summary: string
+  boundaries: Record<string, unknown>
+  version: number
+  status: 'active'
+  source_message_id?: null
+  created_at: string
+  last_seen_at: null
+  updated_at: string
+}
+type MemoryCenterRow = MemoryCenterFact | MemoryCenterRelationship
 type TaskRow = { id: string; type: string; status: string; error?: string; result?: { path?: string; delivery_status?: string; artifact_deleted?: boolean } }
 type Confirmation = { token: string; action: string; payload: Record<string, unknown>; status: string; expires_at: string }
 type ExtensionRow = { id: string; kind: string; name: string; version: string; description: string; enabled: boolean; builtin: boolean; status: string; access_policy: string; error?: string }
-type PersonaRow = { id: string; name: string; raw_prompt: string; created_at?: string; updated_at?: string }
+type PersonaCard = {
+  identity: { role: string; setting?: string; background?: string; experience?: string }
+  appearance?: { description?: string; clothing?: string; mannerisms?: string }
+  relationship?: { default_relation?: string; closeness?: string; self_reference?: string; user_address?: string }
+  personality?: { traits?: string[]; values?: string[]; emotional_baseline?: string; sensitivities?: string[] }
+  voice?: { vocabulary?: string; sentence_length?: string; rhythm?: string; punctuation?: string; emoji?: string; catchphrases?: string[]; humor?: string }
+  interaction?: { initiative?: string; question_habit?: string; listening_style?: string; care_expression?: string; disagreement_style?: string; silence_tolerance?: string }
+  boundaries?: { out_of_character?: string[]; avoid_machine_tone?: string[]; forbidden_fabrications?: string[] }
+  dialogue_examples?: Array<{ user: string; assistant: string }>
+}
+type PersonaRow = { id: string; name: string; status: 'active' | 'invalid'; card_version: number; card: PersonaCard | null; file_name: string; source: 'file'; validation_error?: string; created_at?: string; updated_at?: string }
+type StrategyGuideRow = { strategy: string; prompt_text: string; version: number; is_default: boolean; updated_at: string }
+type StrategyRevisionRow = { strategy: string; version: number; prompt_text: string; source: string; created_at: string }
 type AdminRow = { id: string; external_id: string; display_name?: string; platform: string; enabled: boolean }
 type CompanionPreferenceRow = {
   scope_id: string
@@ -43,10 +88,13 @@ type CompanionPreferenceRow = {
   support_mode: 'auto' | 'listen' | 'reflect' | 'advice'
   memory_enabled: boolean
   safety_mode: 'standard' | 'unfiltered'
+  listening_enabled: boolean
+  listening_silence_seconds: number
   analyzer_model_alias: string | null
   boundaries: Record<string, unknown>
   updated_at?: string | null
 }
+type ListeningBufferRow = { qq_user_id: string; listening_enabled: boolean; listening_silence_seconds: number; fragment_count: number }
 type RelationshipRow = {
   id?: string
   scope_id: string
@@ -94,6 +142,7 @@ type LogEvent = {
   parent_operation_id?: string; progress?: LogProgress
 }
 type NapcatStatus = { url: string; configured: boolean; status: string; two_factor: boolean; last_error?: string | null; last_log_at?: string | null }
+type QQReplySettings = { chunked_output_enabled: boolean }
 type ActiveLogResponse = { session_id: string; operations: LogEvent[]; napcat: NapcatStatus; onebot: { connection: string; qq: string; self_id?: string | null; nickname?: string | null } }
 type HealthData = {
   status?: string
@@ -128,7 +177,7 @@ const sending = ref(false)
 const health = ref<HealthData>({})
 const knowledgeBases = ref<KnowledgeBase[]>([])
 const documents = ref<DocumentRow[]>([])
-const memories = ref<MemoryRow[]>([])
+const memories = ref<MemoryCenterRow[]>([])
 const tasks = ref<TaskRow[]>([])
 const confirmations = ref<Confirmation[]>([])
 const selectedTaskIds = ref<string[]>([])
@@ -156,19 +205,41 @@ const companionBoundaryText = ref('{}')
 const companionLoading = ref(false)
 const companionSaving = ref(false)
 const companionSavedSafetyMode = ref<'standard' | 'unfiltered'>('standard')
+const companionListeningBuffer = ref<ListeningBufferRow>({ qq_user_id: '', listening_enabled: false, listening_silence_seconds: 30, fragment_count: 0 })
 const companionPrivacyDeleting = ref(false)
 const companionDeleteCategories = ref<string[]>(['relationships', 'assessments', 'feedback', 'safety', 'preferences'])
 const companionDeleteConfirm = ref('')
 const companionExpanded = ref(true)
 const personaName = ref('')
-const personaPrompt = ref('')
+const personaCard = ref<PersonaCard>({ identity: { role: '' } })
 const editingPersonaId = ref('')
+const personaExamplesText = ref('')
+const personaField = ref({
+  role: '', setting: '', background: '', experience: '', appearance: '', clothing: '', mannerisms: '',
+  relation: '', closeness: '', selfReference: '', userAddress: '', traits: '', values: '', baseline: '', sensitivities: '',
+  vocabulary: '', sentenceLength: '', rhythm: '', punctuation: '', emoji: '', catchphrases: '', humor: '',
+  initiative: '', questionHabit: '', listeningStyle: '', careExpression: '', disagreementStyle: '', silenceTolerance: '',
+  outOfCharacter: '', avoidMachineTone: '', forbiddenFabrications: '',
+})
+const strategyGuides = ref<StrategyGuideRow[]>([])
+const strategyGuideDraft = ref('')
+const strategyGuideRevisions = ref<StrategyRevisionRow[]>([])
+const editingStrategy = ref('listen')
+const strategyGuideSaving = ref(false)
 const adminQq = ref('')
 const adminName = ref('')
 const githubUrl = ref('')
-const memoryScope = ref('all')
-const memoryUserId = ref('')
-const memoryStatus = ref('active')
+const memoryType = ref<'all' | 'fact' | 'relationship'>('all')
+const memoryScope = ref<'all' | 'global' | 'user' | 'group'>('all')
+const memoryScopeId = ref('')
+const memoryPersonaKey = ref('')
+const memoryStatus = ref<'active' | 'archived' | 'all'>('active')
+const memoryKeyword = ref('')
+const memoryCenterLoading = ref(false)
+const memoryRelationshipDraft = ref<RelationshipRow | null>(null)
+const memoryRelationshipBoundaryText = ref('{}')
+const memoryRelationshipDialog = ref(false)
+const memoryRelationshipSaving = ref(false)
 const sidebarCollapsed = ref(false)
 const mobileSidebarOpen = ref(false)
 const isNarrow = ref(window.innerWidth < 1024)
@@ -189,6 +260,8 @@ const napcatConfig = ref<NapcatStatus>({ url: 'http://127.0.0.1:6099', configure
 const napcatToken = ref('')
 const napcatSaving = ref(false)
 const napcatTesting = ref(false)
+const qqReplySettings = ref<QQReplySettings>({ chunked_output_enabled: true })
+const qqReplySettingsSaving = ref(false)
 let logEventSource: EventSource | null = null
 const theme = ref<ThemeName>('light')
 let followsSystemTheme = false
@@ -196,7 +269,7 @@ let systemThemeQuery: MediaQueryList | undefined
 const currentConversation = computed(() => conversations.value.find((item) => item.id === currentConversationId.value))
 const hasIndexingDocuments = computed(() => documents.value.some((item) => ['queued', 'indexing'].includes(item.status)))
 const companionOwners = computed(() => admins.value.filter((item) => item.platform === 'qq' && item.enabled && /^\d{5,20}$/.test(item.external_id)))
-const companionPersonas = computed(() => [{ id: 'default', name: '默认人格' }, ...personas.value.map((item) => ({ id: item.id, name: item.name }))])
+const companionPersonas = computed(() => [{ id: 'default', name: '默认人格' }, ...personas.value.filter((item) => item.status === 'active').map((item) => ({ id: item.id, name: item.name }))])
 const companionAnalyzerFallbackAlias = computed(() => {
   const selected = companionPreferences.value?.analyzer_model_alias
   if (!selected) return ''
@@ -212,6 +285,10 @@ const companionEmotionLabels: Record<string, string> = {
 }
 const companionEmotionOptions = Object.entries(companionEmotionLabels).map(([value, label]) => ({ value, label }))
 const companionSupportNeedLabels: Record<string, string> = { listen: '倾听', comfort: '安慰', reflect: '一起梳理', advice: '建议', celebrate: '庆祝', space: '留一点空间', unknown: '尚不确定' }
+const strategyGuideLabels: Record<string, string> = {
+  listen: '倾听', validate: '确认感受', clarify: '确认需要', comfort: '安慰',
+  reflect: '一起梳理', advise: '建议', celebrate: '庆祝',
+}
 const companionAnalysisStatusLabels: Record<EmotionAssessmentRow['analysis_status'], string> = { valid: '有效', retrying: '重试中', failed: '分析失败', safety_redirected: '安全转向' }
 const companionAnalysisStatusTypes: Record<EmotionAssessmentRow['analysis_status'], 'success' | 'warning' | 'danger'> = { valid: 'success', retrying: 'warning', failed: 'danger', safety_redirected: 'warning' }
 function companionAnalysisStatusLabel(status: string) { return companionAnalysisStatusLabels[status as EmotionAssessmentRow['analysis_status']] || '未知' }
@@ -220,8 +297,8 @@ const DOCUMENT_REFRESH_INTERVAL_MS = 1000
 let documentRefreshTimer: number | undefined
 const routePaths: Record<string, string> = {
   chat: '/chat', models: '/models', knowledge: '/knowledge', tools: '/tools', skills: '/skills',
-  personas: '/personas', memory: '/memories', companion: '/companion', relationships: '/relationships',
-  emotionRecords: '/emotion-records', privacy: '/privacy', admin: '/admin', tasks: '/tasks', status: '/status', logs: '/logs',
+  personas: '/personas', memory: '/memories', companion: '/companion',
+  strategyGuides: '/strategy-guides', emotionRecords: '/emotion-records', privacy: '/privacy', admin: '/admin', tasks: '/tasks', status: '/status', logs: '/logs',
 }
 const pageDetails: Record<string, { title: string; description: string }> = {
   chat: { title: '对话', description: '与 M200 Agent 对话并管理会话模型和人格' },
@@ -229,10 +306,10 @@ const pageDetails: Record<string, { title: string; description: string }> = {
   knowledge: { title: '知识库', description: '管理文档、Embedding 配置和索引状态' },
   memory: { title: '长期记忆', description: '查看和维护全局、用户与群组记忆' },
   companion: { title: '陪伴设置', description: '为已启用的 QQ Owner 管理陪伴流程与记忆授权' },
-  relationships: { title: '关系资料', description: '按人格查看、修改或删除已授权的低敏感关系资料' },
+  strategyGuides: { title: '策略攻略', description: '编辑七种普通陪伴策略的方向性回复攻略和版本历史' },
   emotionRecords: { title: '情绪记录', description: '查看陪伴分析、支持需求、策略与用户纠正' },
   privacy: { title: '陪伴隐私', description: '导出或按分类删除陪伴数据' },
-  personas: { title: '人格管理', description: '创建可按会话切换的原始提示词人格' },
+  personas: { title: '人格管理', description: '通过结构化角色卡创建可按会话切换的人格' },
   tools: { title: '工具管理', description: '管理工具扩展并发起漫画搜索与下载' },
   skills: { title: '技能管理', description: '导入、启用和维护 Agent Skills' },
   tasks: { title: '任务中心', description: '处理待确认操作并跟踪后台任务' },
@@ -401,14 +478,16 @@ function openLogStream() {
 }
 
 async function loadLogs() {
-  const [history, active, config] = await Promise.all([
+  const [history, active, config, replySettings] = await Promise.all([
     api<{ session_id: string; events: LogEvent[] }>('/logs?limit=2000'),
     api<ActiveLogResponse>('/logs/active'),
     api<{ napcat: NapcatStatus }>('/logs/config'),
+    api<QQReplySettings>('/onebot/reply-settings'),
   ])
   logEvents.value = history.events || []
   activeLogOperations.value = active.operations || []
   napcatConfig.value = config.napcat
+  qqReplySettings.value = replySettings
   await scrollLogsToBottom(true)
 }
 
@@ -461,6 +540,26 @@ async function clearNapcatToken() {
     napcatToken.value = ''
     ElMessage.success('NapCat Token 已清除')
   } catch (error) { ElMessage.error(`清除 Token 失败：${(error as Error).message}`) }
+}
+
+async function saveQQReplySettings(value: boolean) {
+  // Element Plus updates v-model before emitting `change`; the previous
+  // persisted value is therefore the opposite of the newly selected switch
+  // state. Restore it if the PUT fails.
+  const previous = !value
+  qqReplySettingsSaving.value = true
+  try {
+    qqReplySettings.value = await api<QQReplySettings>('/onebot/reply-settings', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chunked_output_enabled: value }),
+    })
+    ElMessage.success(qqReplySettings.value.chunked_output_enabled ? 'QQ 自然分批输出已开启' : 'QQ 自然分批输出已关闭')
+  } catch (error) {
+    qqReplySettings.value.chunked_output_enabled = previous
+    ElMessage.error(`QQ 回复设置保存失败：${(error as Error).message}`)
+  } finally {
+    qqReplySettingsSaving.value = false
+  }
 }
 
 function modelDraftFrom(item: ModelProfile): ModelProfileDraft {
@@ -606,7 +705,21 @@ initializeTheme()
 
 function syncRoute() {
   const previous = activeTab.value
-  const route = Object.entries(routePaths).find(([, path]) => window.location.pathname === path)?.[0]
+  const url = new URL(window.location.href)
+  let route: string | undefined
+  if (url.pathname === '/relationships') {
+    route = 'memory'
+    memoryType.value = 'relationship'
+    window.history.replaceState({}, '', '/memories?memory_type=relationship')
+  } else {
+    route = Object.entries(routePaths).find(([, path]) => url.pathname === path)?.[0]
+    if (route === 'memory') {
+      const requestedType = url.searchParams.get('memory_type')
+      if (requestedType === 'fact' || requestedType === 'relationship' || requestedType === 'all') {
+        memoryType.value = requestedType
+      }
+    }
+  }
   if (route) activeTab.value = route
   mobileSidebarOpen.value = false
   if (previous === 'logs' && activeTab.value !== 'logs') closeLogStream()
@@ -614,16 +727,23 @@ function syncRoute() {
 }
 
 function changeTab(tab: string | number) {
-  const name = String(tab)
+  let name = String(tab)
+  if (name === 'relationships') {
+    name = 'memory'
+    memoryType.value = 'relationship'
+  }
   const previous = activeTab.value
   activeTab.value = name
-  const path = routePaths[name] || '/chat'
-  if (window.location.pathname !== path) window.history.pushState({}, '', path)
+  const path = name === 'memory' && memoryType.value === 'relationship'
+    ? '/memories?memory_type=relationship'
+    : routePaths[name] || '/chat'
+  if (`${window.location.pathname}${window.location.search}` !== path) window.history.pushState({}, '', path)
   mobileSidebarOpen.value = false
   if (previous === 'logs' && name !== 'logs') closeLogStream()
   if (name === 'logs') void enterLogsPage()
-  if (name === 'memory' || name === 'tasks') loadMemoryTasks()
-  if (['companion', 'relationships', 'emotionRecords', 'privacy'].includes(name)) void loadCompanionData()
+  if (name === 'memory' || name === 'tasks') void loadMemoryTasks()
+  if (['companion', 'emotionRecords', 'privacy'].includes(name)) void loadCompanionData()
+  if (name === 'strategyGuides') void loadStrategyGuides()
   if (name === 'models' && !editingModelAlias.value && models.value.length) {
     selectModel(models.value.find((item) => item.is_default) || models.value[0])
   }
@@ -797,13 +917,31 @@ function scheduleDocumentRefresh() {
   }, DOCUMENT_REFRESH_INTERVAL_MS)
 }
 
+async function loadMemoryCenter() {
+  const params = new URLSearchParams({
+    memory_type: memoryType.value,
+    scope_type: memoryScope.value,
+    status: memoryStatus.value,
+  })
+  if (memoryScopeId.value.trim()) params.set('scope_id', memoryScopeId.value.trim())
+  if (memoryPersonaKey.value && memoryType.value === 'relationship') params.set('persona_key', memoryPersonaKey.value)
+  if (memoryKeyword.value.trim()) params.set('keyword', memoryKeyword.value.trim())
+  memoryCenterLoading.value = true
+  try {
+    memories.value = await api<MemoryCenterRow[]>(`/memory-center?${params.toString()}`)
+  } catch (error) {
+    ElMessage.error(`长期记忆加载失败：${(error as Error).message}`)
+  } finally {
+    memoryCenterLoading.value = false
+  }
+}
+
 async function loadMemoryTasks() {
-  const [memoryData, taskData, confirmationData] = await Promise.all([
-    api<MemoryRow[]>(`/memories?scope=${memoryScope.value}${memoryUserId.value ? `&user_id=${encodeURIComponent(memoryUserId.value)}` : ''}${memoryStatus.value ? `&status=${memoryStatus.value}` : ''}`),
+  const [taskData, confirmationData] = await Promise.all([
     api<TaskRow[]>('/tasks'),
     api<Confirmation[]>('/confirmations?status=all'),
   ])
-  memories.value = memoryData
+  await loadMemoryCenter()
   tasks.value = taskData
   confirmations.value = confirmationData
   selectedTaskIds.value = selectedTaskIds.value.filter((id) => tasks.value.some((item) => item.id === id))
@@ -820,6 +958,111 @@ async function loadManagement() {
   admins.value = adminData
   if (!companionOwnerId.value || !companionOwners.value.some((item) => item.external_id === companionOwnerId.value)) {
     companionOwnerId.value = companionOwners.value[0]?.external_id || ''
+  }
+}
+
+async function loadStrategyGuides() {
+  try {
+    strategyGuides.value = await api<StrategyGuideRow[]>('/companion/strategy-guides')
+    const current = strategyGuides.value.find((item) => item.strategy === editingStrategy.value)
+      || strategyGuides.value[0]
+    if (current) {
+      editingStrategy.value = current.strategy
+      strategyGuideDraft.value = current.prompt_text
+      await loadStrategyRevisions()
+    }
+  } catch (error) {
+    ElMessage.error(`策略攻略加载失败：${(error as Error).message}`)
+  }
+}
+
+async function loadStrategyRevisions() {
+  if (!editingStrategy.value) return
+  try {
+    strategyGuideRevisions.value = await api<StrategyRevisionRow[]>(
+      `/companion/strategy-guides/${encodeURIComponent(editingStrategy.value)}/revisions`,
+    )
+  } catch (error) {
+    ElMessage.error(`策略版本加载失败：${(error as Error).message}`)
+  }
+}
+
+function selectStrategyGuide(strategy: string) {
+  editingStrategy.value = strategy
+  const item = strategyGuides.value.find((row) => row.strategy === strategy)
+  strategyGuideDraft.value = item?.prompt_text || ''
+  void loadStrategyRevisions()
+}
+
+async function saveStrategyGuide() {
+  const item = strategyGuides.value.find((row) => row.strategy === editingStrategy.value)
+  if (!item || !strategyGuideDraft.value.trim()) return
+  strategyGuideSaving.value = true
+  try {
+    const saved = await api<StrategyGuideRow>(
+      `/companion/strategy-guides/${encodeURIComponent(editingStrategy.value)}`,
+      {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt_text: strategyGuideDraft.value, expected_version: item.version }),
+      },
+    )
+    strategyGuides.value = strategyGuides.value.map((row) => row.strategy === saved.strategy ? saved : row)
+    strategyGuideDraft.value = saved.prompt_text
+    await loadStrategyRevisions()
+    ElMessage.success('策略攻略已保存')
+  } catch (error) {
+    ElMessage.error(`策略攻略保存失败：${(error as Error).message}`)
+    await loadStrategyGuides()
+  } finally {
+    strategyGuideSaving.value = false
+  }
+}
+
+async function rollbackStrategyGuide(revision: StrategyRevisionRow) {
+  const item = strategyGuides.value.find((row) => row.strategy === editingStrategy.value)
+  if (!item || !window.confirm(`确定回滚到策略攻略版本 ${revision.version}？这会创建一个新版本。`)) return
+  strategyGuideSaving.value = true
+  try {
+    const saved = await api<StrategyGuideRow>(
+      `/companion/strategy-guides/${encodeURIComponent(editingStrategy.value)}/rollback`,
+      {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ revision_version: revision.version, expected_version: item.version }),
+      },
+    )
+    strategyGuides.value = strategyGuides.value.map((row) => row.strategy === saved.strategy ? saved : row)
+    strategyGuideDraft.value = saved.prompt_text
+    await loadStrategyRevisions()
+    ElMessage.success('策略攻略已回滚')
+  } catch (error) {
+    ElMessage.error(`策略攻略回滚失败：${(error as Error).message}`)
+    await loadStrategyGuides()
+  } finally {
+    strategyGuideSaving.value = false
+  }
+}
+
+async function resetStrategyGuide() {
+  const item = strategyGuides.value.find((row) => row.strategy === editingStrategy.value)
+  if (!item || !window.confirm('确定恢复该策略的内置攻略？这会创建一个新版本。')) return
+  strategyGuideSaving.value = true
+  try {
+    const saved = await api<StrategyGuideRow>(
+      `/companion/strategy-guides/${encodeURIComponent(editingStrategy.value)}/reset`,
+      {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ expected_version: item.version }),
+      },
+    )
+    strategyGuides.value = strategyGuides.value.map((row) => row.strategy === saved.strategy ? saved : row)
+    strategyGuideDraft.value = saved.prompt_text
+    await loadStrategyRevisions()
+    ElMessage.success('已恢复内置攻略')
+  } catch (error) {
+    ElMessage.error(`恢复内置攻略失败：${(error as Error).message}`)
+    await loadStrategyGuides()
+  } finally {
+    strategyGuideSaving.value = false
   }
 }
 
@@ -845,11 +1088,12 @@ async function loadCompanionData() {
   companionLoading.value = true
   try {
     const scope = companionRequestId()
-    const [preference, relationships, assessments, exported] = await Promise.all([
+    const [preference, relationships, assessments, exported, listeningBuffer] = await Promise.all([
       api<CompanionPreferenceRow>(`/companion/preferences${scope}`),
       api<RelationshipRow[]>(`/companion/relationships${scope}`),
       api<EmotionAssessmentRow[]>(`/companion/assessments${scope}&limit=100`),
       api<{ feedback: CompanionFeedbackRow[]; safety_events: CompanionSafetyRow[] }>(`/companion/privacy/export${scope}`),
+      api<ListeningBufferRow>(`/companion/listening-buffer${scope}`),
     ])
     companionPreferences.value = preference
     companionSavedSafetyMode.value = preference.safety_mode || 'standard'
@@ -859,6 +1103,7 @@ async function loadCompanionData() {
     initializeCompanionCorrections(assessments)
     companionFeedback.value = exported.feedback || []
     companionSafetyEvents.value = exported.safety_events || []
+    companionListeningBuffer.value = listeningBuffer
   } catch (error) {
     ElMessage.error(`陪伴数据加载失败：${(error as Error).message}`)
   } finally {
@@ -1010,6 +1255,18 @@ async function deleteCompanionData() {
   }
 }
 
+async function clearCompanionListeningBuffer() {
+  if (!companionOwnerId.value || !companionListeningBuffer.value.fragment_count) return
+  if (!window.confirm('确定清空尚未发送给模型的连续消息片段？')) return
+  try {
+    await api(`/companion/listening-buffer${companionRequestId()}`, { method: 'DELETE' })
+    await loadCompanionData()
+    ElMessage.success('连续消息缓冲已清空')
+  } catch (error) {
+    ElMessage.error(`连续消息缓冲清空失败：${(error as Error).message}`)
+  }
+}
+
 async function setExtension(kind: 'tools' | 'skills', item: ExtensionRow, enabled: boolean) {
   await api(`/${kind}/${item.name}/${enabled ? 'enable' : 'disable'}`, { method: 'POST' })
   await loadManagement()
@@ -1036,19 +1293,133 @@ async function importGithub(kind: 'tools' | 'skills') {
   githubUrl.value = ''; await loadManagement(); ElMessage.success('GitHub 扩展已导入，默认停用')
 }
 
-async function savePersona() {
-  if (!personaName.value.trim() || !personaPrompt.value.trim()) return
-  if (editingPersonaId.value) {
-    await api(`/personas/${editingPersonaId.value}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: personaName.value, raw_prompt: personaPrompt.value }) })
-  } else {
-    await api('/personas', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: personaName.value, raw_prompt: personaPrompt.value }) })
+function splitPersonaValues(value: string | undefined) {
+  return (value || '')
+    .split(/[\n,，、;；]/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .slice(0, 12)
+}
+
+function trimPersonaValue(value: string | undefined) {
+  const trimmed = (value || '').trim()
+  return trimmed || undefined
+}
+
+function buildPersonaCard(): PersonaCard | null {
+  const draft = personaField.value
+  const role = draft.role.trim()
+  if (!role) return null
+  const card: PersonaCard = { identity: { role } }
+  const identity = {
+    setting: trimPersonaValue(draft.setting),
+    background: trimPersonaValue(draft.background),
+    experience: trimPersonaValue(draft.experience),
   }
-  personaName.value = ''; personaPrompt.value = ''; editingPersonaId.value = ''
-  await loadManagement()
+  if (Object.values(identity).some(Boolean)) card.identity = { role, ...identity }
+  const appearance = {
+    description: trimPersonaValue(draft.appearance), clothing: trimPersonaValue(draft.clothing),
+    mannerisms: trimPersonaValue(draft.mannerisms),
+  }
+  if (Object.values(appearance).some(Boolean)) card.appearance = appearance
+  const relationship = {
+    default_relation: trimPersonaValue(draft.relation), closeness: trimPersonaValue(draft.closeness),
+    self_reference: trimPersonaValue(draft.selfReference), user_address: trimPersonaValue(draft.userAddress),
+  }
+  if (Object.values(relationship).some(Boolean)) card.relationship = relationship
+  const personality = {
+    traits: splitPersonaValues(draft.traits), values: splitPersonaValues(draft.values),
+    emotional_baseline: trimPersonaValue(draft.baseline), sensitivities: splitPersonaValues(draft.sensitivities),
+  }
+  if (personality.traits.length || personality.values.length || personality.emotional_baseline || personality.sensitivities.length) card.personality = personality
+  const voice = {
+    vocabulary: trimPersonaValue(draft.vocabulary), sentence_length: trimPersonaValue(draft.sentenceLength),
+    rhythm: trimPersonaValue(draft.rhythm), punctuation: trimPersonaValue(draft.punctuation),
+    emoji: trimPersonaValue(draft.emoji), catchphrases: splitPersonaValues(draft.catchphrases), humor: trimPersonaValue(draft.humor),
+  }
+  if (Object.values(voice).some((value) => Array.isArray(value) ? value.length > 0 : Boolean(value))) card.voice = voice
+  const interaction = {
+    initiative: trimPersonaValue(draft.initiative), question_habit: trimPersonaValue(draft.questionHabit),
+    listening_style: trimPersonaValue(draft.listeningStyle), care_expression: trimPersonaValue(draft.careExpression),
+    disagreement_style: trimPersonaValue(draft.disagreementStyle), silence_tolerance: trimPersonaValue(draft.silenceTolerance),
+  }
+  if (Object.values(interaction).some(Boolean)) card.interaction = interaction
+  const boundaries = {
+    out_of_character: splitPersonaValues(draft.outOfCharacter), avoid_machine_tone: splitPersonaValues(draft.avoidMachineTone),
+    forbidden_fabrications: splitPersonaValues(draft.forbiddenFabrications),
+  }
+  if (Object.values(boundaries).some((value) => value.length > 0)) card.boundaries = boundaries
+  const examples = personaExamplesText.value.split('\n').map((line) => line.trim()).filter(Boolean).slice(0, 8).flatMap((line) => {
+    const separator = line.indexOf('=>')
+    if (separator < 1) return []
+    const user = line.slice(0, separator).trim()
+    const assistant = line.slice(separator + 2).trim()
+    return user && assistant ? [{ user, assistant }] : []
+  })
+  if (examples.length) card.dialogue_examples = examples
+  personaCard.value = card
+  return card
+}
+
+function clearPersonaDraft() {
+  personaName.value = ''
+  personaCard.value = { identity: { role: '' } }
+  personaExamplesText.value = ''
+  personaField.value = {
+    role: '', setting: '', background: '', experience: '', appearance: '', clothing: '', mannerisms: '',
+    relation: '', closeness: '', selfReference: '', userAddress: '', traits: '', values: '', baseline: '', sensitivities: '',
+    vocabulary: '', sentenceLength: '', rhythm: '', punctuation: '', emoji: '', catchphrases: '', humor: '',
+    initiative: '', questionHabit: '', listeningStyle: '', careExpression: '', disagreementStyle: '', silenceTolerance: '',
+    outOfCharacter: '', avoidMachineTone: '', forbiddenFabrications: '',
+  }
+  editingPersonaId.value = ''
+}
+
+function fillPersonaDraft(item: PersonaRow) {
+  const card = item.card
+  const toText = (value: string[] | undefined) => (value || []).join('、')
+  personaName.value = item.name
+  personaCard.value = card || { identity: { role: '' } }
+  personaExamplesText.value = (card?.dialogue_examples || []).map((example) => `${example.user} => ${example.assistant}`).join('\n')
+  personaField.value = {
+    role: card?.identity?.role || '', setting: card?.identity?.setting || '', background: card?.identity?.background || '', experience: card?.identity?.experience || '',
+    appearance: card?.appearance?.description || '', clothing: card?.appearance?.clothing || '', mannerisms: card?.appearance?.mannerisms || '',
+    relation: card?.relationship?.default_relation || '', closeness: card?.relationship?.closeness || '', selfReference: card?.relationship?.self_reference || '', userAddress: card?.relationship?.user_address || '',
+    traits: toText(card?.personality?.traits), values: toText(card?.personality?.values), baseline: card?.personality?.emotional_baseline || '', sensitivities: toText(card?.personality?.sensitivities),
+    vocabulary: card?.voice?.vocabulary || '', sentenceLength: card?.voice?.sentence_length || '', rhythm: card?.voice?.rhythm || '', punctuation: card?.voice?.punctuation || '', emoji: card?.voice?.emoji || '', catchphrases: toText(card?.voice?.catchphrases), humor: card?.voice?.humor || '',
+    initiative: card?.interaction?.initiative || '', questionHabit: card?.interaction?.question_habit || '', listeningStyle: card?.interaction?.listening_style || '', careExpression: card?.interaction?.care_expression || '', disagreementStyle: card?.interaction?.disagreement_style || '', silenceTolerance: card?.interaction?.silence_tolerance || '',
+    outOfCharacter: toText(card?.boundaries?.out_of_character), avoidMachineTone: toText(card?.boundaries?.avoid_machine_tone), forbiddenFabrications: toText(card?.boundaries?.forbidden_fabrications),
+  }
+}
+
+async function savePersona() {
+  const card = buildPersonaCard()
+  if (!personaName.value.trim()) {
+    ElMessage.warning('请填写人格名称')
+    return
+  }
+  if (!card) {
+    ElMessage.warning('请填写基础身份中的“身份/职业”')
+    return
+  }
+  try {
+    const body = JSON.stringify({ name: personaName.value.trim(), card })
+    if (editingPersonaId.value) {
+      await api(`/personas/${editingPersonaId.value}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body })
+    } else {
+      await api('/personas', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body })
+    }
+    clearPersonaDraft()
+    await loadManagement()
+    ElMessage.success('人格角色卡已保存')
+  } catch (error) {
+    ElMessage.error(`人格保存失败：${(error as Error).message}`)
+  }
 }
 
 function editPersona(item: PersonaRow) {
-  editingPersonaId.value = item.id; personaName.value = item.name; personaPrompt.value = item.raw_prompt
+  editingPersonaId.value = item.id
+  fillPersonaDraft(item)
 }
 
 async function deletePersona(item: PersonaRow) {
@@ -1071,22 +1442,133 @@ async function removeAdmin(item: AdminRow) {
 
 async function archiveMemory(id: string) {
   await api(`/memories/${id}/archive`, { method: 'POST' })
-  await loadMemoryTasks()
+  await loadMemoryCenter()
 }
 
-async function editMemory(item: MemoryRow) {
+async function restoreMemory(id: string) {
+  await api(`/memories/${id}/restore`, { method: 'POST' })
+  await loadMemoryCenter()
+}
+
+async function editMemory(item: MemoryCenterFact) {
   const content = window.prompt('修改记忆内容', item.content)?.trim()
   if (!content || content === item.content) return
   await api(`/memories/${item.id}`, {
     method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content }),
   })
-  await loadMemoryTasks()
+  await loadMemoryCenter()
 }
 
 async function deleteMemory(id: string) {
   if (!window.confirm('确定删除这条记忆？')) return
   await api(`/memories/${id}`, { method: 'DELETE' })
-  await loadMemoryTasks()
+  await loadMemoryCenter()
+}
+
+function memoryTypeLabel(item: MemoryCenterRow) {
+  return item.memory_type === 'fact' ? '普通事实' : '陪伴关系'
+}
+
+function memoryScopeLabel(item: MemoryCenterRow) {
+  if (item.scope_type === 'global') return '全局'
+  if (item.scope_type === 'group') return `群组 · ${item.scope_id || '未知'}`
+  return `用户 · ${item.scope_id || '未知'}`
+}
+
+function memoryRelationshipBoundaryCount(item: MemoryCenterRelationship) {
+  return Object.keys(item.boundaries || {}).length
+}
+
+function editMemoryRelationship(item: MemoryCenterRelationship) {
+  memoryRelationshipDraft.value = {
+    id: item.id,
+    scope_id: item.scope_id,
+    persona_key: item.persona_key,
+    persona_id: item.persona_id,
+    nickname: item.nickname,
+    shared_summary: item.shared_summary,
+    boundaries: item.boundaries || {},
+    version: item.version,
+    updated_at: item.updated_at,
+  }
+  memoryRelationshipBoundaryText.value = JSON.stringify(item.boundaries || {}, null, 2)
+  memoryRelationshipDialog.value = true
+}
+
+function newMemoryRelationship() {
+  const ownerId = memoryScope.value !== 'group' && /^\d{5,20}$/.test(memoryScopeId.value.trim())
+    ? memoryScopeId.value.trim()
+    : companionOwnerId.value || companionOwners.value[0]?.external_id || ''
+  if (!ownerId) {
+    ElMessage.warning('请先在“管理员”中启用 QQ Owner')
+    return
+  }
+  const selectedPersona = memoryPersonaKey.value || companionPersonaKey.value || 'default'
+  const exists = memories.value.some(
+    (item) => item.memory_type === 'relationship' && item.scope_id === ownerId && item.persona_key === selectedPersona,
+  )
+  if (exists) {
+    ElMessage.info('该用户与人格的关系资料已存在，请直接编辑')
+    return
+  }
+  memoryRelationshipDraft.value = {
+    scope_id: ownerId,
+    persona_key: selectedPersona,
+    persona_id: selectedPersona === 'default' ? null : selectedPersona,
+    nickname: null,
+    shared_summary: '',
+    boundaries: {},
+    version: 0,
+  }
+  memoryRelationshipBoundaryText.value = '{}'
+  memoryRelationshipDialog.value = true
+}
+
+async function saveMemoryRelationship() {
+  const draft = memoryRelationshipDraft.value
+  if (!draft) return
+  let boundaries: Record<string, unknown>
+  try {
+    boundaries = JSON.parse(memoryRelationshipBoundaryText.value || '{}') as Record<string, unknown>
+  } catch {
+    ElMessage.warning('边界必须是合法 JSON')
+    return
+  }
+  memoryRelationshipSaving.value = true
+  try {
+    const saved = await api<RelationshipRow>(`/companion/relationships/${encodeURIComponent(draft.persona_key)}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        qq_user_id: draft.scope_id,
+        nickname: draft.nickname,
+        shared_summary: draft.shared_summary,
+        boundaries,
+        version: draft.version,
+      }),
+    })
+    memoryRelationshipDraft.value = { ...draft, ...saved, boundaries }
+    memoryRelationshipDialog.value = false
+    await loadMemoryCenter()
+    if (companionOwnerId.value === draft.scope_id) await loadCompanionData()
+    ElMessage.success('关系资料已保存')
+  } catch (error) {
+    ElMessage.error(`关系资料保存失败：${(error as Error).message}`)
+    if ((error as Error).message.includes('版本')) await loadMemoryCenter()
+  } finally {
+    memoryRelationshipSaving.value = false
+  }
+}
+
+async function deleteMemoryRelationship(item: MemoryCenterRelationship) {
+  if (!window.confirm(`确定删除“${item.persona_name || item.persona_key}”的关系资料？`)) return
+  try {
+    await api(`/companion/relationships/${encodeURIComponent(item.persona_key)}?qq_user_id=${encodeURIComponent(item.scope_id)}&version=${item.version}`, { method: 'DELETE' })
+    await loadMemoryCenter()
+    if (companionOwnerId.value === item.scope_id) await loadCompanionData()
+    ElMessage.success('关系资料已删除')
+  } catch (error) {
+    ElMessage.error(`关系资料删除失败：${(error as Error).message}`)
+  }
 }
 
 async function deleteDocument(id: string) {
@@ -1199,7 +1681,8 @@ onMounted(async () => {
   window.addEventListener('resize', handleResize)
   try { await loadBase(); await loadDocuments(); await loadMemoryTasks(); await loadManagement() }
   catch (error) { ElMessage.error((error as Error).message) }
-  if (['companion', 'relationships', 'emotionRecords', 'privacy'].includes(activeTab.value)) await loadCompanionData()
+  if (['companion', 'emotionRecords', 'privacy'].includes(activeTab.value)) await loadCompanionData()
+  if (activeTab.value === 'strategyGuides') await loadStrategyGuides()
   if (activeTab.value === 'logs') await enterLogsPage()
 })
 
@@ -1236,7 +1719,7 @@ onUnmounted(() => {
         </button>
         <div v-show="sidebarCollapsed || companionExpanded" class="nav-children">
           <button class="nav-item" aria-label="陪伴设置" title="陪伴设置" :class="{ active: activeTab === 'companion' }" @click="changeTab('companion')"><el-icon><Setting /></el-icon><span>陪伴设置</span></button>
-          <button class="nav-item" aria-label="关系资料" title="关系资料" :class="{ active: activeTab === 'relationships' }" @click="changeTab('relationships')"><el-icon><UserFilled /></el-icon><span>关系资料</span></button>
+          <button class="nav-item" aria-label="策略攻略" title="策略攻略" :class="{ active: activeTab === 'strategyGuides' }" @click="changeTab('strategyGuides')"><el-icon><Memo /></el-icon><span>策略攻略</span></button>
           <button class="nav-item" aria-label="情绪记录" title="情绪记录" :class="{ active: activeTab === 'emotionRecords' }" @click="changeTab('emotionRecords')"><el-icon><DataAnalysis /></el-icon><span>情绪记录</span></button>
           <button class="nav-item" aria-label="陪伴隐私" title="陪伴隐私" :class="{ active: activeTab === 'privacy' }" @click="changeTab('privacy')"><el-icon><Delete /></el-icon><span>陪伴隐私</span></button>
         </div>
@@ -1308,7 +1791,7 @@ onUnmounted(() => {
               <div class="chat-title"><button class="icon-button conversation-toggle" aria-label="显示或隐藏会话列表" @click="conversationListOpen = !conversationListOpen"><el-icon><Menu /></el-icon></button><span><span class="section-kicker">当前会话</span><strong>{{ currentConversation?.title || '未选择会话' }}</strong></span></div>
               <div class="toolbar-selects">
                 <el-select :model-value="currentConversation?.model_alias" placeholder="选择模型" @change="switchModel"><el-option v-for="model in models" :key="model.alias" :label="`${model.alias}${model.configured ? '' : '（未配置）'}`" :value="model.alias" /></el-select>
-                <el-select :model-value="currentConversation?.persona_id || ''" placeholder="选择人格" @change="switchPersona"><el-option label="关闭人格" value="" /><el-option v-for="item in personas" :key="item.id" :label="item.name" :value="item.id" /></el-select>
+                <el-select :model-value="currentConversation?.persona_id || ''" placeholder="选择人格" @change="switchPersona"><el-option label="关闭人格" value="" /><el-option v-for="item in personas" :key="item.id" :label="`${item.name}${item.status === 'active' ? '' : '（文件无效）'}`" :value="item.id" :disabled="item.status !== 'active'" /></el-select>
               </div>
             </div>
             <div ref="messagesContainer" class="messages" @scroll="handleMessagesScroll">
@@ -1333,6 +1816,8 @@ onUnmounted(() => {
               <div v-if="companionPreferences" class="stack companion-settings">
                 <div class="form-row"><span class="setting-label">陪伴流程</span><el-switch v-model="companionPreferences.companion_enabled" active-text="启用" inactive-text="暂停" /></div>
                 <label class="field-control"><span>默认支持方式</span><el-select v-model="companionPreferences.support_mode"><el-option label="自动判断" value="auto" /><el-option label="倾听" value="listen" /><el-option label="一起梳理" value="reflect" /><el-option label="建议" value="advice" /></el-select></label>
+                <div class="form-row"><span class="setting-label">你听我说模式</span><el-switch v-model="companionPreferences.listening_enabled" active-text="已开启" inactive-text="关闭" /><small class="hint-inline">仅 Owner QQ 私聊生效；{{ companionPreferences.listening_silence_seconds }} 秒无新片段后合并回复。</small></div>
+                <div class="result listening-buffer-status"><span><strong>当前缓冲</strong><small>{{ companionListeningBuffer.fragment_count }} 条片段；重启后不会自动发送，继续输入或使用完成命令即可处理。</small></span><el-button size="small" :disabled="!companionListeningBuffer.fragment_count" @click="clearCompanionListeningBuffer">清空</el-button></div>
                 <label class="field-control"><span>安全模式</span><el-select v-model="companionPreferences.safety_mode"><el-option label="标准防护" value="standard" /><el-option label="无过滤模式（仅本机拦截关闭）" value="unfiltered" /></el-select></label>
                 <el-alert v-if="companionPreferences.safety_mode === 'unfiltered'" type="error" :closable="false" title="无过滤模式已选择" description="仅关闭本机陪伴内容拦截；Owner 权限、Tool 确认、文件隔离、密钥脱敏和模型服务商自身规则仍然有效。保存时需要输入确认文本。" />
                 <label class="field-control"><span>情绪分析模型 alias</span><el-select v-model="companionPreferences.analyzer_model_alias" clearable placeholder="跟随当前会话主模型"><el-option v-for="item in models" :key="item.alias" :label="`${item.alias}${item.configured ? '' : '（不可用）'}`" :value="item.alias" /></el-select><small v-if="companionAnalyzerFallbackAlias" class="hint-inline">所选 alias 不可用，当前请求会回退到：{{ companionAnalyzerFallbackAlias }}</small></label>
@@ -1344,24 +1829,35 @@ onUnmounted(() => {
             <section class="panel stack">
               <div class="panel-heading"><div><span class="section-kicker">使用边界</span><h2>当前安全说明</h2></div><el-icon><Warning /></el-icon></div>
               <p class="hint">情绪标签是可纠正的候选分类，不是心理诊断。<template v-if="companionPreferences?.safety_mode === 'unfiltered'">当前无过滤模式只做风险审计，高风险内容仍进入普通 Agent；本机权限和模型服务商规则不变。</template><template v-else>标准模式下，高风险内容会停止普通角色扮演和工具调用，转入安全支持提示。</template></p>
-              <div class="card-list"><div class="result"><span><strong>记忆默认状态</strong><small>首次授权前，历史资料保留但当前回合不召回、不写入。</small></span><el-tag type="warning">默认关闭</el-tag></div><div class="result"><span><strong>分析模型不可用</strong><small>自动回退当前会话主模型；仍不可用时使用澄清降级。</small></span><el-tag type="info">自动回退</el-tag></div><div class="result"><span><strong>数据控制</strong><small>可在关系资料和隐私页面修改、导出或分类删除。</small></span><el-button size="small" @click="changeTab('privacy')">管理隐私</el-button></div></div>
+              <div class="card-list"><div class="result"><span><strong>记忆默认状态</strong><small>首次授权前，历史资料保留但当前回合不召回、不写入。</small></span><el-tag type="warning">默认关闭</el-tag></div><div class="result"><span><strong>分析模型不可用</strong><small>自动回退当前会话主模型；仍不可用时使用澄清降级。</small></span><el-tag type="info">自动回退</el-tag></div><div class="result"><span><strong>数据控制</strong><small>关系资料统一在长期记忆中心管理；隐私页面可导出或分类删除。</small></span><el-button size="small" @click="changeTab('privacy')">管理隐私</el-button></div></div>
             </section>
           </div>
         </template>
 
-        <template v-else-if="activeTab === 'relationships'">
-          <section v-if="!companionOwners.length" class="panel stack"><h2>暂无可用 QQ Owner</h2><p class="hint">请先启用 QQ Owner。</p></section>
-          <section v-else class="panel stack">
-            <div class="panel-heading"><div><span class="section-kicker">关系范围</span><h2>已授权关系资料</h2></div><span class="count-badge">{{ companionRelationships.length }}</span></div>
-            <div class="form-row"><el-select v-model="companionOwnerId" @change="loadCompanionData"><el-option v-for="item in companionOwners" :key="item.external_id" :label="`${item.display_name || 'QQ Owner'} · ${item.external_id}`" :value="item.external_id" /></el-select><el-select v-model="companionPersonaKey"><el-option v-for="item in companionPersonas" :key="item.id" :label="item.name" :value="item.id" /></el-select><el-button @click="newCompanionRelationship">添加人格资料</el-button></div>
-            <el-alert title="只保存用户明确表达的低敏感事实；诊断、危机细节、凭据、精确位置和第三方隐私不会自动写入。" type="info" :closable="false" />
-            <div v-for="item in companionRelationships" :key="item.persona_key" class="relationship-editor">
-              <div class="panel-heading"><div><span class="section-kicker">人格</span><h3>{{ companionPersonas.find((persona) => persona.id === item.persona_key)?.name || item.persona_key }}</h3></div><el-tag size="small" type="info">版本 {{ item.version }}</el-tag></div>
-              <div class="model-form-grid"><label class="field-control"><span>称呼</span><el-input v-model="item.nickname" placeholder="用户希望的称呼" /></label><label class="field-control field-wide"><span>共同经历摘要</span><el-input v-model="item.shared_summary" type="textarea" :rows="3" maxlength="4000" /></label><label class="field-control field-wide"><span>边界（JSON）</span><el-input :model-value="JSON.stringify(item.boundaries || {}, null, 2)" type="textarea" :rows="3" @change="updateRelationshipBoundaries(item, $event)" /></label></div>
-              <div class="form-row"><el-button type="primary" @click="saveCompanionRelationship(item)">保存</el-button><el-button type="danger" plain @click="deleteCompanionRelationship(item)">删除资料</el-button></div>
-            </div>
-            <div v-if="!companionRelationships.length" class="empty-copy">当前没有关系资料。选择人格后点击“添加人格资料”开始编辑。</div>
-          </section>
+        <template v-else-if="activeTab === 'strategyGuides'">
+          <div class="two-column strategy-guides-layout">
+            <section class="panel stack">
+              <div class="panel-heading"><div><span class="section-kicker">方向性提示</span><h2>普通策略攻略</h2></div><span class="count-badge">{{ strategyGuides.length }}</span></div>
+              <p class="hint">攻略只告诉模型本轮该把注意力放在哪里，不规定固定开场、句式或字数；角色卡的身份和语气始终优先。安全转向攻略不可编辑。</p>
+              <div class="card-list strategy-guide-list">
+                <button v-for="item in strategyGuides" :key="item.strategy" class="result strategy-guide-row" :class="{ active: item.strategy === editingStrategy }" @click="selectStrategyGuide(item.strategy)">
+                  <span><strong>{{ strategyGuideLabels[item.strategy] || item.strategy }}</strong><small>版本 {{ item.version }}<template v-if="item.is_default"> · 内置</template></small></span>
+                  <el-icon><Memo /></el-icon>
+                </button>
+                <div v-if="!strategyGuides.length" class="empty-copy">策略攻略尚未初始化。</div>
+              </div>
+            </section>
+            <section class="panel stack">
+              <div class="panel-heading"><div><span class="section-kicker">编辑</span><h2>{{ strategyGuideLabels[editingStrategy] || editingStrategy }}</h2></div><el-tag v-if="strategyGuides.find((item) => item.strategy === editingStrategy)?.is_default" type="info">内置默认</el-tag></div>
+              <el-input v-model="strategyGuideDraft" type="textarea" :rows="10" maxlength="4000" show-word-limit placeholder="描述本策略要做什么、注意什么，以及应保持怎样的语气；不要写固定模板。" />
+              <div class="form-row"><el-button type="primary" :loading="strategyGuideSaving" @click="saveStrategyGuide">保存新版本</el-button><el-button :loading="strategyGuideSaving" @click="resetStrategyGuide">恢复内置默认</el-button></div>
+              <div class="advanced-heading"><span>版本历史</span><small>回滚也会创建新版本</small></div>
+              <div class="card-list">
+                <div v-for="revision in strategyGuideRevisions" :key="`${revision.strategy}-${revision.version}`" class="result"><span><strong>版本 {{ revision.version }} · {{ revision.source === 'default' ? '默认' : revision.source === 'rollback' ? '回滚' : '编辑' }}</strong><small>{{ revision.created_at }} · {{ revision.prompt_text }}</small></span><el-button size="small" :disabled="revision.version === strategyGuides.find((item) => item.strategy === editingStrategy)?.version" @click="rollbackStrategyGuide(revision)">回滚</el-button></div>
+                <div v-if="!strategyGuideRevisions.length" class="empty-copy">暂无版本历史。</div>
+              </div>
+            </section>
+          </div>
         </template>
 
         <template v-else-if="activeTab === 'emotionRecords'">
@@ -1445,11 +1941,72 @@ onUnmounted(() => {
         </template>
 
         <template v-else-if="activeTab === 'memory'">
-          <section class="panel stack"><div class="panel-heading"><div><span class="section-kicker">筛选</span><h2>长期记忆</h2></div></div><div class="form-row"><el-select v-model="memoryScope" @change="loadMemoryTasks"><el-option label="全部" value="all" /><el-option label="全局记忆" value="global" /><el-option label="指定用户" value="user" /></el-select><el-input v-model="memoryUserId" placeholder="QQ 用户 ID（可选）" @change="loadMemoryTasks" /><el-select v-model="memoryStatus" @change="loadMemoryTasks"><el-option label="有效" value="active" /><el-option label="已归档" value="archived" /><el-option label="全部状态" value="" /></el-select></div><div class="table-wrap"><el-table :data="memories"><el-table-column prop="fact_key" label="事实键" min-width="180" /><el-table-column prop="content" label="内容" min-width="320" /><el-table-column prop="status" label="状态" width="110" /><el-table-column label="操作" width="230"><template #default="scope"><el-button size="small" @click="editMemory(scope.row)">编辑</el-button><el-button size="small" @click="archiveMemory(scope.row.id)">归档</el-button><el-button size="small" type="danger" plain @click="deleteMemory(scope.row.id)">删除</el-button></template></el-table-column></el-table></div></section>
+          <section class="panel stack">
+            <div class="panel-heading">
+              <div><span class="section-kicker">统一长期记忆中心</span><h2>长期记忆</h2></div>
+              <el-button v-if="memoryType !== 'fact'" type="primary" :disabled="!companionOwners.length" @click="newMemoryRelationship">添加陪伴关系</el-button>
+            </div>
+            <div class="form-row memory-center-filters">
+              <el-select v-model="memoryType" @change="loadMemoryCenter"><el-option label="全部记忆" value="all" /><el-option label="普通事实" value="fact" /><el-option label="陪伴关系" value="relationship" /></el-select>
+              <el-select v-model="memoryScope" @change="loadMemoryCenter"><el-option label="全部作用域" value="all" /><el-option label="全局" value="global" /><el-option label="用户" value="user" /><el-option label="群组" value="group" /></el-select>
+              <el-input v-model="memoryScopeId" placeholder="用户 / 群组 ID（可选）" @change="loadMemoryCenter" />
+              <el-select v-if="memoryType === 'relationship'" v-model="memoryPersonaKey" clearable placeholder="全部人格" @change="loadMemoryCenter"><el-option v-for="item in companionPersonas" :key="item.id" :label="item.name" :value="item.id" /></el-select>
+              <el-select v-model="memoryStatus" @change="loadMemoryCenter"><el-option label="有效" value="active" /><el-option label="已归档" value="archived" /><el-option label="全部状态" value="all" /></el-select>
+              <el-input v-model="memoryKeyword" clearable placeholder="检索键、正文、关系资料或人格" @keyup.enter="loadMemoryCenter" />
+              <el-button @click="loadMemoryCenter" :loading="memoryCenterLoading">搜索</el-button>
+            </div>
+            <el-alert title="关系资料始终视为有效；群组事实只展示和维护已有记录，不在此创建。" type="info" :closable="false" />
+            <div v-if="memories.length" class="table-wrap">
+              <el-table v-loading="memoryCenterLoading" :data="memories" empty-text="没有符合条件的记忆">
+                <el-table-column label="类型" width="120"><template #default="scope"><el-tag :type="scope.row.memory_type === 'fact' ? 'info' : 'success'">{{ memoryTypeLabel(scope.row) }}</el-tag></template></el-table-column>
+                <el-table-column label="作用域" min-width="170"><template #default="scope">{{ memoryScopeLabel(scope.row) }}</template></el-table-column>
+                <el-table-column label="人格" min-width="130"><template #default="scope"><span v-if="scope.row.memory_type === 'relationship'">{{ scope.row.persona_name }}</span><span v-else>—</span></template></el-table-column>
+                <el-table-column label="内容" min-width="360"><template #default="scope"><template v-if="scope.row.memory_type === 'fact'"><div class="table-primary"><strong>{{ scope.row.fact_key }}</strong><small>{{ scope.row.content }}</small></div></template><template v-else><div class="table-primary"><strong>{{ scope.row.nickname || '未设置称呼' }}</strong><small>{{ scope.row.shared_summary || '暂无共同经历摘要' }} · 边界 {{ memoryRelationshipBoundaryCount(scope.row) }} 项</small></div></template></template></el-table-column>
+                <el-table-column label="状态" width="100"><template #default="scope"><el-tag :type="scope.row.status === 'active' ? 'success' : 'warning'">{{ scope.row.status === 'active' ? '有效' : '已归档' }}</el-tag></template></el-table-column>
+                <el-table-column label="更新时间" min-width="165"><template #default="scope">{{ scope.row.updated_at }}</template></el-table-column>
+                <el-table-column label="操作" width="250" fixed="right"><template #default="scope"><template v-if="scope.row.memory_type === 'fact'"><el-button size="small" @click="editMemory(scope.row)">编辑</el-button><el-button v-if="scope.row.status === 'active'" size="small" @click="archiveMemory(scope.row.id)">归档</el-button><el-button v-else size="small" @click="restoreMemory(scope.row.id)">恢复</el-button><el-button size="small" type="danger" plain @click="deleteMemory(scope.row.id)">删除</el-button></template><template v-else><el-button size="small" @click="editMemoryRelationship(scope.row)">编辑</el-button><el-button size="small" type="danger" plain @click="deleteMemoryRelationship(scope.row)">删除</el-button></template></template></el-table-column>
+              </el-table>
+            </div>
+            <el-empty v-else description="当前没有符合条件的记忆" />
+          </section>
+          <el-dialog v-model="memoryRelationshipDialog" title="编辑陪伴关系资料" width="620px">
+            <div v-if="memoryRelationshipDraft" class="stack">
+              <div class="model-form-grid">
+                <label class="field-control"><span>QQ Owner</span><el-select v-model="memoryRelationshipDraft.scope_id" :disabled="Boolean(memoryRelationshipDraft.id)"><el-option v-for="item in companionOwners" :key="item.external_id" :label="`${item.display_name || 'QQ Owner'} · ${item.external_id}`" :value="item.external_id" /></el-select></label>
+                <label class="field-control"><span>人格</span><el-select v-model="memoryRelationshipDraft.persona_key" :disabled="Boolean(memoryRelationshipDraft.id)"><el-option v-for="item in companionPersonas" :key="item.id" :label="item.name" :value="item.id" /></el-select></label>
+              </div>
+              <label class="field-control"><span>称呼</span><el-input v-model="memoryRelationshipDraft.nickname" placeholder="用户希望的称呼" /></label>
+              <label class="field-control"><span>共同经历</span><el-input v-model="memoryRelationshipDraft.shared_summary" type="textarea" :rows="4" maxlength="4000" /></label>
+              <label class="field-control"><span>边界（JSON）</span><el-input v-model="memoryRelationshipBoundaryText" type="textarea" :rows="5" placeholder='例如：{"items":["不想被催着给建议"]}' /></label>
+            </div>
+            <template #footer><el-button @click="memoryRelationshipDialog = false">取消</el-button><el-button type="primary" :loading="memoryRelationshipSaving" @click="saveMemoryRelationship">保存</el-button></template>
+          </el-dialog>
         </template>
 
         <template v-else-if="activeTab === 'personas'">
-          <div class="two-column"><section class="panel stack"><div class="panel-heading"><div><span class="section-kicker">配置</span><h2>{{ editingPersonaId ? '编辑人格' : '新建人格' }}</h2></div></div><el-input v-model="personaName" placeholder="人格名称" /><el-input v-model="personaPrompt" type="textarea" :rows="10" maxlength="8000" show-word-limit placeholder="描述角色身份、语气、称呼、详细程度和格式；不能修改权限、工具或系统规则" /><div class="form-row"><el-button type="primary" @click="savePersona">保存人格</el-button><el-button @click="personaName = ''; personaPrompt = ''; editingPersonaId = ''">清空</el-button></div></section><section class="panel stack"><div class="panel-heading"><div><span class="section-kicker">列表</span><h2>已保存人格</h2></div><span class="count-badge">{{ personas.length }}</span></div><div class="card-list"><div v-for="item in personas" :key="item.id" class="result"><span class="list-icon"><el-icon><UserFilled /></el-icon></span><strong>{{ item.name }}</strong><div><el-button size="small" @click="editPersona(item)">编辑</el-button><el-button size="small" type="danger" plain @click="deletePersona(item)">删除</el-button></div></div><div v-if="!personas.length" class="empty-copy">还没有已保存人格。</div></div></section></div>
+          <div class="two-column persona-layout">
+            <section class="panel stack persona-editor">
+              <div class="panel-heading"><div><span class="section-kicker">结构化角色卡</span><h2>{{ editingPersonaId ? '编辑人格' : '新建人格' }}</h2></div><el-tag v-if="editingPersonaId" type="info">版本 {{ personas.find((item) => item.id === editingPersonaId)?.card_version || 0 }}</el-tag></div>
+              <el-input v-model="personaName" placeholder="人格名称" maxlength="120" />
+              <div class="advanced-heading"><span>基础身份（必填）</span><small>只填写角色设定，不写权限或系统规则</small></div>
+              <div class="model-form-grid"><label class="field-control"><span>身份 / 职业 *</span><el-input v-model="personaField.role" placeholder="例如：住在海边的电台编辑" /></label><label class="field-control"><span>时代与世界背景</span><el-input v-model="personaField.setting" placeholder="可留空" /></label><label class="field-control field-wide"><span>简短经历</span><el-input v-model="personaField.background" type="textarea" :rows="2" /></label><label class="field-control field-wide"><span>重要经历 / 当前处境</span><el-input v-model="personaField.experience" type="textarea" :rows="2" /></label></div>
+              <div class="advanced-heading"><span>外貌设定</span><small>外貌、服装、典型动作和神态</small></div>
+              <div class="model-form-grid"><label class="field-control"><span>外貌</span><el-input v-model="personaField.appearance" /></label><label class="field-control"><span>服装</span><el-input v-model="personaField.clothing" /></label><label class="field-control field-wide"><span>动作 / 神态</span><el-input v-model="personaField.mannerisms" /></label></div>
+              <div class="advanced-heading"><span>关系定位</span><small>默认关系、亲密程度、自称和对用户称呼</small></div>
+              <div class="model-form-grid"><label class="field-control"><span>默认关系</span><el-input v-model="personaField.relation" /></label><label class="field-control"><span>亲密程度</span><el-input v-model="personaField.closeness" /></label><label class="field-control"><span>自称</span><el-input v-model="personaField.selfReference" /></label><label class="field-control"><span>对用户称呼</span><el-input v-model="personaField.userAddress" /></label></div>
+              <div class="advanced-heading"><span>核心人格</span><small>多项内容用顿号、逗号或换行分隔</small></div>
+              <div class="model-form-grid"><label class="field-control"><span>核心特质</span><el-input v-model="personaField.traits" /></label><label class="field-control"><span>价值倾向</span><el-input v-model="personaField.values" /></label><label class="field-control"><span>情绪基调</span><el-input v-model="personaField.baseline" /></label><label class="field-control"><span>敏感点</span><el-input v-model="personaField.sensitivities" /></label></div>
+              <div class="advanced-heading"><span>语言风格</span><small>控制词汇、句长、节奏和幽默感</small></div>
+              <div class="model-form-grid"><label class="field-control"><span>词汇偏好</span><el-input v-model="personaField.vocabulary" /></label><label class="field-control"><span>句长</span><el-input v-model="personaField.sentenceLength" /></label><label class="field-control"><span>节奏</span><el-input v-model="personaField.rhythm" /></label><label class="field-control"><span>标点 / 表情</span><el-input v-model="personaField.punctuation" /></label><label class="field-control"><span>表情习惯</span><el-input v-model="personaField.emoji" /></label><label class="field-control"><span>口头禅</span><el-input v-model="personaField.catchphrases" /></label><label class="field-control field-wide"><span>幽默方式</span><el-input v-model="personaField.humor" /></label></div>
+              <div class="advanced-heading"><span>互动习惯</span><small>决定主动程度、提问、倾听和分歧处理</small></div>
+              <div class="model-form-grid"><label class="field-control"><span>主动程度</span><el-input v-model="personaField.initiative" /></label><label class="field-control"><span>提问习惯</span><el-input v-model="personaField.questionHabit" /></label><label class="field-control field-wide"><span>倾听方式</span><el-input v-model="personaField.listeningStyle" /></label><label class="field-control field-wide"><span>关心方式</span><el-input v-model="personaField.careExpression" /></label><label class="field-control"><span>分歧处理</span><el-input v-model="personaField.disagreementStyle" /></label><label class="field-control"><span>沉默容忍度</span><el-input v-model="personaField.silenceTolerance" /></label></div>
+              <div class="advanced-heading"><span>角色边界</span><small>避免出戏、机器口吻和虚构能力</small></div>
+              <div class="model-form-grid"><label class="field-control"><span>禁止出戏行为</span><el-input v-model="personaField.outOfCharacter" /></label><label class="field-control"><span>避免机器 / 客服口吻</span><el-input v-model="personaField.avoidMachineTone" /></label><label class="field-control field-wide"><span>禁止虚构能力</span><el-input v-model="personaField.forbiddenFabrications" /></label></div>
+              <label class="field-control"><span>对话示例（可选，每行使用“用户 =&gt; 角色”）</span><el-input v-model="personaExamplesText" type="textarea" :rows="4" maxlength="6000" placeholder="例如：今天有点累 =&gt; 那就先歇一会儿，别急着把所有事都扛完。" /></label>
+              <div class="form-row"><el-button type="primary" @click="savePersona">保存角色卡</el-button><el-button @click="clearPersonaDraft">清空</el-button></div>
+            </section>
+            <section class="panel stack"><div class="panel-heading"><div><span class="section-kicker">列表</span><h2>已保存人格</h2></div><span class="count-badge">{{ personas.length }}</span></div><p class="hint">角色卡文件位于项目根目录 persona/；文件是运行时唯一来源，手工修复后下一次访问自动生效。</p><div class="card-list"><div v-for="item in personas" :key="item.id" class="result"><span class="list-icon"><el-icon><UserFilled /></el-icon></span><span><strong>{{ item.name }}</strong><small><el-tag size="small" :type="item.status === 'active' ? 'success' : 'warning'">{{ item.status === 'active' ? '可运行' : '文件无效' }}</el-tag> · 文件来源：{{ item.source }} · {{ item.file_name }} · 版本 {{ item.card_version }}<template v-if="item.validation_error"> · {{ item.validation_error }}</template></small></span><div><el-button size="small" @click="editPersona(item)">编辑</el-button><el-button size="small" type="danger" plain @click="deletePersona(item)">删除</el-button></div></div><div v-if="!personas.length" class="empty-copy">还没有已保存人格。</div></div></section>
+          </div>
         </template>
 
         <template v-else-if="activeTab === 'tools'">
@@ -1494,6 +2051,11 @@ onUnmounted(() => {
             <article class="status-card"><span>QQ 状态</span><el-icon><CircleCheck /></el-icon><strong>{{ statusLabel(health.qq) }}</strong><small>与 NapCat 进程、OneBot 分开显示</small><el-tag :type="statusType(health.qq)">{{ health.qq || 'unknown' }}</el-tag></article>
             <article class="status-card"><span>OneBot 状态</span><el-icon><ChatDotRound /></el-icon><strong>{{ statusLabel(health.onebot) }}</strong><small>反向 WebSocket</small><el-tag :type="statusType(health.onebot)">{{ health.onebot || 'unknown' }}</el-tag></article>
           </div>
+
+          <section class="panel stack log-config-panel">
+            <div class="panel-heading"><div><span class="section-kicker">QQ 回复</span><h2>自然分批输出</h2></div><el-switch v-model="qqReplySettings.chunked_output_enabled" :loading="qqReplySettingsSaving" active-text="已开启" inactive-text="单条发送" @change="saveQQReplySettings" /></div>
+            <p class="hint">全局作用于 QQ 的模型聊天回复。回复会在安全与角色复核完成后，按语义分成几条自然发送；命令、错误、任务通知和文件说明保持单条。</p>
+          </section>
 
           <section class="panel stack log-config-panel">
             <div class="panel-heading"><div><span class="section-kicker">本机连接</span><h2>NapCat WebUI 日志配置</h2></div><el-tag :type="napcatConfig.configured ? 'success' : 'warning'">{{ napcatConfig.configured ? 'Token 已配置' : '未配置' }}</el-tag></div>
