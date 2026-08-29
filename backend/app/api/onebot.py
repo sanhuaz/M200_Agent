@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import re
@@ -11,10 +12,13 @@ from pathlib import Path
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlalchemy import desc, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.db.models import (
+    AppSetting,
     Artifact,
+    CompanionListeningBuffer,
     Conversation,
     EmotionAssessment,
     ExtensionPackage,
@@ -22,7 +26,6 @@ from app.db.models import (
     KnowledgeBase,
     Memory,
     Message,
-    Persona,
     ProcessedEvent,
     ResponseFeedback,
 )
@@ -35,6 +38,7 @@ from app.services.companion import (
     assessment_dict,
     get_or_create_preference,
     parse_emotion_labels_strict,
+    safety_precheck,
     safety_redirect_text,
 )
 from app.services.confirmations import (
@@ -52,10 +56,39 @@ from app.services.jobs import (
 from app.services.manga import manga_service
 from app.services.models import model_registry
 from app.services.operation_logs import operation_logs
+from app.services.persona_store import get_persona_store
+from app.services.qq_delivery import qq_reply_delay_seconds, split_qq_reply
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 settings = get_settings()
+QQ_CHUNKED_OUTPUT_SETTING_KEY = "qq_chunked_output_enabled"
+DEFAULT_QQ_CHUNKED_OUTPUT_ENABLED = True
+
+
+def qq_chunked_output_enabled(session: Session) -> bool:
+    item = session.get(AppSetting, QQ_CHUNKED_OUTPUT_SETTING_KEY)
+    if item is None:
+        return DEFAULT_QQ_CHUNKED_OUTPUT_ENABLED
+    try:
+        value = json.loads(item.value)
+    except json.JSONDecodeError:
+        value = item.value.strip().lower()
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value in {"true", "1", "on", "enabled"}:
+        return True
+    if isinstance(value, str) and value in {"false", "0", "off", "disabled"}:
+        return False
+    return DEFAULT_QQ_CHUNKED_OUTPUT_ENABLED
+
+
+def set_qq_chunked_output_enabled(session: Session, enabled: bool) -> None:
+    item = session.get(AppSetting, QQ_CHUNKED_OUTPUT_SETTING_KEY)
+    if item is None:
+        item = AppSetting(key=QQ_CHUNKED_OUTPUT_SETTING_KEY, value="")
+        session.add(item)
+    item.value = json.dumps(bool(enabled))
 
 
 class OneBotManager:
@@ -67,6 +100,11 @@ class OneBotManager:
         self.qq_status = "unknown"
         self.qq_nickname: str | None = None
         self._monitor_task: asyncio.Task[None] | None = None
+        self._listening_tasks: dict[str, asyncio.Task[None]] = {}
+        self._listening_locks: dict[str, asyncio.Lock] = {}
+        self._listening_processing: set[str] = set()
+        self._listening_processing_done: dict[str, asyncio.Event] = {}
+        self._chat_locks: dict[str, asyncio.Lock] = {}
 
     def status(self) -> dict[str, object]:
         return {
@@ -88,6 +126,25 @@ class OneBotManager:
                 await task
             except asyncio.CancelledError:
                 pass
+        tasks, self._listening_tasks = list(self._listening_tasks.values()), {}
+        for listening_task in tasks:
+            listening_task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _listening_lock(self, conversation_id: str) -> asyncio.Lock:
+        lock = self._listening_locks.get(conversation_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._listening_locks[conversation_id] = lock
+        return lock
+
+    def _chat_lock(self, external_id: str) -> asyncio.Lock:
+        lock = self._chat_locks.get(external_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._chat_locks[external_id] = lock
+        return lock
 
     async def _monitor_login(self) -> None:
         while True:
@@ -136,17 +193,18 @@ class OneBotManager:
                         future.set_result(payload)
                     continue
                 if payload.get("post_type") == "message":
-                    operation_logs.emit(
-                        source="onebot",
-                        kind="message",
-                        title="收到 QQ 消息",
-                        message=str(payload.get("raw_message") or payload.get("message") or ""),
-                        details={
-                            "user_id": payload.get("user_id"),
-                            "group_id": payload.get("group_id"),
-                            "message_id": payload.get("message_id"),
-                        },
-                    )
+                    if self._text_from_event(payload):
+                        operation_logs.emit(
+                            source="onebot",
+                            kind="message",
+                            title="收到 QQ 消息",
+                            message="收到文本消息（正文不写入连接日志）",
+                            details={
+                                "user_id": payload.get("user_id"),
+                                "group_id": payload.get("group_id"),
+                                "message_id": payload.get("message_id"),
+                            },
+                        )
                     asyncio.create_task(self._handle_message(payload))
         except WebSocketDisconnect:
             logger.info("NapCat OneBot 已断开")
@@ -214,6 +272,59 @@ class OneBotManager:
         if response.get("status") != "ok" or int(str(response.get("retcode", -1))) != 0:
             raise RuntimeError(f"QQ 文件上传失败: {response.get('message') or response.get('wording')}")
 
+    @staticmethod
+    def _normalize_cq_text(value: str, *, preserve_mentions: bool = False) -> str:
+        """Keep CQ text segments and remove attachments/receipts."""
+
+        value = value.strip()
+        if "[CQ:" not in value:
+            return value
+
+        def replace_segment(match: re.Match[str]) -> str:
+            segment_type, payload = match.group(1), match.group(2) or ""
+            if segment_type == "at" and preserve_mentions:
+                return match.group(0)
+            if segment_type != "text":
+                return ""
+            text_value = ""
+            for part in payload.split(","):
+                if part.startswith("text="):
+                    text_value = part[5:]
+                    break
+            return html.unescape(
+                text_value.replace("&#44;", ",").replace("&#91;", "[").replace("&#93;", "]")
+            )
+
+        return re.sub(r"\[CQ:([^,\]]+)(?:,([^\]]*))?\]", replace_segment, value).strip()
+
+    @classmethod
+    def _text_from_event(cls, event: dict[str, object]) -> str:
+        raw_message = event.get("raw_message")
+        if isinstance(raw_message, str) and raw_message.strip():
+            # NapCat may put a file/image receipt entirely in raw_message as
+            # CQ segments. Keep text segments and drop non-text segments so a
+            # receipt never reaches commands, companion analysis or Agent.
+            return cls._normalize_cq_text(raw_message, preserve_mentions=event.get("message_type") == "group")
+        message = event.get("message")
+        if isinstance(message, str):
+            return cls._normalize_cq_text(message, preserve_mentions=event.get("message_type") == "group")
+        if isinstance(message, list):
+            parts: list[str] = []
+            for segment in message:
+                if not isinstance(segment, dict):
+                    continue
+                segment_type = segment.get("type")
+                data = segment.get("data")
+                if isinstance(data, dict):
+                    value = data.get("text")
+                    if segment_type == "text" and isinstance(value, str):
+                        parts.append(value)
+                    elif event.get("message_type") == "group" and segment_type == "at":
+                        qq = str(data.get("qq") or "")
+                        parts.append(f"[CQ:at,qq={qq}]")
+            return "".join(parts).strip()
+        return ""
+
     async def _handle_message(self, event: dict[str, object]) -> None:
         message_id = str(event.get("message_id", ""))
         if not message_id:
@@ -226,122 +337,509 @@ class OneBotManager:
         message_type = str(event.get("message_type", "private"))
         user_id = str(event.get("user_id", ""))
         group_id = str(event.get("group_id", "")) if message_type == "group" else None
-        raw = str(event.get("raw_message") or event.get("message") or "").strip()
+        raw = self._text_from_event(event)
         text = self._extract_triggered_text(raw, message_type)
-        if text is None or not user_id:
+        if text is None or not text.strip() or not user_id:
+            if user_id and not text:
+                operation_logs.emit(
+                    source="onebot",
+                    kind="ignored",
+                    title="忽略无文本 QQ 事件",
+                    message="文件回执或空白消息未进入聊天流程",
+                    details={"user_id": user_id, "message_id": message_id},
+                )
             return
         text = self._expand_manual_extension_request(text)
         external_id = f"group:{group_id}" if group_id else f"private:{user_id}"
         try:
-            command_response = await self._command(text, user_id, external_id)
-            if command_response is not None:
-                try:
-                    await self.send_text(user_id, command_response, group_id)
-                except Exception as error:
-                    operation_logs.emit(
-                        source="onebot",
-                        kind="failed",
-                        title="QQ 命令发送失败",
-                        message="命令结果未送达",
-                        details={"user_id": user_id, "error": type(error).__name__},
-                    )
-                    raise
-                return
-            with SessionLocal() as session:
-                conversation = session.scalar(
-                    select(Conversation).where(
-                        Conversation.platform == "qq", Conversation.external_id == external_id
-                    )
+            if group_id is None and is_owner(user_id):
+                listening_result = await self._handle_listening_input(
+                    text, user_id, external_id, message_id
                 )
-                if conversation is None:
-                    conversation = Conversation(
-                        platform="qq",
-                        external_id=external_id,
-                        conversation_type="group" if group_id else "private",
-                        title=f"QQ {external_id}",
-                        model_alias=model_registry.default_alias(),
-                        owner_id=user_id,
-                    )
-                    session.add(conversation)
+                if listening_result is not None:
+                    if listening_result:
+                        async with self._chat_lock(external_id):
+                            await self.send_text(user_id, listening_result)
+                    return
+            async with self._chat_lock(external_id):
+                command_response = await self._command(text, user_id, external_id)
+                if command_response is not None:
                     try:
-                        session.commit()
-                    except IntegrityError:
-                        session.rollback()
-                        conversation = session.scalar(
-                            select(Conversation).where(
-                                Conversation.platform == "qq",
-                                Conversation.external_id == external_id,
-                            )
+                        await self.send_text(user_id, command_response, group_id)
+                    except Exception as error:
+                        operation_logs.emit(
+                            source="onebot",
+                            kind="failed",
+                            title="QQ 命令发送失败",
+                            message="命令结果未送达",
+                            details={"user_id": user_id, "error": type(error).__name__},
                         )
-                    if conversation is None:
-                        raise RuntimeError("无法创建 QQ 会话")
-                final_text = ""
-                error_text = ""
-                artifact_ids: list[str] = []
-                async for item in chat_service.stream(
-                    session,
-                    conversation,
-                    user_id,
-                    text,
-                    message_id,
-                    platform="qq",
-                    is_group=bool(group_id),
-                ):
-                    event_data = item["data"]
-                    if not isinstance(event_data, dict):
-                        continue
-                    if item["event"] == "final":
-                        final_text = str(event_data.get("text", ""))
-                    elif item["event"] == "error":
-                        error_text = str(event_data.get("message", ""))
-                    elif item["event"] == "artifact_created":
-                        artifact_id = str(event_data.get("artifact_id", ""))
-                        if artifact_id:
-                            artifact_ids.append(artifact_id)
-                try:
-                    await self.send_text(user_id, final_text or f"处理失败：{error_text}", group_id)
-                except Exception as error:
-                    operation_logs.emit(
-                        source="onebot",
-                        kind="failed",
-                        title="QQ 回复发送失败",
-                        message="回复已写入数据库但未确认送达",
-                        details={
-                            "conversation_id": conversation.id,
-                            "user_id": user_id,
-                            "error": type(error).__name__,
-                        },
-                    )
-                    raise
-                if not group_id:
-                    with SessionLocal() as artifact_session:
-                        artifacts = [
-                            artifact_session.get(Artifact, artifact_id)
-                            for artifact_id in artifact_ids
-                        ]
-                    for artifact in artifacts:
-                        if artifact is None or not Path(artifact.path).is_file():
-                            continue
-                        path = Path(artifact.path)
-                        if path.stat().st_size <= settings.qq_upload_limit_mb * 1024 * 1024:
-                            try:
-                                await self.send_private_file(user_id, path)
-                            except Exception as error:
-                                await self.send_text(
-                                    user_id,
-                                    f"文件发送失败：{error}\n本地路径：{path.resolve()}",
-                                )
-                        else:
-                            await self.send_text(
-                                user_id,
-                                f"文件超过 QQ 上传阈值，本地路径：{path.resolve()}",
-                            )
+                        raise
+                    return
+                await self._run_chat_response_unlocked(
+                    user_id, text, message_id, group_id, external_id
+                )
         except Exception as error:
             logger.exception("处理 QQ 消息失败")
             try:
                 await self.send_text(user_id, f"处理失败：{type(error).__name__}: {error}", group_id)
             except Exception:
                 logger.exception("发送 QQ 错误回复失败")
+
+    async def _run_chat_response(
+        self,
+        user_id: str,
+        text: str,
+        message_id: str | None,
+        group_id: str | None,
+        external_id: str,
+    ) -> None:
+        async with self._chat_lock(external_id):
+            await self._run_chat_response_unlocked(
+                user_id, text, message_id, group_id, external_id
+            )
+
+    async def _run_chat_response_unlocked(
+        self,
+        user_id: str,
+        text: str,
+        message_id: str | None,
+        group_id: str | None,
+        external_id: str,
+    ) -> None:
+        with SessionLocal() as session:
+            conversation = session.scalar(
+                select(Conversation).where(
+                    Conversation.platform == "qq", Conversation.external_id == external_id
+                )
+            )
+            if conversation is None:
+                conversation = Conversation(
+                    platform="qq",
+                    external_id=external_id,
+                    conversation_type="group" if group_id else "private",
+                    title=f"QQ {external_id}",
+                    model_alias=model_registry.default_alias(),
+                    owner_id=user_id,
+                )
+                session.add(conversation)
+                try:
+                    session.commit()
+                except IntegrityError:
+                    session.rollback()
+                    conversation = session.scalar(
+                        select(Conversation).where(
+                            Conversation.platform == "qq", Conversation.external_id == external_id
+                        )
+                    )
+                if conversation is None:
+                    raise RuntimeError("无法创建 QQ 会话")
+            chunked_output = qq_chunked_output_enabled(session)
+            final_text = ""
+            response_source = ""
+            error_text = ""
+            safety_intercepted = False
+            artifact_ids: list[str] = []
+            async for item in chat_service.stream(
+                session,
+                conversation,
+                user_id,
+                text,
+                message_id,
+                platform="qq",
+                is_group=bool(group_id),
+            ):
+                event_data = item["data"]
+                if not isinstance(event_data, dict):
+                    continue
+                if item["event"] == "final":
+                    final_text = str(event_data.get("text", ""))
+                    response_source = str(event_data.get("response_source") or "agent")
+                elif item["event"] == "companion_analysis":
+                    safety_intercepted = bool(event_data.get("safety_intercepted"))
+                elif item["event"] == "error":
+                    error_text = str(event_data.get("message", ""))
+                elif item["event"] == "artifact_created":
+                    artifact_id = str(event_data.get("artifact_id", ""))
+                    if artifact_id:
+                        artifact_ids.append(artifact_id)
+            reply_text = final_text or f"处理失败：{error_text}"
+            chunkable_response_sources = {"agent", "rewritten", "style_rewritten"}
+            chunks = (
+                split_qq_reply(reply_text)
+                if (
+                    final_text
+                    and not error_text
+                    and chunked_output
+                    and not safety_intercepted
+                    and response_source in chunkable_response_sources
+                )
+                else [reply_text]
+            )
+            chunks = [chunk for chunk in chunks if chunk.strip()] or [reply_text]
+            sent_count = 0
+            try:
+                for index, chunk in enumerate(chunks):
+                    if index:
+                        await asyncio.sleep(qq_reply_delay_seconds(chunks[index - 1]))
+                    await self.send_text(user_id, chunk, group_id)
+                    sent_count += 1
+            except Exception as error:
+                operation_logs.emit(
+                    source="onebot",
+                    kind="failed",
+                    title="QQ 回复分段发送失败",
+                    message="回复已写入数据库，但部分内容未送达",
+                    details={
+                        "conversation_id": conversation.id,
+                        "error": type(error).__name__,
+                        "chunk_count": len(chunks),
+                        "sent_count": sent_count,
+                        "failed_index": sent_count + 1,
+                    },
+                )
+                return
+            if len(chunks) > 1:
+                operation_logs.emit(
+                    source="onebot",
+                    kind="succeeded",
+                    title="QQ 回复分段发送完成",
+                    message="已按自然语义分批发送回复",
+                    details={
+                        "conversation_id": conversation.id,
+                        "chunk_count": len(chunks),
+                    },
+                )
+            if not group_id:
+                with SessionLocal() as artifact_session:
+                    artifacts = [artifact_session.get(Artifact, artifact_id) for artifact_id in artifact_ids]
+                for artifact in artifacts:
+                    if artifact is None or not Path(artifact.path).is_file():
+                        continue
+                    path = Path(artifact.path)
+                    if path.stat().st_size <= settings.qq_upload_limit_mb * 1024 * 1024:
+                        try:
+                            await self.send_private_file(user_id, path)
+                        except Exception as error:
+                            await self.send_text(
+                                user_id,
+                                f"文件发送失败：{error}\n本地路径：{path.resolve()}",
+                            )
+                    else:
+                        await self.send_text(
+                            user_id,
+                            f"文件超过 QQ 上传阈值，本地路径：{path.resolve()}",
+                        )
+
+    @staticmethod
+    def _ensure_qq_conversation(external_id: str, user_id: str) -> str:
+        with SessionLocal() as session:
+            conversation = session.scalar(
+                select(Conversation).where(
+                    Conversation.platform == "qq", Conversation.external_id == external_id
+                )
+            )
+            if conversation is None:
+                conversation = Conversation(
+                    platform="qq",
+                    external_id=external_id,
+                    conversation_type="private",
+                    title=f"QQ {external_id}",
+                    model_alias=model_registry.default_alias(),
+                    owner_id=user_id,
+                )
+                session.add(conversation)
+                try:
+                    session.commit()
+                except IntegrityError:
+                    session.rollback()
+                    conversation = session.scalar(
+                        select(Conversation).where(
+                            Conversation.platform == "qq", Conversation.external_id == external_id
+                        )
+                    )
+                if conversation is None:
+                    raise RuntimeError("无法创建 QQ 会话")
+            return conversation.id
+
+    @staticmethod
+    def _buffer_text(buffer: CompanionListeningBuffer | None) -> str:
+        if buffer is None:
+            return ""
+        try:
+            values = json.loads(buffer.fragments or "[]")
+        except json.JSONDecodeError:
+            return ""
+        if not isinstance(values, list):
+            return ""
+        return "\n".join(
+            str(item.get("text", "")).strip()
+            for item in values
+            if isinstance(item, dict) and str(item.get("text", "")).strip()
+        ).strip()
+
+    @staticmethod
+    def _buffer_count(buffer: CompanionListeningBuffer | None) -> int:
+        if buffer is None:
+            return 0
+        try:
+            values = json.loads(buffer.fragments or "[]")
+        except json.JSONDecodeError:
+            return 0
+        return len(values) if isinstance(values, list) else 0
+
+    async def _pop_listening_buffer(self, conversation_id: str) -> tuple[str, str | None]:
+        lock = self._listening_lock(conversation_id)
+        async with lock:
+            with SessionLocal.begin() as session:
+                buffer = session.scalar(
+                    select(CompanionListeningBuffer).where(
+                        CompanionListeningBuffer.conversation_id == conversation_id
+                    )
+                )
+                if buffer is None:
+                    return "", None
+                text = self._buffer_text(buffer)
+                session.delete(buffer)
+                return text, f"listening-{uuid.uuid4().hex}"
+
+    async def _claim_listening_batch(self, conversation_id: str) -> tuple[str, str | None]:
+        """Atomically claim one batch and mark the session as processing.
+
+        A completion command may arrive at the same time as the silence timer.
+        Waiting for the current processing event here prevents either caller
+        from dropping a batch or invoking the main Agent twice.
+        """
+
+        while True:
+            lock = self._listening_lock(conversation_id)
+            wait_event: asyncio.Event | None = None
+            async with lock:
+                if conversation_id in self._listening_processing:
+                    wait_event = self._listening_processing_done.get(conversation_id)
+                else:
+                    pending = self._listening_tasks.pop(conversation_id, None)
+                    current_task = asyncio.current_task()
+                    if pending is not None and pending is not current_task:
+                        pending.cancel()
+                    with SessionLocal.begin() as session:
+                        buffer = session.scalar(
+                            select(CompanionListeningBuffer).where(
+                                CompanionListeningBuffer.conversation_id == conversation_id
+                            )
+                        )
+                        if buffer is None:
+                            return "", None
+                        text = self._buffer_text(buffer)
+                        session.delete(buffer)
+                    if not text:
+                        return "", None
+                    self._listening_processing.add(conversation_id)
+                    self._listening_processing_done[conversation_id] = asyncio.Event()
+                    return text, f"listening-{uuid.uuid4().hex}"
+            if wait_event is None:
+                return "", None
+            await wait_event.wait()
+
+    async def _finish_listening_batch(self, conversation_id: str) -> None:
+        lock = self._listening_lock(conversation_id)
+        async with lock:
+            self._listening_processing.discard(conversation_id)
+            event = self._listening_processing_done.pop(conversation_id, None)
+            if event is not None:
+                event.set()
+
+    async def _cancel_listening(self, user_id: str, external_id: str) -> None:
+        with SessionLocal() as session:
+            conversation = session.scalar(
+                select(Conversation).where(
+                    Conversation.platform == "qq", Conversation.external_id == external_id
+                )
+            )
+        conversation_id = conversation.id if conversation is not None else None
+        if conversation_id is None:
+            with SessionLocal.begin() as session:
+                preference = get_or_create_preference(session, user_id)
+                preference.listening_enabled = False
+            return
+        lock = self._listening_lock(conversation_id)
+        async with lock:
+            pending = self._listening_tasks.pop(conversation_id, None)
+            current_task = asyncio.current_task()
+            if pending is not None and pending is not current_task:
+                pending.cancel()
+            with SessionLocal.begin() as session:
+                preference = get_or_create_preference(session, user_id)
+                preference.listening_enabled = False
+                buffer = session.scalar(
+                    select(CompanionListeningBuffer).where(
+                        CompanionListeningBuffer.conversation_id == conversation_id
+                    )
+                )
+                if buffer is not None:
+                    session.delete(buffer)
+
+    def _schedule_listening_flush(
+        self, conversation_id: str, user_id: str, external_id: str, seconds: int
+    ) -> None:
+        previous = self._listening_tasks.pop(conversation_id, None)
+        if previous is not None:
+            previous.cancel()
+
+        async def delayed_flush() -> None:
+            try:
+                await asyncio.sleep(seconds)
+                text, message_id = await self._claim_listening_batch(conversation_id)
+                if text and message_id:
+                    try:
+                        await self._run_chat_response(user_id, text, message_id, None, external_id)
+                    finally:
+                        await self._finish_listening_batch(conversation_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("你听我说模式自动处理失败：conversation=%s", conversation_id)
+            finally:
+                current_task = asyncio.current_task()
+                if self._listening_tasks.get(conversation_id) is current_task:
+                    self._listening_tasks.pop(conversation_id, None)
+
+        self._listening_tasks[conversation_id] = asyncio.create_task(
+            delayed_flush(), name=f"listening-flush-{conversation_id}"
+        )
+
+    async def _flush_listening_now(
+        self, user_id: str, external_id: str, *, disable_after: bool = False
+    ) -> str:
+        with SessionLocal() as session:
+            conversation = session.scalar(
+                select(Conversation).where(
+                    Conversation.platform == "qq", Conversation.external_id == external_id
+                )
+            )
+        conversation_id = conversation.id if conversation is not None else None
+        if disable_after:
+            # Disable before waiting for an in-flight batch, so fragments sent
+            # after `/listening off` cannot join the batch being awaited.
+            with SessionLocal.begin() as session:
+                preference = get_or_create_preference(session, user_id)
+                preference.listening_enabled = False
+        if conversation_id:
+            text, message_id = await self._claim_listening_batch(conversation_id)
+        else:
+            text, message_id = "", None
+        if text and message_id:
+            assert conversation_id is not None
+            try:
+                await self._run_chat_response(user_id, text, message_id, None, external_id)
+            finally:
+                await self._finish_listening_batch(conversation_id)
+            return ""
+        return "当前没有待处理的连续消息。"
+
+    async def _handle_listening_input(
+        self, text: str, user_id: str, external_id: str, message_id: str
+    ) -> str | None:
+        command = text.lower()
+        natural_enable = any(
+            phrase in text for phrase in ("你先听我说", "等我说完再回", "我说完你再回复")
+        )
+        natural_done = any(phrase in text for phrase in ("我说完了", "你可以说了", "现在可以回复了"))
+        if external_id.startswith("group:") or not is_owner(user_id):
+            return None
+        if command in {
+            "/listening on",
+            "/listening off",
+            "/listening done",
+            "/listening cancel",
+            "/listening status",
+        }:
+            if command == "/listening on":
+                with SessionLocal.begin() as session:
+                    preference = get_or_create_preference(session, user_id)
+                    preference.listening_enabled = True
+                return (
+                    "已开启‘你听我说’模式。你可以分段发送，30 秒没有新消息或发送 "
+                    "/listening done 后我再回复。"
+                )
+            if command == "/listening status":
+                with SessionLocal() as session:
+                    preference = get_or_create_preference(session, user_id)
+                    conversation = session.scalar(select(Conversation).where(
+                        Conversation.platform == "qq", Conversation.external_id == external_id
+                    ))
+                    buffer = session.scalar(select(CompanionListeningBuffer).where(
+                        CompanionListeningBuffer.conversation_id == conversation.id
+                    )) if conversation is not None else None
+                    return (
+                        f"你听我说模式：{'已开启' if preference.listening_enabled else '已关闭'}；"
+                        f"待处理片段：{self._buffer_count(buffer)}。"
+                    )
+            if command == "/listening cancel":
+                await self._cancel_listening(user_id, external_id)
+                return "已取消当前连续消息，并关闭‘你听我说’模式。"
+            if command == "/listening done":
+                return await self._flush_listening_now(user_id, external_id)
+            return await self._flush_listening_now(user_id, external_id, disable_after=True)
+
+        with SessionLocal() as session:
+            preference = get_or_create_preference(session, user_id)
+            listening_enabled = bool(preference.listening_enabled)
+            companion_enabled = bool(preference.companion_enabled)
+            silence_seconds = max(5, min(120, int(preference.listening_silence_seconds or 30)))
+        if natural_enable and not listening_enabled:
+            with SessionLocal.begin() as session:
+                preference = get_or_create_preference(session, user_id)
+                preference.listening_enabled = True
+            return "好，你慢慢说。我等你说完再回应。"
+        if not listening_enabled or not companion_enabled:
+            return None
+        if natural_done:
+            return await self._flush_listening_now(user_id, external_id)
+        # Safety remains immediate even when normal conversational fragments are buffered.
+        if safety_precheck(text).risk_level in {"high", "critical"}:
+            return None
+        conversation_id = self._ensure_qq_conversation(external_id, user_id)
+        async with self._listening_lock(conversation_id):
+            with SessionLocal.begin() as session:
+                buffer = session.scalar(
+                    select(CompanionListeningBuffer).where(
+                        CompanionListeningBuffer.conversation_id == conversation_id
+                    )
+                )
+                fragments: list[dict[str, object]] = []
+                if buffer is not None:
+                    try:
+                        parsed = json.loads(buffer.fragments or "[]")
+                        if isinstance(parsed, list):
+                            fragments = [item for item in parsed if isinstance(item, dict)]
+                    except json.JSONDecodeError:
+                        fragments = []
+                fragments.append(
+                    {
+                        "message_id": message_id,
+                        "text": text,
+                        "created_at": datetime.now(UTC).isoformat(),
+                    }
+                )
+                if buffer is None:
+                    buffer = CompanionListeningBuffer(
+                        conversation_id=conversation_id,
+                        scope_id=user_id,
+                        fragments=json.dumps(fragments, ensure_ascii=False),
+                    )
+                    session.add(buffer)
+                else:
+                    buffer.fragments = json.dumps(fragments, ensure_ascii=False)
+        self._schedule_listening_flush(conversation_id, user_id, external_id, silence_seconds)
+        operation_logs.emit(
+            source="companion",
+            kind="listening_buffered",
+            title="QQ 消息进入连续倾听缓冲",
+            message=f"已暂存 {len(fragments)} 条片段，等待用户说完",
+            details={"conversation_id": conversation_id, "fragment_count": len(fragments)},
+        )
+        return ""
 
     def _extract_triggered_text(self, raw: str, message_type: str) -> str | None:
         if message_type != "group":
@@ -393,7 +891,8 @@ class OneBotManager:
                 "/emotion\n"
                 "/emotion correct <情绪>\n"
                 "/feedback helpful|unhelpful|no-advice\n"
-                "/companion pause|resume\n"
+                 "/companion pause|resume\n"
+                 "/listening on|done|off|cancel|status\n"
                 "/companion memory on|off\n\n"
                 "/companion safety standard\n"
                 "/companion safety unfiltered confirm\n"
@@ -408,8 +907,50 @@ class OneBotManager:
                 "/jm delete <任务ID>\n\n"
                 "【确认】\n"
                 "/confirm <token>\n"
-                "/cancel <token>"
+                 "/cancel <token>"
             )
+        if text == "/listening" or text.startswith("/listening "):
+            if external_id.startswith("group:"):
+                return "‘你听我说’模式仅支持 QQ Owner 私聊。"
+            if not is_owner(user_id):
+                return "只有 Owner 可以使用‘你听我说’模式。"
+            action = text.removeprefix("/listening").strip().lower()
+            if action == "on":
+                with SessionLocal.begin() as session:
+                    preference = get_or_create_preference(session, user_id)
+                    preference.listening_enabled = True
+                return (
+                    "已开启‘你听我说’模式。你可以分段发送，30 秒没有新消息或发送 "
+                    "/listening done 后我再回复。"
+                )
+            if action == "status":
+                with SessionLocal() as session:
+                    preference = get_or_create_preference(session, user_id)
+                    conversation = session.scalar(
+                        select(Conversation).where(
+                            Conversation.platform == "qq", Conversation.external_id == external_id
+                        )
+                    )
+                    count = 0
+                    if conversation is not None:
+                        buffer = session.scalar(
+                            select(CompanionListeningBuffer).where(
+                                CompanionListeningBuffer.conversation_id == conversation.id
+                            )
+                        )
+                        count = self._buffer_count(buffer)
+                    return (
+                        f"你听我说模式：{'已开启' if preference.listening_enabled else '已关闭'}；"
+                        f"待处理片段：{count}。"
+                    )
+            if action in {"done", "off", "cancel"}:
+                if action == "cancel":
+                    await self._cancel_listening(user_id, external_id)
+                    return "已关闭‘你听我说’模式；当前未处理片段不会进入模型。"
+                return await self._flush_listening_now(
+                    user_id, external_id, disable_after=action == "off"
+                )
+            return "用法：/listening on|done|off|cancel|status"
         if text == "/support" or text.startswith("/support "):
             if external_id.startswith("group:"):
                 return "情感陪伴仅支持 QQ 私聊，群聊不会加载私人陪伴资料。"
@@ -656,14 +1197,18 @@ class OneBotManager:
                     "长期记忆不会因会话轮换而删除。"
                 )
         if text in {"/persona", "/persona list"}:
-            with SessionLocal() as session:
+            with SessionLocal.begin() as session:
+                entries = get_persona_store().sync_db(session)
                 conversation = session.scalar(
                     select(Conversation).where(
                         Conversation.platform == "qq", Conversation.external_id == external_id
                     )
                 )
                 current_id = conversation.persona_id if conversation else None
-                personas = list(session.scalars(select(Persona).order_by(Persona.name)))
+                personas = sorted(
+                    (entry for entry in entries.values() if entry.is_active),
+                    key=lambda entry: entry.name.casefold(),
+                )
                 lines = [f"当前人格：{current_id or '关闭'}"]
                 lines.extend(f"- {item.name} ({item.id})" for item in personas)
                 return "可用人格：\n" + ("\n".join(lines) if personas else "暂无已保存人格")
@@ -674,10 +1219,16 @@ class OneBotManager:
             if text != "/persona off" and not requested:
                 return "用法：/persona use <人格名称或ID>，或 /persona off。"
             with SessionLocal.begin() as session:
+                entries = get_persona_store().sync_db(session)
                 persona = None
                 if requested is not None:
-                    persona = session.scalar(
-                        select(Persona).where((Persona.id == requested) | (Persona.name == requested))
+                    persona = next(
+                        (
+                            entry
+                            for entry in entries.values()
+                            if entry.is_active and (entry.id == requested or entry.name == requested)
+                        ),
+                        None,
                     )
                     if persona is None:
                         return "找不到该人格，请先使用 /persona list 查看。"
