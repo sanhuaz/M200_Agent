@@ -37,6 +37,55 @@ type Confirmation = { token: string; action: string; payload: Record<string, unk
 type ExtensionRow = { id: string; kind: string; name: string; version: string; description: string; enabled: boolean; builtin: boolean; status: string; access_policy: string; error?: string }
 type PersonaRow = { id: string; name: string; raw_prompt: string; created_at?: string; updated_at?: string }
 type AdminRow = { id: string; external_id: string; display_name?: string; platform: string; enabled: boolean }
+type CompanionPreferenceRow = {
+  scope_id: string
+  companion_enabled: boolean
+  support_mode: 'auto' | 'listen' | 'reflect' | 'advice'
+  memory_enabled: boolean
+  safety_mode: 'standard' | 'unfiltered'
+  analyzer_model_alias: string | null
+  boundaries: Record<string, unknown>
+  updated_at?: string | null
+}
+type RelationshipRow = {
+  id?: string
+  scope_id: string
+  persona_key: string
+  persona_id?: string | null
+  nickname: string | null
+  shared_summary: string
+  boundaries: Record<string, unknown>
+  version: number
+  updated_at?: string
+}
+type EmotionAssessmentRow = {
+  id: string
+  user_message_id: string
+  candidate_emotions: string[]
+  candidate_emotions_display: string[]
+  primary_emotion: string | null
+  primary_emotion_display: string | null
+  effective_candidate_emotions?: string[]
+  effective_candidate_emotions_display?: string[]
+  effective_primary_emotion?: string | null
+  effective_primary_emotion_display?: string | null
+  intensity: string | null
+  support_need: string | null
+  support_need_display: string | null
+  effective_support_need?: string | null
+  effective_support_need_display?: string | null
+  confidence: number | null
+  risk_level: string
+  next_action: string
+  next_action_display: string
+  model_alias?: string | null
+  schema_valid: boolean
+  analysis_status: 'valid' | 'retrying' | 'failed' | 'safety_redirected'
+  correction: { emotions?: string[]; support_need?: string | null; note?: string | null }
+  created_at: string
+}
+type CompanionFeedbackRow = { id: string; assistant_message_id: string; feedback: string; correction: { note?: string }; created_at: string; updated_at: string }
+type CompanionSafetyRow = { id: string; message_id: string; risk_level: string; action: string; detector_version: string; details: { rules?: string[]; source?: string; safety_mode?: string; response_source?: string; violation_codes?: string[] }; created_at: string }
 type HealthItem = { alias?: string; model?: string; configured?: boolean }
 type LogProgress = { current?: number; total?: number; percent?: number; unit?: string }
 type LogEvent = {
@@ -95,6 +144,22 @@ const tools = ref<ExtensionRow[]>([])
 const skills = ref<ExtensionRow[]>([])
 const personas = ref<PersonaRow[]>([])
 const admins = ref<AdminRow[]>([])
+const companionOwnerId = ref('')
+const companionPreferences = ref<CompanionPreferenceRow | null>(null)
+const companionRelationships = ref<RelationshipRow[]>([])
+const companionPersonaKey = ref('default')
+const companionAssessments = ref<EmotionAssessmentRow[]>([])
+const companionFeedback = ref<CompanionFeedbackRow[]>([])
+const companionSafetyEvents = ref<CompanionSafetyRow[]>([])
+const companionCorrectionDrafts = ref<Record<string, { emotions: string[]; support_need: string; note: string }>>({})
+const companionBoundaryText = ref('{}')
+const companionLoading = ref(false)
+const companionSaving = ref(false)
+const companionSavedSafetyMode = ref<'standard' | 'unfiltered'>('standard')
+const companionPrivacyDeleting = ref(false)
+const companionDeleteCategories = ref<string[]>(['relationships', 'assessments', 'feedback', 'safety', 'preferences'])
+const companionDeleteConfirm = ref('')
+const companionExpanded = ref(true)
 const personaName = ref('')
 const personaPrompt = ref('')
 const editingPersonaId = ref('')
@@ -130,17 +195,43 @@ let followsSystemTheme = false
 let systemThemeQuery: MediaQueryList | undefined
 const currentConversation = computed(() => conversations.value.find((item) => item.id === currentConversationId.value))
 const hasIndexingDocuments = computed(() => documents.value.some((item) => ['queued', 'indexing'].includes(item.status)))
+const companionOwners = computed(() => admins.value.filter((item) => item.platform === 'qq' && item.enabled && /^\d{5,20}$/.test(item.external_id)))
+const companionPersonas = computed(() => [{ id: 'default', name: '默认人格' }, ...personas.value.map((item) => ({ id: item.id, name: item.name }))])
+const companionAnalyzerFallbackAlias = computed(() => {
+  const selected = companionPreferences.value?.analyzer_model_alias
+  if (!selected) return ''
+  const profile = models.value.find((item) => item.alias === selected)
+  if (profile?.configured) return ''
+  return models.value.find((item) => item.is_default)?.alias || '当前会话主模型'
+})
+const companionEmotionLabels: Record<string, string> = {
+  joy: '开心', excitement: '兴奋', relief: '如释重负', gratitude: '感激', pride: '自豪', hope: '希望',
+  sadness: '难过', loneliness: '孤独', anxiety: '焦虑', fear: '害怕', anger: '生气', frustration: '挫败',
+  disappointment: '失望', guilt: '内疚', shame: '羞愧', helplessness: '无力', exhaustion: '疲惫', confusion: '困惑',
+  calm: '平静', neutral: '平淡',
+}
+const companionEmotionOptions = Object.entries(companionEmotionLabels).map(([value, label]) => ({ value, label }))
+const companionSupportNeedLabels: Record<string, string> = { listen: '倾听', comfort: '安慰', reflect: '一起梳理', advice: '建议', celebrate: '庆祝', space: '留一点空间', unknown: '尚不确定' }
+const companionAnalysisStatusLabels: Record<EmotionAssessmentRow['analysis_status'], string> = { valid: '有效', retrying: '重试中', failed: '分析失败', safety_redirected: '安全转向' }
+const companionAnalysisStatusTypes: Record<EmotionAssessmentRow['analysis_status'], 'success' | 'warning' | 'danger'> = { valid: 'success', retrying: 'warning', failed: 'danger', safety_redirected: 'warning' }
+function companionAnalysisStatusLabel(status: string) { return companionAnalysisStatusLabels[status as EmotionAssessmentRow['analysis_status']] || '未知' }
+function companionAnalysisStatusType(status: string) { return companionAnalysisStatusTypes[status as EmotionAssessmentRow['analysis_status']] || 'danger' }
 const DOCUMENT_REFRESH_INTERVAL_MS = 1000
 let documentRefreshTimer: number | undefined
 const routePaths: Record<string, string> = {
   chat: '/chat', models: '/models', knowledge: '/knowledge', tools: '/tools', skills: '/skills',
-  personas: '/personas', memory: '/memories', admin: '/admin', tasks: '/tasks', status: '/status', logs: '/logs',
+  personas: '/personas', memory: '/memories', companion: '/companion', relationships: '/relationships',
+  emotionRecords: '/emotion-records', privacy: '/privacy', admin: '/admin', tasks: '/tasks', status: '/status', logs: '/logs',
 }
 const pageDetails: Record<string, { title: string; description: string }> = {
   chat: { title: '对话', description: '与 M200 Agent 对话并管理会话模型和人格' },
   models: { title: '模型管理', description: '配置主聊天 LLM，并在会话中快捷切换' },
   knowledge: { title: '知识库', description: '管理文档、Embedding 配置和索引状态' },
   memory: { title: '长期记忆', description: '查看和维护全局、用户与群组记忆' },
+  companion: { title: '陪伴设置', description: '为已启用的 QQ Owner 管理陪伴流程与记忆授权' },
+  relationships: { title: '关系资料', description: '按人格查看、修改或删除已授权的低敏感关系资料' },
+  emotionRecords: { title: '情绪记录', description: '查看陪伴分析、支持需求、策略与用户纠正' },
+  privacy: { title: '陪伴隐私', description: '导出或按分类删除陪伴数据' },
   personas: { title: '人格管理', description: '创建可按会话切换的原始提示词人格' },
   tools: { title: '工具管理', description: '管理工具扩展并发起漫画搜索与下载' },
   skills: { title: '技能管理', description: '导入、启用和维护 Agent Skills' },
@@ -532,6 +623,7 @@ function changeTab(tab: string | number) {
   if (previous === 'logs' && name !== 'logs') closeLogStream()
   if (name === 'logs') void enterLogsPage()
   if (name === 'memory' || name === 'tasks') loadMemoryTasks()
+  if (['companion', 'relationships', 'emotionRecords', 'privacy'].includes(name)) void loadCompanionData()
   if (name === 'models' && !editingModelAlias.value && models.value.length) {
     selectModel(models.value.find((item) => item.is_default) || models.value[0])
   }
@@ -726,6 +818,196 @@ async function loadManagement() {
   skills.value = skillData
   personas.value = personaData
   admins.value = adminData
+  if (!companionOwnerId.value || !companionOwners.value.some((item) => item.external_id === companionOwnerId.value)) {
+    companionOwnerId.value = companionOwners.value[0]?.external_id || ''
+  }
+}
+
+function companionRequestId() {
+  return companionOwnerId.value ? `?qq_user_id=${encodeURIComponent(companionOwnerId.value)}` : ''
+}
+
+function initializeCompanionCorrections(items: EmotionAssessmentRow[]) {
+  companionCorrectionDrafts.value = Object.fromEntries(
+    items.map((item) => [
+      item.user_message_id,
+      {
+        emotions: item.correction?.emotions?.length ? item.correction.emotions : item.candidate_emotions,
+        support_need: item.correction?.support_need || item.support_need || 'unknown',
+        note: item.correction?.note || '',
+      },
+    ]),
+  )
+}
+
+async function loadCompanionData() {
+  if (!companionOwnerId.value) return
+  companionLoading.value = true
+  try {
+    const scope = companionRequestId()
+    const [preference, relationships, assessments, exported] = await Promise.all([
+      api<CompanionPreferenceRow>(`/companion/preferences${scope}`),
+      api<RelationshipRow[]>(`/companion/relationships${scope}`),
+      api<EmotionAssessmentRow[]>(`/companion/assessments${scope}&limit=100`),
+      api<{ feedback: CompanionFeedbackRow[]; safety_events: CompanionSafetyRow[] }>(`/companion/privacy/export${scope}`),
+    ])
+    companionPreferences.value = preference
+    companionSavedSafetyMode.value = preference.safety_mode || 'standard'
+    companionBoundaryText.value = JSON.stringify(preference.boundaries || {}, null, 2)
+    companionRelationships.value = relationships
+    companionAssessments.value = assessments
+    initializeCompanionCorrections(assessments)
+    companionFeedback.value = exported.feedback || []
+    companionSafetyEvents.value = exported.safety_events || []
+  } catch (error) {
+    ElMessage.error(`陪伴数据加载失败：${(error as Error).message}`)
+  } finally {
+    companionLoading.value = false
+  }
+}
+
+async function saveCompanionPreferences() {
+  if (!companionOwnerId.value || !companionPreferences.value) return
+  const requestedSafetyMode = companionPreferences.value.safety_mode || 'standard'
+  if (requestedSafetyMode === 'unfiltered' && companionSavedSafetyMode.value !== 'unfiltered') {
+    const confirmation = window.prompt('无过滤模式仅关闭本机陪伴内容拦截，仍受权限、工具确认、文件隔离、密钥脱敏和模型服务商规则约束。请输入“启用无过滤模式”确认：')
+    if (confirmation !== '启用无过滤模式') {
+      companionPreferences.value.safety_mode = companionSavedSafetyMode.value
+      ElMessage.warning('未确认，无过滤模式保持关闭')
+      return
+    }
+  }
+  let boundaries: Record<string, unknown> = {}
+  try {
+    boundaries = JSON.parse(companionBoundaryText.value || '{}') as Record<string, unknown>
+  } catch {
+    ElMessage.warning('边界配置必须是合法 JSON')
+    return
+  }
+  companionSaving.value = true
+  try {
+    companionPreferences.value = await api<CompanionPreferenceRow>('/companion/preferences', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ qq_user_id: companionOwnerId.value, ...companionPreferences.value, boundaries }),
+    })
+    companionSavedSafetyMode.value = companionPreferences.value.safety_mode || 'standard'
+    companionBoundaryText.value = JSON.stringify(companionPreferences.value.boundaries || {}, null, 2)
+    ElMessage.success('陪伴设置已保存')
+  } catch (error) {
+    ElMessage.error(`陪伴设置保存失败：${(error as Error).message}`)
+  } finally {
+    companionSaving.value = false
+  }
+}
+
+function newCompanionRelationship() {
+  if (!companionOwnerId.value) return
+  if (companionRelationships.value.some((item) => item.persona_key === companionPersonaKey.value)) return
+  const persona = companionPersonas.value.find((item) => item.id === companionPersonaKey.value)
+  companionRelationships.value.push({
+    scope_id: companionOwnerId.value,
+    persona_key: companionPersonaKey.value,
+    persona_id: companionPersonaKey.value === 'default' ? null : companionPersonaKey.value,
+    nickname: null,
+    shared_summary: '',
+    boundaries: {},
+    version: 0,
+  })
+  ElMessage.info(`已添加${persona?.name || '人格'}资料草稿，保存后生效`)
+}
+
+function updateRelationshipBoundaries(item: RelationshipRow, value: string | number | boolean) {
+  try {
+    item.boundaries = JSON.parse(String(value || '{}')) as Record<string, unknown>
+  } catch {
+    ElMessage.warning('边界必须是合法 JSON')
+  }
+}
+
+async function saveCompanionRelationship(item: RelationshipRow) {
+  if (!companionOwnerId.value) return
+  try {
+    const saved = await api<RelationshipRow>(`/companion/relationships/${encodeURIComponent(item.persona_key)}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ qq_user_id: companionOwnerId.value, nickname: item.nickname, shared_summary: item.shared_summary, boundaries: item.boundaries, version: item.version }),
+    })
+    companionRelationships.value = companionRelationships.value.map((row) => row.persona_key === saved.persona_key ? saved : row)
+    ElMessage.success('关系资料已保存')
+  } catch (error) {
+    ElMessage.error(`关系资料保存失败：${(error as Error).message}`)
+    if ((error as Error).message.includes('版本')) await loadCompanionData()
+  }
+}
+
+async function deleteCompanionRelationship(item: RelationshipRow) {
+  if (!companionOwnerId.value || !window.confirm(`确定删除“${item.persona_key === 'default' ? '默认人格' : item.persona_key}”的关系资料？`)) return
+  try {
+    await api(`/companion/relationships/${encodeURIComponent(item.persona_key)}${companionRequestId()}&version=${item.version}`, { method: 'DELETE' })
+    companionRelationships.value = companionRelationships.value.filter((row) => row.persona_key !== item.persona_key)
+    ElMessage.success('关系资料已删除')
+  } catch (error) {
+    ElMessage.error(`关系资料删除失败：${(error as Error).message}`)
+  }
+}
+
+async function submitCompanionCorrection(item: EmotionAssessmentRow) {
+  if (!companionOwnerId.value) return
+  const draft = companionCorrectionDrafts.value[item.user_message_id]
+  if (!draft?.emotions.length) {
+    ElMessage.warning('至少选择一个情绪标签')
+    return
+  }
+  try {
+    const updated = await api<EmotionAssessmentRow>(`/companion/assessments/${item.user_message_id}/correction`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ qq_user_id: companionOwnerId.value, emotions: draft.emotions, support_need: draft.support_need, note: draft.note || null }),
+    })
+    companionAssessments.value = companionAssessments.value.map((row) => row.user_message_id === updated.user_message_id ? updated : row)
+    ElMessage.success('情绪纠正已保存，原始分析仍会保留')
+  } catch (error) {
+    ElMessage.error(`情绪纠正失败：${(error as Error).message}`)
+  }
+}
+
+async function exportCompanionData() {
+  if (!companionOwnerId.value) return
+  try {
+    const data = await api<Record<string, unknown>>(`/companion/privacy/export${companionRequestId()}`)
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json;charset=utf-8' })
+    const link = document.createElement('a')
+    link.href = URL.createObjectURL(blob)
+    link.download = `companion-${companionOwnerId.value}.json`
+    link.click()
+    URL.revokeObjectURL(link.href)
+    ElMessage.success('陪伴数据已导出')
+  } catch (error) {
+    ElMessage.error(`数据导出失败：${(error as Error).message}`)
+  }
+}
+
+async function deleteCompanionData() {
+  if (!companionOwnerId.value || !companionDeleteCategories.value.length) return
+  if (companionDeleteConfirm.value !== '删除陪伴数据') {
+    ElMessage.warning('请输入“删除陪伴数据”确认删除')
+    return
+  }
+  if (!window.confirm('删除后不可恢复，确定继续？')) return
+  companionPrivacyDeleting.value = true
+  try {
+    const result = await api<{ counts: Record<string, number>; results: Record<string, { success: boolean; count: number; error?: string }> }>('/companion/privacy/data', {
+      method: 'DELETE', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ qq_user_id: companionOwnerId.value, confirm_text: companionDeleteConfirm.value, categories: companionDeleteCategories.value }),
+    })
+    companionDeleteConfirm.value = ''
+    await loadCompanionData()
+    const failed = Object.entries(result.results || {}).filter(([, item]) => !item.success)
+    if (failed.length) ElMessage.warning(`已部分删除，${failed.length} 项失败，请重试`)
+    else ElMessage.success('所选陪伴数据已删除')
+  } catch (error) {
+    ElMessage.error(`数据删除失败：${(error as Error).message}`)
+  } finally {
+    companionPrivacyDeleting.value = false
+  }
 }
 
 async function setExtension(kind: 'tools' | 'skills', item: ExtensionRow, enabled: boolean) {
@@ -917,6 +1199,7 @@ onMounted(async () => {
   window.addEventListener('resize', handleResize)
   try { await loadBase(); await loadDocuments(); await loadMemoryTasks(); await loadManagement() }
   catch (error) { ElMessage.error((error as Error).message) }
+  if (['companion', 'relationships', 'emotionRecords', 'privacy'].includes(activeTab.value)) await loadCompanionData()
   if (activeTab.value === 'logs') await enterLogsPage()
 })
 
@@ -946,6 +1229,17 @@ onUnmounted(() => {
         <button class="nav-item" aria-label="知识库" title="知识库" :class="{ active: activeTab === 'knowledge' }" @click="changeTab('knowledge')"><el-icon><Collection /></el-icon><span>知识库</span></button>
         <button class="nav-item" aria-label="长期记忆" title="长期记忆" :class="{ active: activeTab === 'memory' }" @click="changeTab('memory')"><el-icon><Memo /></el-icon><span>长期记忆</span></button>
         <button class="nav-item" aria-label="人格管理" title="人格管理" :class="{ active: activeTab === 'personas' }" @click="changeTab('personas')"><el-icon><UserFilled /></el-icon><span>人格管理</span></button>
+
+        <button class="nav-group" :aria-expanded="companionExpanded" @click="companionExpanded = !companionExpanded">
+          <span><el-icon><ChatDotRound /></el-icon><span>陪伴管理</span></span>
+          <el-icon class="group-arrow" :class="{ expanded: companionExpanded }"><Expand /></el-icon>
+        </button>
+        <div v-show="sidebarCollapsed || companionExpanded" class="nav-children">
+          <button class="nav-item" aria-label="陪伴设置" title="陪伴设置" :class="{ active: activeTab === 'companion' }" @click="changeTab('companion')"><el-icon><Setting /></el-icon><span>陪伴设置</span></button>
+          <button class="nav-item" aria-label="关系资料" title="关系资料" :class="{ active: activeTab === 'relationships' }" @click="changeTab('relationships')"><el-icon><UserFilled /></el-icon><span>关系资料</span></button>
+          <button class="nav-item" aria-label="情绪记录" title="情绪记录" :class="{ active: activeTab === 'emotionRecords' }" @click="changeTab('emotionRecords')"><el-icon><DataAnalysis /></el-icon><span>情绪记录</span></button>
+          <button class="nav-item" aria-label="陪伴隐私" title="陪伴隐私" :class="{ active: activeTab === 'privacy' }" @click="changeTab('privacy')"><el-icon><Delete /></el-icon><span>陪伴隐私</span></button>
+        </div>
 
         <button class="nav-group" :aria-expanded="extensionExpanded" @click="extensionExpanded = !extensionExpanded">
           <span><el-icon><MagicStick /></el-icon><span>扩展管理</span></span>
@@ -1024,6 +1318,71 @@ onUnmounted(() => {
             <div class="composer"><el-input v-model="input" type="textarea" :rows="3" resize="none" placeholder="输入消息，Ctrl+Enter 发送" @keydown.ctrl.enter.prevent="send" /><el-button type="primary" :loading="sending" @click="send">发送</el-button></div>
           </section>
         </section>
+
+        <template v-else-if="activeTab === 'companion'">
+          <section v-if="!companionOwners.length" class="panel stack">
+            <div class="panel-heading"><div><span class="section-kicker">Owner</span><h2>暂无可用 QQ Owner</h2></div></div>
+            <p class="hint">请先在“管理员”中添加并启用 QQ Owner；陪伴设置不接受任意输入的 QQ 号。</p>
+            <el-button type="primary" @click="changeTab('admin')">前往管理员</el-button>
+          </section>
+          <div v-else class="two-column">
+            <section class="panel stack">
+              <div class="panel-heading"><div><span class="section-kicker">身份范围</span><h2>QQ Owner 陪伴</h2></div><div class="form-row"><el-tag :type="companionPreferences?.companion_enabled ? 'success' : 'warning'">{{ companionPreferences?.companion_enabled ? '已启用' : '已暂停' }}</el-tag><el-tag v-if="companionPreferences?.safety_mode === 'unfiltered'" type="danger">无过滤模式</el-tag></div></div>
+              <label class="field-control"><span>选择已启用 QQ Owner</span><el-select v-model="companionOwnerId" @change="loadCompanionData"><el-option v-for="item in companionOwners" :key="item.external_id" :label="`${item.display_name || 'QQ Owner'} · ${item.external_id}`" :value="item.external_id" /></el-select></label>
+              <el-alert title="仅 Owner 私聊进入陪伴流程；非 Owner 私聊和所有群聊仍使用通用 Agent。" type="info" :closable="false" />
+              <div v-if="companionPreferences" class="stack companion-settings">
+                <div class="form-row"><span class="setting-label">陪伴流程</span><el-switch v-model="companionPreferences.companion_enabled" active-text="启用" inactive-text="暂停" /></div>
+                <label class="field-control"><span>默认支持方式</span><el-select v-model="companionPreferences.support_mode"><el-option label="自动判断" value="auto" /><el-option label="倾听" value="listen" /><el-option label="一起梳理" value="reflect" /><el-option label="建议" value="advice" /></el-select></label>
+                <label class="field-control"><span>安全模式</span><el-select v-model="companionPreferences.safety_mode"><el-option label="标准防护" value="standard" /><el-option label="无过滤模式（仅本机拦截关闭）" value="unfiltered" /></el-select></label>
+                <el-alert v-if="companionPreferences.safety_mode === 'unfiltered'" type="error" :closable="false" title="无过滤模式已选择" description="仅关闭本机陪伴内容拦截；Owner 权限、Tool 确认、文件隔离、密钥脱敏和模型服务商自身规则仍然有效。保存时需要输入确认文本。" />
+                <label class="field-control"><span>情绪分析模型 alias</span><el-select v-model="companionPreferences.analyzer_model_alias" clearable placeholder="跟随当前会话主模型"><el-option v-for="item in models" :key="item.alias" :label="`${item.alias}${item.configured ? '' : '（不可用）'}`" :value="item.alias" /></el-select><small v-if="companionAnalyzerFallbackAlias" class="hint-inline">所选 alias 不可用，当前请求会回退到：{{ companionAnalyzerFallbackAlias }}</small></label>
+                <div class="form-row"><span class="setting-label">关系记忆授权</span><el-switch v-model="companionPreferences.memory_enabled" active-text="已授权" inactive-text="关闭" /><small class="hint-inline">关闭时不召回、不新增关系资料。</small></div>
+                <label class="field-control"><span>沟通边界（JSON）</span><el-input v-model="companionBoundaryText" type="textarea" :rows="5" placeholder='例如：{"items":["不想被催着给建议"]}' /></label>
+                <el-button type="primary" :loading="companionSaving" @click="saveCompanionPreferences">保存陪伴设置</el-button>
+              </div>
+            </section>
+            <section class="panel stack">
+              <div class="panel-heading"><div><span class="section-kicker">使用边界</span><h2>当前安全说明</h2></div><el-icon><Warning /></el-icon></div>
+              <p class="hint">情绪标签是可纠正的候选分类，不是心理诊断。<template v-if="companionPreferences?.safety_mode === 'unfiltered'">当前无过滤模式只做风险审计，高风险内容仍进入普通 Agent；本机权限和模型服务商规则不变。</template><template v-else>标准模式下，高风险内容会停止普通角色扮演和工具调用，转入安全支持提示。</template></p>
+              <div class="card-list"><div class="result"><span><strong>记忆默认状态</strong><small>首次授权前，历史资料保留但当前回合不召回、不写入。</small></span><el-tag type="warning">默认关闭</el-tag></div><div class="result"><span><strong>分析模型不可用</strong><small>自动回退当前会话主模型；仍不可用时使用澄清降级。</small></span><el-tag type="info">自动回退</el-tag></div><div class="result"><span><strong>数据控制</strong><small>可在关系资料和隐私页面修改、导出或分类删除。</small></span><el-button size="small" @click="changeTab('privacy')">管理隐私</el-button></div></div>
+            </section>
+          </div>
+        </template>
+
+        <template v-else-if="activeTab === 'relationships'">
+          <section v-if="!companionOwners.length" class="panel stack"><h2>暂无可用 QQ Owner</h2><p class="hint">请先启用 QQ Owner。</p></section>
+          <section v-else class="panel stack">
+            <div class="panel-heading"><div><span class="section-kicker">关系范围</span><h2>已授权关系资料</h2></div><span class="count-badge">{{ companionRelationships.length }}</span></div>
+            <div class="form-row"><el-select v-model="companionOwnerId" @change="loadCompanionData"><el-option v-for="item in companionOwners" :key="item.external_id" :label="`${item.display_name || 'QQ Owner'} · ${item.external_id}`" :value="item.external_id" /></el-select><el-select v-model="companionPersonaKey"><el-option v-for="item in companionPersonas" :key="item.id" :label="item.name" :value="item.id" /></el-select><el-button @click="newCompanionRelationship">添加人格资料</el-button></div>
+            <el-alert title="只保存用户明确表达的低敏感事实；诊断、危机细节、凭据、精确位置和第三方隐私不会自动写入。" type="info" :closable="false" />
+            <div v-for="item in companionRelationships" :key="item.persona_key" class="relationship-editor">
+              <div class="panel-heading"><div><span class="section-kicker">人格</span><h3>{{ companionPersonas.find((persona) => persona.id === item.persona_key)?.name || item.persona_key }}</h3></div><el-tag size="small" type="info">版本 {{ item.version }}</el-tag></div>
+              <div class="model-form-grid"><label class="field-control"><span>称呼</span><el-input v-model="item.nickname" placeholder="用户希望的称呼" /></label><label class="field-control field-wide"><span>共同经历摘要</span><el-input v-model="item.shared_summary" type="textarea" :rows="3" maxlength="4000" /></label><label class="field-control field-wide"><span>边界（JSON）</span><el-input :model-value="JSON.stringify(item.boundaries || {}, null, 2)" type="textarea" :rows="3" @change="updateRelationshipBoundaries(item, $event)" /></label></div>
+              <div class="form-row"><el-button type="primary" @click="saveCompanionRelationship(item)">保存</el-button><el-button type="danger" plain @click="deleteCompanionRelationship(item)">删除资料</el-button></div>
+            </div>
+            <div v-if="!companionRelationships.length" class="empty-copy">当前没有关系资料。选择人格后点击“添加人格资料”开始编辑。</div>
+          </section>
+        </template>
+
+        <template v-else-if="activeTab === 'emotionRecords'">
+          <section v-if="!companionOwners.length" class="panel stack"><h2>暂无可用 QQ Owner</h2><p class="hint">请先启用 QQ Owner。</p></section>
+          <section v-else class="panel stack">
+            <div class="panel-heading"><div><span class="section-kicker">可纠正分类</span><h2>情绪分析记录</h2></div><span class="count-badge">{{ companionAssessments.length }}</span></div>
+            <div class="form-row"><el-select v-model="companionOwnerId" @change="loadCompanionData"><el-option v-for="item in companionOwners" :key="item.external_id" :label="`${item.display_name || 'QQ Owner'} · ${item.external_id}`" :value="item.external_id" /></el-select><el-button @click="loadCompanionData" :loading="companionLoading">刷新</el-button></div>
+            <el-alert title="页面不展示用户消息原文；候选标签仅用于回顾和纠正。高风险记录只显示风险级别和已执行动作。" type="warning" :closable="false" />
+            <p class="hint">安全转向记录会显示“安全转向，未执行情绪分类”，不把中性占位值当作真实情绪。</p>
+            <div class="table-wrap"><el-table :data="companionAssessments" empty-text="还没有陪伴分析记录"><el-table-column label="状态" width="110"><template #default="scope"><el-tag :type="companionAnalysisStatusType(scope.row.analysis_status)">{{ companionAnalysisStatusLabel(scope.row.analysis_status) }}</el-tag><small v-if="scope.row.analysis_status !== 'valid'">不展示占位分类</small></template></el-table-column><el-table-column label="情绪候选" min-width="190"><template #default="scope"><template v-if="scope.row.effective_candidate_emotions_display?.length || scope.row.analysis_status === 'valid'"><el-tag v-for="emotion in (scope.row.effective_candidate_emotions_display?.length ? scope.row.effective_candidate_emotions_display : scope.row.candidate_emotions_display)" :key="emotion" size="small" class="tag-gap">{{ emotion }}</el-tag><small v-if="scope.row.effective_primary_emotion_display || scope.row.primary_emotion_display">主：{{ scope.row.effective_primary_emotion_display || scope.row.primary_emotion_display }}</small></template><span v-else>—</span></template></el-table-column><el-table-column label="支持需要" width="120"><template #default="scope">{{ scope.row.effective_support_need_display || (scope.row.analysis_status === 'valid' ? scope.row.support_need_display : '—') }}</template></el-table-column><el-table-column label="置信度" width="100"><template #default="scope">{{ scope.row.confidence == null ? '—' : `${Math.round(scope.row.confidence * 100)}%` }}</template></el-table-column><el-table-column prop="next_action_display" label="策略" width="120" /><el-table-column label="风险" width="100"><template #default="scope"><el-tag :type="scope.row.risk_level === 'low' ? 'success' : scope.row.risk_level === 'medium' ? 'warning' : 'danger'">{{ scope.row.risk_level }}</el-tag></template></el-table-column><el-table-column label="纠正" min-width="340"><template #default="scope"><div v-if="companionCorrectionDrafts[scope.row.user_message_id]" class="correction-cell"><el-select v-model="companionCorrectionDrafts[scope.row.user_message_id].emotions" multiple collapse-tags placeholder="选择 1-3 个情绪"><el-option v-for="emotion in companionEmotionOptions" :key="emotion.value" :label="emotion.label" :value="emotion.value" /></el-select><el-select v-model="companionCorrectionDrafts[scope.row.user_message_id].support_need" placeholder="支持需要"><el-option v-for="(label, value) in companionSupportNeedLabels" :key="value" :label="label" :value="value" /></el-select><el-button size="small" type="primary" @click="submitCompanionCorrection(scope.row)">保存纠正</el-button></div></template></el-table-column></el-table></div>
+            <div v-if="companionSafetyEvents.length" class="card-list"><div v-for="item in companionSafetyEvents" :key="item.id" class="result"><span><strong>风险事件 · {{ item.risk_level }}</strong><small>动作：{{ item.action }} · 检测版本：{{ item.detector_version }}</small></span><el-tag type="warning">已脱敏</el-tag></div></div>
+          </section>
+        </template>
+
+        <template v-else-if="activeTab === 'privacy'">
+          <section v-if="!companionOwners.length" class="panel stack"><h2>暂无可用 QQ Owner</h2><p class="hint">请先启用 QQ Owner。</p></section>
+          <div v-else class="two-column">
+            <section class="panel stack"><div class="panel-heading"><div><span class="section-kicker">数据可携带</span><h2>导出陪伴数据</h2></div><el-icon><DataAnalysis /></el-icon></div><div class="form-row"><el-select v-model="companionOwnerId" @change="loadCompanionData"><el-option v-for="item in companionOwners" :key="item.external_id" :label="`${item.display_name || 'QQ Owner'} · ${item.external_id}`" :value="item.external_id" /></el-select><el-button type="primary" @click="exportCompanionData">导出 JSON</el-button></div><p class="hint">导出包含偏好、关系资料、情绪元数据、反馈和脱敏安全事件，不包含聊天正文、系统提示词、模型推理、密钥或日志凭据。</p><div class="card-list"><div class="result"><span><strong>关系资料</strong><small>{{ companionRelationships.length }} 条</small></span><el-tag type="info">可管理</el-tag></div><div class="result"><span><strong>情绪记录</strong><small>{{ companionAssessments.length }} 条</small></span><el-tag type="info">可纠正</el-tag></div><div class="result"><span><strong>反馈记录</strong><small>{{ companionFeedback.length }} 条</small></span><el-tag type="info">可更新</el-tag></div></div></section>
+            <section class="panel stack"><div class="panel-heading"><div><span class="section-kicker">不可逆操作</span><h2>分类删除</h2></div><el-icon><Warning /></el-icon></div><el-checkbox-group v-model="companionDeleteCategories"><el-checkbox label="relationships">关系资料</el-checkbox><el-checkbox label="assessments">情绪分析</el-checkbox><el-checkbox label="feedback">回复反馈</el-checkbox><el-checkbox label="safety">安全记录</el-checkbox><el-checkbox label="preferences">陪伴偏好</el-checkbox></el-checkbox-group><el-input v-model="companionDeleteConfirm" placeholder="输入：删除陪伴数据" /><el-button type="danger" :loading="companionPrivacyDeleting" :disabled="!companionDeleteCategories.length" @click="deleteCompanionData">确认分类删除</el-button><p class="hint">删除接口幂等，并逐项返回成功/失败结果；删除关系资料后立即停止上下文注入。</p></section>
+          </div>
+        </template>
 
         <template v-else-if="activeTab === 'models'">
           <div class="model-management">
