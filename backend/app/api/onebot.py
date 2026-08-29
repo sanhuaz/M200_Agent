@@ -9,22 +9,34 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from sqlalchemy import select
+from sqlalchemy import desc, select
 from sqlalchemy.exc import IntegrityError
 
 from app.core.config import get_settings
 from app.db.models import (
     Artifact,
     Conversation,
+    EmotionAssessment,
     ExtensionPackage,
     Job,
     KnowledgeBase,
     Memory,
+    Message,
     Persona,
     ProcessedEvent,
+    ResponseFeedback,
 )
 from app.db.session import SessionLocal
 from app.services.chat import chat_service
+from app.services.companion import (
+    COMPANION_ANALYSIS_RETRY_JOB_TYPE,
+    EMOTION_LABEL_ZH,
+    SUPPORT_NEED_ZH,
+    assessment_dict,
+    get_or_create_preference,
+    parse_emotion_labels_strict,
+    safety_redirect_text,
+)
 from app.services.confirmations import (
     create_extension_confirmation,
     is_owner,
@@ -223,7 +235,17 @@ class OneBotManager:
         try:
             command_response = await self._command(text, user_id, external_id)
             if command_response is not None:
-                await self.send_text(user_id, command_response, group_id)
+                try:
+                    await self.send_text(user_id, command_response, group_id)
+                except Exception as error:
+                    operation_logs.emit(
+                        source="onebot",
+                        kind="failed",
+                        title="QQ 命令发送失败",
+                        message="命令结果未送达",
+                        details={"user_id": user_id, "error": type(error).__name__},
+                    )
+                    raise
                 return
             with SessionLocal() as session:
                 conversation = session.scalar(
@@ -276,7 +298,21 @@ class OneBotManager:
                         artifact_id = str(event_data.get("artifact_id", ""))
                         if artifact_id:
                             artifact_ids.append(artifact_id)
-                await self.send_text(user_id, final_text or f"处理失败：{error_text}", group_id)
+                try:
+                    await self.send_text(user_id, final_text or f"处理失败：{error_text}", group_id)
+                except Exception as error:
+                    operation_logs.emit(
+                        source="onebot",
+                        kind="failed",
+                        title="QQ 回复发送失败",
+                        message="回复已写入数据库但未确认送达",
+                        details={
+                            "conversation_id": conversation.id,
+                            "user_id": user_id,
+                            "error": type(error).__name__,
+                        },
+                    )
+                    raise
                 if not group_id:
                     with SessionLocal() as artifact_session:
                         artifacts = [
@@ -352,6 +388,16 @@ class OneBotManager:
                 "/persona list\n"
                 "/persona use <名称或ID>\n"
                 "/persona off\n\n"
+                "【情感陪伴（仅 Owner 私聊）】\n"
+                "/support auto|listen|reflect|advice\n"
+                "/emotion\n"
+                "/emotion correct <情绪>\n"
+                "/feedback helpful|unhelpful|no-advice\n"
+                "/companion pause|resume\n"
+                "/companion memory on|off\n\n"
+                "/companion safety standard\n"
+                "/companion safety unfiltered confirm\n"
+                "/companion status\n\n"
                 "【Tools 与 Skills】\n"
                 "/tools\n"
                 "/skills\n"
@@ -364,6 +410,195 @@ class OneBotManager:
                 "/confirm <token>\n"
                 "/cancel <token>"
             )
+        if text == "/support" or text.startswith("/support "):
+            if external_id.startswith("group:"):
+                return "情感陪伴仅支持 QQ 私聊，群聊不会加载私人陪伴资料。"
+            if not is_owner(user_id):
+                return "只有 Owner 可以使用情感陪伴。"
+            mode = text.removeprefix("/support").strip()
+            if mode not in {"auto", "listen", "reflect", "advice"}:
+                return "用法：/support auto|listen|reflect|advice"
+            with SessionLocal.begin() as session:
+                preference = get_or_create_preference(session, user_id)
+                preference.support_mode = mode
+            mode_labels = {
+                "auto": "自动判断",
+                "listen": "倾听",
+                "reflect": "一起梳理",
+                "advice": "建议",
+            }
+            return f"本次及后续 QQ 私聊支持方式已设为：{mode_labels[mode]}。"
+        if text == "/emotion" or text.startswith("/emotion correct"):
+            if external_id.startswith("group:"):
+                return "情感陪伴仅支持 QQ 私聊，群聊没有个人情绪记录。"
+            if not is_owner(user_id):
+                return "只有 Owner 可以查看情绪分析。"
+            correcting = text.startswith("/emotion correct")
+            labels: list[str] = []
+            invalid_labels: list[str] = []
+            if correcting:
+                raw_labels = text.removeprefix("/emotion correct").strip()
+                labels, invalid_labels = parse_emotion_labels_strict(raw_labels)
+                if invalid_labels or len(labels) > 3 or not labels:
+                    options = "、".join(EMOTION_LABEL_ZH.values())
+                    return f"情绪标签无效。请选择 1-3 个合法标签：{options}"
+            with SessionLocal.begin() as session:
+                assessment = session.scalar(
+                    select(EmotionAssessment)
+                    .where(EmotionAssessment.scope_id == user_id)
+                    .order_by(desc(EmotionAssessment.created_at))
+                    .limit(1)
+                )
+                if assessment is None:
+                    return "还没有可查看的情绪分析记录。"
+                if correcting:
+                    assessment.correction = json.dumps(
+                        {"emotions": labels, "corrected_at": datetime.now(UTC).isoformat()},
+                        ensure_ascii=False,
+                    )
+                    return "已记录你的情绪纠正：" + "、".join(
+                        EMOTION_LABEL_ZH.get(label, label) for label in labels
+                    )
+                view = assessment_dict(assessment, session)
+                analysis_status = str(view["analysis_status"])
+                corrected_emotions = view.get("effective_candidate_emotions")
+                has_correction = bool(
+                    isinstance(corrected_emotions, list)
+                    and corrected_emotions
+                    and view.get("correction")
+                )
+                if analysis_status == "retrying" and not has_correction:
+                    return "最近一次情绪分析正在重试，暂时没有可靠结果。"
+                if analysis_status == "safety_redirected" and not has_correction:
+                    return (
+                        "最近一次消息触发了安全转向，未执行情绪分类；"
+                        "如需纠正请使用 /emotion correct。"
+                    )
+                if analysis_status == "failed" and not has_correction:
+                    return (
+                        "最近一次情绪分析失败，暂时无法可靠判断；"
+                        "你可以使用 /emotion correct 进行纠正。"
+                    )
+                emotions = corrected_emotions if isinstance(corrected_emotions, list) else []
+                display = "、".join(
+                    EMOTION_LABEL_ZH.get(str(item), str(item)) for item in emotions
+                )
+                support_need_value = view.get("effective_support_need")
+                support_need = (
+                    SUPPORT_NEED_ZH.get(str(support_need_value), "尚不确定")
+                    if isinstance(support_need_value, str)
+                    else "尚不确定"
+                )
+                confidence = view.get("confidence")
+                confidence_text = (
+                    f"{confidence:.0%}"
+                    if isinstance(confidence, (int, float))
+                    else "—"
+                )
+                status_note = "；已采用你的纠正" if has_correction else ""
+                return (
+                    f"最近候选情绪：{display or '暂不确定'}；"
+                    f"支持需要：{support_need}；"
+                    f"置信度：{confidence_text}；"
+                    f"当前策略：{assessment.next_action}{status_note}。"
+                )
+        if text == "/feedback" or text.startswith("/feedback "):
+            if external_id.startswith("group:"):
+                return "情感陪伴反馈仅支持 QQ 私聊。"
+            if not is_owner(user_id):
+                return "只有 Owner 可以提交陪伴反馈。"
+            value = text.removeprefix("/feedback").strip()
+            if value not in {"helpful", "unhelpful", "no-advice"}:
+                return "用法：/feedback helpful|unhelpful|no-advice"
+            with SessionLocal.begin() as session:
+                conversation = session.scalar(
+                    select(Conversation).where(
+                        Conversation.platform == "qq", Conversation.external_id == external_id
+                    )
+                )
+                if conversation is None:
+                    return "当前还没有可反馈的 QQ 会话。"
+                assistant = session.scalar(
+                    select(Message)
+                    .where(
+                        Message.conversation_id == conversation.id,
+                        Message.role == "assistant",
+                    )
+                    .order_by(desc(Message.created_at))
+                    .limit(1)
+                )
+                if assistant is None:
+                    return "当前还没有可反馈的回复。"
+                feedback = session.scalar(
+                    select(ResponseFeedback).where(
+                        ResponseFeedback.assistant_message_id == assistant.id
+                    )
+                )
+                if feedback is None:
+                    feedback = ResponseFeedback(
+                        assistant_message_id=assistant.id,
+                        scope_id=user_id,
+                        feedback=value,
+                    )
+                    session.add(feedback)
+                else:
+                    feedback.feedback = value
+                return "已记录本条回复反馈：" + value
+        if text == "/companion" or text.startswith("/companion "):
+            if external_id.startswith("group:"):
+                return "情感陪伴仅支持 QQ 私聊，群聊不会启用。"
+            if not is_owner(user_id):
+                return "只有 Owner 可以管理情感陪伴。"
+            action = text.removeprefix("/companion").strip()
+            allowed_actions = {
+                "pause",
+                "resume",
+                "memory on",
+                "memory off",
+                "safety standard",
+                "safety unfiltered confirm",
+                "status",
+            }
+            if action == "safety unfiltered":
+                return "无过滤模式风险较高；如确认，请发送：/companion safety unfiltered confirm"
+            if action not in allowed_actions:
+                return (
+                    "用法：/companion pause|resume|memory on|memory off；"
+                    "/companion safety standard；"
+                    "/companion safety unfiltered confirm；/companion status"
+                )
+            with SessionLocal.begin() as session:
+                preference = get_or_create_preference(session, user_id)
+                if action == "pause":
+                    preference.companion_enabled = False
+                    return "已暂停情感陪伴，后续私聊将回到通用 Agent。"
+                if action == "resume":
+                    preference.companion_enabled = True
+                    return "已恢复情感陪伴。"
+                if action == "status":
+                    safety_mode = getattr(preference, "safety_mode", "standard") or "standard"
+                    return (
+                        f"情感陪伴：{'已启用' if preference.companion_enabled else '已暂停'}；"
+                        f"关系记忆：{'已授权' if preference.memory_enabled else '未授权'}；"
+                        "安全模式："
+                        f"{'无过滤（仅关闭本机陪伴拦截）' if safety_mode == 'unfiltered' else '标准防护'}。"
+                    )
+                if action == "safety standard":
+                    preference.safety_mode = "standard"
+                    return "已切回标准防护模式。"
+                if action == "safety unfiltered confirm":
+                    preference.safety_mode = "unfiltered"
+                    return (
+                        "已启用无过滤模式（仅当前 Owner）。本机仍保留 Owner 权限、Tool 确认、"
+                        "文件隔离和密钥脱敏；模型服务商仍可能自行拒答。"
+                        "可用 /companion safety standard 关闭。"
+                    )
+                preference.memory_enabled = action == "memory on"
+                return (
+                    "已授权关系记忆；后续只保存低敏感、明确表达的关系事实。"
+                    if preference.memory_enabled
+                    else "已关闭记忆；后续陪伴私聊不召回或写入长期记忆。"
+                )
         if text in {"/new", "/reset-context"}:
             if external_id.startswith("group:") and not is_owner(user_id):
                 return "只有 Owner 可以轮换群聊上下文。"
@@ -619,6 +854,24 @@ class OneBotManager:
         return None
 
     async def notify_job(self, job: Job) -> None:
+        if job.type == COMPANION_ANALYSIS_RETRY_JOB_TYPE:
+            if job.status == "succeeded" and job.result:
+                result = json.loads(job.result)
+                risk_level = result.get("risk_level")
+                safety_mode = result.get("safety_mode", "standard")
+                next_action = result.get("next_action")
+                if (
+                    safety_mode == "standard"
+                    and risk_level in {"high", "critical"}
+                    and next_action == "safety_redirect"
+                    and job.requester_id.isdigit()
+                    and is_owner(job.requester_id)
+                ):
+                    await self.send_text(
+                        job.requester_id,
+                        safety_redirect_text("critical" if risk_level == "critical" else "high"),
+                    )
+            return
         if not job.requester_id.isdigit() or not is_owner(job.requester_id):
             return
         if job.status != "succeeded" or not job.result:
