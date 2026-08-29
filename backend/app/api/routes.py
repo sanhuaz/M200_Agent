@@ -12,17 +12,22 @@ from typing import Literal
 import httpx
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, Field
-from sqlalchemy import delete, desc, select, text, update
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import delete, desc, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.api.onebot import onebot_manager
+from app.api.onebot import (
+    onebot_manager,
+    qq_chunked_output_enabled,
+    set_qq_chunked_output_enabled,
+)
 from app.core.config import get_settings
 from app.db.models import (
     AdminIdentity,
     Artifact,
     Chunk,
+    CompanionListeningBuffer,
     CompanionPreference,
     Confirmation,
     Conversation,
@@ -69,6 +74,7 @@ from app.services.jobs import (
     job_worker,
 )
 from app.services.manga import manga_service
+from app.services.memories import memory_collection_name
 from app.services.model_profiles import (
     create_profile,
     delete_profile,
@@ -80,8 +86,20 @@ from app.services.model_profiles import (
 from app.services.models import model_registry
 from app.services.napcat_logs import napcat_connector
 from app.services.operation_logs import operation_logs
-from app.services.personas import persona_dict, validate_persona_prompt
+from app.services.persona_store import get_persona_store
+from app.services.personas import (
+    PersonaCard,
+    persona_dict,
+)
 from app.services.runtime import admin_dict, is_owner
+from app.services.strategy_guides import (
+    list_strategy_guides,
+    list_strategy_revisions,
+    reset_strategy_guide,
+    rollback_strategy_guide,
+    strategy_guide_dict,
+    update_strategy_guide,
+)
 from app.services.vector_store import safe_collection_name, vector_store
 
 router = APIRouter()
@@ -185,13 +203,17 @@ class ExtensionState(BaseModel):
 
 
 class PersonaCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(min_length=1, max_length=120)
-    raw_prompt: str = Field(min_length=1, max_length=8_000)
+    card: PersonaCard
 
 
 class PersonaUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str | None = Field(default=None, min_length=1, max_length=120)
-    raw_prompt: str | None = Field(default=None, min_length=1, max_length=8_000)
+    card: PersonaCard | None = None
 
 
 class AdminCreate(BaseModel):
@@ -217,14 +239,34 @@ class NapCatLogTest(BaseModel):
     token: str | None = Field(default=None, max_length=2_000)
 
 
+class QQReplySettingsUpdate(BaseModel):
+    chunked_output_enabled: bool
+
+
 class CompanionPreferenceUpdate(BaseModel):
     qq_user_id: str = Field(min_length=5, max_length=20, pattern=r"^\d+$")
     companion_enabled: bool | None = None
     support_mode: Literal["auto", "listen", "reflect", "advice"] | None = None
     memory_enabled: bool | None = None
     safety_mode: Literal["standard", "unfiltered"] | None = None
+    listening_enabled: bool | None = None
+    listening_silence_seconds: int | None = Field(default=None, ge=5, le=120)
     analyzer_model_alias: str | None = Field(default=None, max_length=80)
     boundaries: dict[str, object] | None = None
+
+
+class StrategyGuideUpdate(BaseModel):
+    prompt_text: str = Field(min_length=1, max_length=4_000)
+    expected_version: int = Field(ge=1)
+
+
+class StrategyGuideRollback(BaseModel):
+    revision_version: int = Field(ge=1)
+    expected_version: int = Field(ge=1)
+
+
+class StrategyGuideVersionRequest(BaseModel):
+    expected_version: int = Field(ge=1)
 
 
 class RelationshipUpdate(BaseModel):
@@ -277,6 +319,8 @@ def _default_preference_dict(qq_user_id: str) -> dict[str, object]:
         "support_mode": "auto",
         "memory_enabled": False,
         "safety_mode": "standard",
+        "listening_enabled": False,
+        "listening_silence_seconds": 30,
         "analyzer_model_alias": None,
         "boundaries": {},
         "created_at": None,
@@ -386,6 +430,10 @@ def update_companion_preferences(
         item.memory_enabled = payload.memory_enabled
     if payload.safety_mode is not None:
         item.safety_mode = payload.safety_mode
+    if payload.listening_enabled is not None:
+        item.listening_enabled = payload.listening_enabled
+    if payload.listening_silence_seconds is not None:
+        item.listening_silence_seconds = payload.listening_silence_seconds
     if "analyzer_model_alias" in payload.model_fields_set:
         alias = (payload.analyzer_model_alias or "").strip()
         if alias:
@@ -404,6 +452,137 @@ def update_companion_preferences(
     session.commit()
     session.refresh(item)
     return preference_dict(item)
+
+
+def _listening_buffer_count(session: Session, qq_user_id: str) -> int:
+    conversation = session.scalar(
+        select(Conversation).where(
+            Conversation.platform == "qq", Conversation.external_id == f"private:{qq_user_id}"
+        )
+    )
+    if conversation is None:
+        return 0
+    buffer = session.scalar(
+        select(CompanionListeningBuffer).where(
+            CompanionListeningBuffer.conversation_id == conversation.id
+        )
+    )
+    if buffer is None:
+        return 0
+    try:
+        values = json.loads(buffer.fragments or "[]")
+    except json.JSONDecodeError:
+        return 0
+    return len(values) if isinstance(values, list) else 0
+
+
+@router.get("/companion/listening-buffer", dependencies=[Depends(require_loopback)])
+def get_listening_buffer(qq_user_id: str, session: Session = Depends(get_db)) -> dict[str, object]:
+    require_companion_owner(qq_user_id)
+    preference = session.scalar(
+        select(CompanionPreference).where(
+            CompanionPreference.scope_type == "qq_user",
+            CompanionPreference.scope_id == qq_user_id,
+        )
+    )
+    return {
+        "qq_user_id": qq_user_id,
+        "listening_enabled": bool(preference and preference.listening_enabled),
+        "listening_silence_seconds": int(
+            getattr(preference, "listening_silence_seconds", 30) if preference else 30
+        ),
+        "fragment_count": _listening_buffer_count(session, qq_user_id),
+    }
+
+
+@router.delete("/companion/listening-buffer", dependencies=[Depends(require_loopback)])
+def clear_listening_buffer(qq_user_id: str, session: Session = Depends(get_db)) -> dict[str, object]:
+    require_companion_owner(qq_user_id)
+    conversation = session.scalar(
+        select(Conversation).where(
+            Conversation.platform == "qq", Conversation.external_id == f"private:{qq_user_id}"
+        )
+    )
+    deleted = 0
+    if conversation is not None:
+        buffer = session.scalar(
+            select(CompanionListeningBuffer).where(
+                CompanionListeningBuffer.conversation_id == conversation.id
+            )
+        )
+        if buffer is not None:
+            session.delete(buffer)
+            deleted = 1
+    session.commit()
+    return {"cleared": True, "fragment_count": int(deleted)}
+
+
+@router.get("/companion/strategy-guides", dependencies=[Depends(require_loopback)])
+def get_strategy_guides(session: Session = Depends(get_db)) -> list[dict[str, object]]:
+    return [strategy_guide_dict(item) for item in list_strategy_guides(session)]
+
+
+@router.put("/companion/strategy-guides/{strategy}", dependencies=[Depends(require_loopback)])
+def put_strategy_guide(
+    strategy: str, payload: StrategyGuideUpdate, session: Session = Depends(get_db)
+) -> dict[str, object]:
+    try:
+        item = update_strategy_guide(
+            session, strategy, payload.prompt_text, payload.expected_version
+        )
+    except RuntimeError as error:
+        raise HTTPException(409, str(error)) from error
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    return strategy_guide_dict(item)
+
+
+@router.get("/companion/strategy-guides/{strategy}/revisions", dependencies=[Depends(require_loopback)])
+def get_strategy_guide_revisions(
+    strategy: str, session: Session = Depends(get_db)
+) -> list[dict[str, object]]:
+    try:
+        revisions = list_strategy_revisions(session, strategy)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    return [
+        {
+            "strategy": item.strategy,
+            "version": item.version,
+            "prompt_text": item.prompt_text,
+            "source": item.source,
+            "created_at": item.created_at.isoformat(),
+        }
+        for item in revisions
+    ]
+
+
+@router.post("/companion/strategy-guides/{strategy}/rollback", dependencies=[Depends(require_loopback)])
+def post_strategy_guide_rollback(
+    strategy: str, payload: StrategyGuideRollback, session: Session = Depends(get_db)
+) -> dict[str, object]:
+    try:
+        item = rollback_strategy_guide(
+            session, strategy, payload.revision_version, payload.expected_version
+        )
+    except RuntimeError as error:
+        raise HTTPException(409, str(error)) from error
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    return strategy_guide_dict(item)
+
+
+@router.post("/companion/strategy-guides/{strategy}/reset", dependencies=[Depends(require_loopback)])
+def post_strategy_guide_reset(
+    strategy: str, payload: StrategyGuideVersionRequest, session: Session = Depends(get_db)
+) -> dict[str, object]:
+    try:
+        item = reset_strategy_guide(session, strategy, payload.expected_version)
+    except RuntimeError as error:
+        raise HTTPException(409, str(error)) from error
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    return strategy_guide_dict(item)
 
 
 @router.get("/companion/relationships/{persona_key}", dependencies=[Depends(require_loopback)])
@@ -649,6 +828,19 @@ def delete_companion_data(
                             Job.id.in_(assessment_ids),
                             Job.type == COMPANION_ANALYSIS_RETRY_JOB_TYPE,
                         )
+                        )
+            if name == "preferences":
+                conversation = session.scalar(
+                    select(Conversation).where(
+                        Conversation.platform == "qq",
+                        Conversation.external_id == f"private:{payload.qq_user_id}",
+                    )
+                )
+                if conversation is not None:
+                    session.execute(
+                        delete(CompanionListeningBuffer).where(
+                            CompanionListeningBuffer.conversation_id == conversation.id
+                        )
                     )
             count = session.query(model).where(condition).count()
             session.execute(delete(model).where(condition))
@@ -680,6 +872,20 @@ def list_operation_logs(
             source=source, level=level, query=query, limit=limit, after_id=after_id
         ),
     }
+
+
+@router.get("/onebot/reply-settings", dependencies=[Depends(require_loopback)])
+def get_qq_reply_settings(session: Session = Depends(get_db)) -> dict[str, bool]:
+    return {"chunked_output_enabled": qq_chunked_output_enabled(session)}
+
+
+@router.put("/onebot/reply-settings", dependencies=[Depends(require_loopback)])
+def update_qq_reply_settings(
+    payload: QQReplySettingsUpdate, session: Session = Depends(get_db)
+) -> dict[str, bool]:
+    set_qq_chunked_output_enabled(session, payload.chunked_output_enabled)
+    session.commit()
+    return {"chunked_output_enabled": qq_chunked_output_enabled(session)}
 
 
 @router.get("/logs/active", dependencies=[Depends(require_loopback)])
@@ -924,6 +1130,11 @@ async def remove_conversation(conversation_id: str, session: Session = Depends(g
     session.execute(
         update(Artifact).where(Artifact.conversation_id == conversation_id).values(conversation_id=None)
     )
+    session.execute(
+        delete(CompanionListeningBuffer).where(
+            CompanionListeningBuffer.conversation_id == conversation_id
+        )
+    )
     session.execute(delete(ToolRun).where(ToolRun.conversation_id == conversation_id))
     session.delete(conversation)
     session.commit()
@@ -947,10 +1158,16 @@ def switch_model(
 def switch_persona(
     conversation_id: str, payload: PersonaSwitch, session: Session = Depends(get_db)
 ) -> dict[str, object]:
+    persona_store = get_persona_store()
+    entries = persona_store.sync_db(session)
+    session.flush()
     conversation = session.get(Conversation, conversation_id)
     if conversation is None:
         raise HTTPException(404, "会话不存在")
-    if payload.persona_id is not None and session.get(Persona, payload.persona_id) is None:
+    if payload.persona_id is not None and not (
+        entries.get(payload.persona_id) is not None
+        and entries[payload.persona_id].is_active
+    ):
         raise HTTPException(404, "人格不存在")
     conversation.persona_id = payload.persona_id
     session.commit()
@@ -1184,6 +1401,136 @@ def list_memories(
 ]
 
 
+@router.get("/memory-center", dependencies=[Depends(require_loopback)])
+def list_memory_center(
+    memory_type: Literal["all", "fact", "relationship"] = "all",
+    scope_type: Literal["all", "global", "user", "group"] = "all",
+    scope_id: str | None = None,
+    persona_key: str | None = None,
+    status: Literal["active", "archived", "all"] = "active",
+    keyword: str | None = None,
+    session: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    """Return the two internal memory stores through one management surface.
+
+    Relationship profiles are deliberately restricted to currently enabled QQ
+    Owners.  They have no archive state, so an ``archived`` request never
+    exposes them.  No runtime recall or extraction path uses this facade.
+    """
+    # Persona files are authoritative; refresh the lightweight index before
+    # resolving relationship display names.
+    get_persona_store().sync_db(session)
+    session.flush()
+    rows: list[dict[str, object]] = []
+    keyword_text = (keyword or "").strip()
+    normalized_keyword = keyword_text.casefold()
+
+    if memory_type in {"all", "fact"}:
+        fact_query = select(Memory).order_by(Memory.last_seen_at.desc())
+        if scope_type == "global":
+            fact_query = fact_query.where(Memory.scope_type == "global", Memory.user_id.is_(None))
+            if scope_id:
+                fact_query = fact_query.where(Memory.user_id == scope_id)
+        elif scope_type in {"user", "group"}:
+            fact_query = fact_query.where(Memory.scope_type == scope_type)
+            if scope_id:
+                fact_query = fact_query.where(Memory.user_id == scope_id)
+        elif scope_id:
+            fact_query = fact_query.where(Memory.user_id == scope_id)
+        if status != "all":
+            fact_query = fact_query.where(Memory.status == status)
+        if keyword_text:
+            fact_query = fact_query.where(
+                or_(
+                    Memory.fact_key.contains(keyword_text),
+                    Memory.content.contains(keyword_text),
+                )
+            )
+        for item in session.scalars(fact_query):
+            updated_at = item.last_seen_at.isoformat()
+            rows.append(
+                {
+                    "memory_type": "fact",
+                    "id": item.id,
+                    "scope_type": item.scope_type,
+                    "scope_id": item.user_id,
+                    "user_id": item.user_id,
+                    "fact_key": item.fact_key,
+                    "content": item.content,
+                    "status": item.status,
+                    "source_message_id": item.source_message_id,
+                    "created_at": item.created_at.isoformat(),
+                    "last_seen_at": updated_at,
+                    "updated_at": updated_at,
+                }
+            )
+
+    if memory_type in {"all", "relationship"} and status != "archived" and scope_type in {"all", "user"}:
+        owner_query = select(AdminIdentity.external_id).where(
+            AdminIdentity.platform == "qq",
+            AdminIdentity.enabled.is_(True),
+        )
+        owner_ids = set(session.scalars(owner_query))
+        if scope_id:
+            owner_ids &= {scope_id}
+        if owner_ids:
+            relationship_query = select(RelationshipProfile).where(
+                RelationshipProfile.scope_id.in_(owner_ids)
+            )
+            if persona_key:
+                relationship_query = relationship_query.where(
+                    RelationshipProfile.persona_key == persona_key
+                )
+            relationships = list(session.scalars(relationship_query))
+            persona_ids = {item.persona_id for item in relationships if item.persona_id}
+            persona_names = {
+                item.id: item.name
+                for item in session.scalars(select(Persona).where(Persona.id.in_(persona_ids)))
+            } if persona_ids else {}
+            for item in relationships:
+                try:
+                    boundaries: object = json.loads(item.boundaries or "{}")
+                except json.JSONDecodeError:
+                    boundaries = {}
+                persona_name = persona_names.get(item.persona_id or "", item.persona_key)
+                if normalized_keyword:
+                    searchable = " ".join(
+                        (
+                            item.persona_key,
+                            persona_name,
+                            item.nickname or "",
+                            item.shared_summary or "",
+                            json.dumps(boundaries, ensure_ascii=False),
+                        )
+                    ).casefold()
+                    if normalized_keyword not in searchable:
+                        continue
+                updated_at = item.updated_at.isoformat()
+                rows.append(
+                    {
+                        "memory_type": "relationship",
+                        "id": item.id,
+                        "scope_type": "user",
+                        "scope_id": item.scope_id,
+                        "user_id": item.scope_id,
+                        "persona_key": item.persona_key,
+                        "persona_id": item.persona_id,
+                        "persona_name": persona_name,
+                        "nickname": item.nickname,
+                        "shared_summary": item.shared_summary,
+                        "boundaries": boundaries,
+                        "version": item.version,
+                        "status": "active",
+                        "created_at": item.created_at.isoformat(),
+                        "last_seen_at": None,
+                        "updated_at": updated_at,
+                    }
+                )
+
+    rows.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+    return rows
+
+
 @router.post("/memories", dependencies=[Depends(require_loopback)])
 def create_memory(payload: MemoryCreate, session: Session = Depends(get_db)) -> dict[str, object]:
     if payload.scope_type not in {"global", "user"}:
@@ -1223,7 +1570,7 @@ def update_memory(
     profile = settings.default_embedding_profile
     provider = get_embedding_provider(profile)
     vector_store.upsert_documents(
-        safe_collection_name("memory", item.user_id or "global", profile),
+        memory_collection_name(item.scope_type, item.user_id or "global", profile),
         [item.id],
         [item.content],
         provider.embed_documents([item.content]),
@@ -1240,7 +1587,9 @@ def archive_memory(memory_id: str, session: Session = Depends(get_db)) -> dict[s
         raise HTTPException(404, "记忆不存在")
     item.status = "archived"
     profile = settings.default_embedding_profile
-    vector_store.delete_ids(safe_collection_name("memory", item.user_id or "global", profile), [item.id])
+    vector_store.delete_ids(
+        memory_collection_name(item.scope_type, item.user_id or "global", profile), [item.id]
+    )
     session.commit()
     return {"id": item.id, "status": item.status}
 
@@ -1251,7 +1600,9 @@ def delete_memory(memory_id: str, session: Session = Depends(get_db)) -> dict[st
     if item is None:
         raise HTTPException(404, "记忆不存在")
     profile = settings.default_embedding_profile
-    vector_store.delete_ids(safe_collection_name("memory", item.user_id or "global", profile), [item.id])
+    vector_store.delete_ids(
+        memory_collection_name(item.scope_type, item.user_id or "global", profile), [item.id]
+    )
     session.delete(item)
     session.commit()
     return {"deleted": True}
@@ -1266,7 +1617,7 @@ def restore_memory(memory_id: str, session: Session = Depends(get_db)) -> dict[s
     profile = settings.default_embedding_profile
     provider = get_embedding_provider(profile)
     vector_store.upsert_documents(
-        safe_collection_name("memory", item.user_id or "global", profile),
+        memory_collection_name(item.scope_type, item.user_id or "global", profile),
         [item.id],
         [item.content],
         provider.embed_documents([item.content]),
@@ -1596,60 +1947,138 @@ def _delete_extension(kind: str, name: str, session: Session) -> dict[str, bool]
 
 @router.get("/personas")
 def list_personas(session: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return [persona_dict(item) for item in session.scalars(select(Persona).order_by(Persona.name))]
+    persona_store = get_persona_store()
+    entries = persona_store.sync_db(session)
+    session.commit()
+    rows = list(session.scalars(select(Persona).order_by(Persona.name)))
+    result = [persona_dict(item, entries.get(item.id)) for item in rows]
+    indexed = {item.id for item in rows}
+    result.extend(persona_dict(entry) for persona_id, entry in entries.items() if persona_id not in indexed)
+    result.sort(key=lambda item: str(item.get("name", "")).casefold())
+    return result
 
 
 @router.post("/personas", dependencies=[Depends(require_loopback)])
 def create_persona(payload: PersonaCreate, session: Session = Depends(get_db)) -> dict[str, object]:
+    persona_store = get_persona_store()
+    entries = persona_store.sync_db(session)
+    normalized_name = payload.name.strip()
+    if any(item.name.casefold() == normalized_name.casefold() for item in entries.values()):
+        raise HTTPException(409, "人格名称已存在")
+    existing_ids = set(entries)
+    existing_ids.update(session.scalars(select(Persona.id)))
+    persona_id = persona_store.new_id(normalized_name, existing_ids)
     try:
-        validate_persona_prompt(payload.raw_prompt)
-    except ValueError as error:
+        envelope = persona_store.envelope_for(persona_id, normalized_name, payload.card)
+        previous = persona_store.write(envelope)
+    except (ValueError, OSError) as error:
         raise HTTPException(400, str(error)) from error
-    item = Persona(name=payload.name, raw_prompt=payload.raw_prompt)
+    item = Persona(
+        id=persona_id,
+        name=normalized_name,
+        raw_prompt="",
+        card_json="{}",
+        status="active",
+        card_version=envelope.card_version,
+    )
     session.add(item)
     try:
         session.commit()
     except IntegrityError as error:
         session.rollback()
+        persona_store.restore(persona_id, previous)
         raise HTTPException(409, "人格名称已存在") from error
+    except Exception:
+        session.rollback()
+        persona_store.restore(persona_id, previous)
+        raise
     session.refresh(item)
-    return persona_dict(item)
+    return persona_dict(item, persona_store.load(persona_id))
 
 
 @router.put("/personas/{persona_id}", dependencies=[Depends(require_loopback)])
 def update_persona(
     persona_id: str, payload: PersonaUpdate, session: Session = Depends(get_db)
 ) -> dict[str, object]:
+    persona_store = get_persona_store()
+    entries = persona_store.sync_db(session)
+    session.flush()
     item = session.get(Persona, persona_id)
-    if item is None:
+    document = entries.get(persona_id) or persona_store.load(persona_id)
+    if item is None and document is None:
         raise HTTPException(404, "人格不存在")
-    if payload.name is not None:
-        item.name = payload.name
-    if payload.raw_prompt is not None:
-        try:
-            validate_persona_prompt(payload.raw_prompt)
-        except ValueError as error:
-            raise HTTPException(400, str(error)) from error
-        item.raw_prompt = payload.raw_prompt
+    current_name = document.name if document is not None else item.name  # type: ignore[union-attr]
+    current_card = document.card if document is not None else None
+    if payload.card is None and current_card is None:
+        raise HTTPException(400, "无效人格必须同时提交完整结构化角色卡")
+    new_name = (payload.name or current_name).strip()
+    if not new_name:
+        raise HTTPException(400, "人格名称不能为空")
+    for other in entries.values():
+        if other.id != persona_id and other.name.casefold() == new_name.casefold():
+            raise HTTPException(409, "人格名称已存在")
+    if item is None:
+        item = Persona(id=persona_id, name=new_name, raw_prompt="", card_json="{}")
+        session.add(item)
+    current_version = document.card_version if document is not None else getattr(item, "card_version", 0) or 0
+    next_version = current_version + 1
+    try:
+        envelope = persona_store.envelope_for(
+            persona_id,
+            new_name,
+            payload.card or current_card,  # type: ignore[arg-type]
+            card_version=next_version,
+            sources=document.envelope.sources if document and document.envelope else [],
+            adaptation=document.envelope.adaptation if document and document.envelope else "",
+        )
+        previous = persona_store.write(envelope)
+    except (ValueError, OSError) as error:
+        raise HTTPException(400, str(error)) from error
+    item.name = new_name
+    item.raw_prompt = ""
+    item.card_json = "{}"
+    item.status = "active"
+    item.card_version = next_version
     try:
         session.commit()
     except IntegrityError as error:
         session.rollback()
+        persona_store.restore(persona_id, previous)
         raise HTTPException(409, "人格名称已存在") from error
+    except Exception:
+        session.rollback()
+        persona_store.restore(persona_id, previous)
+        raise
     session.refresh(item)
-    return persona_dict(item)
+    return persona_dict(item, persona_store.load(persona_id))
 
 
 @router.delete("/personas/{persona_id}", dependencies=[Depends(require_loopback)])
 def delete_persona(persona_id: str, session: Session = Depends(get_db)) -> dict[str, bool]:
+    persona_store = get_persona_store()
+    persona_store.sync_db(session)
+    session.flush()
     item = session.get(Persona, persona_id)
-    if item is None:
+    document = persona_store.load(persona_id)
+    if item is None and document is None:
         raise HTTPException(404, "人格不存在")
     session.query(Conversation).filter(Conversation.persona_id == persona_id).update(
         {Conversation.persona_id: None}, synchronize_session=False
     )
-    session.delete(item)
-    session.commit()
+    if item is not None:
+        session.delete(item)
+    previous: bytes | None = None
+    try:
+        previous = persona_store.delete(persona_id)
+        session.commit()
+    except ValueError as error:
+        session.rollback()
+        raise HTTPException(400, str(error)) from error
+    except Exception:
+        session.rollback()
+        if previous is not None:
+            persona_store.restore(persona_id, previous)
+        raise
     return {"deleted": True}
 
 
