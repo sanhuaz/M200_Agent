@@ -70,6 +70,11 @@ def verify_schema() -> None:
         "admin_identities",
         "artifacts",
         "app_settings",
+        "companion_preferences",
+        "relationship_profiles",
+        "emotion_assessments",
+        "response_feedback",
+        "safety_events",
     }
     missing = required.difference(inspect(engine).get_table_names())
     if missing:

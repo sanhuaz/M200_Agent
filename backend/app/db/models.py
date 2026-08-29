@@ -222,3 +222,95 @@ class ProcessedEvent(Base):
 
     message_id: Mapped[str] = mapped_column(String(160), primary_key=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class CompanionPreference(Base):
+    """Per QQ Owner companion settings.
+
+    The scope is intentionally explicit even though the current product is a
+    single-user application.  It prevents a future identity from inheriting
+    another user's companion controls by accident.
+    """
+
+    __tablename__ = "companion_preferences"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    scope_type: Mapped[str] = mapped_column(String(20), default="qq_user")
+    scope_id: Mapped[str] = mapped_column(String(120), index=True)
+    companion_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    support_mode: Mapped[str] = mapped_column(String(20), default="auto")
+    memory_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    safety_mode: Mapped[str] = mapped_column(String(20), default="standard")
+    analyzer_model_alias: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    boundaries: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("scope_type", "scope_id", name="uq_companion_preference_scope"),
+    )
+
+
+class RelationshipProfile(Base):
+    __tablename__ = "relationship_profiles"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    scope_id: Mapped[str] = mapped_column(String(120), index=True)
+    persona_key: Mapped[str] = mapped_column(String(80), default="default")
+    persona_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    nickname: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    shared_summary: Mapped[str] = mapped_column(Text, default="")
+    boundaries: Mapped[str] = mapped_column(Text, default="{}")
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("scope_id", "persona_key", name="uq_relationship_scope_persona"),
+    )
+
+
+class EmotionAssessment(Base):
+    __tablename__ = "emotion_assessments"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_message_id: Mapped[str] = mapped_column(String(36), index=True, unique=True)
+    scope_id: Mapped[str] = mapped_column(String(120), index=True)
+    candidate_emotions: Mapped[str] = mapped_column(Text, default="[]")
+    primary_emotion: Mapped[str] = mapped_column(String(40), default="neutral")
+    intensity: Mapped[str] = mapped_column(String(20), default="unknown")
+    support_need: Mapped[str] = mapped_column(String(20), default="unknown")
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    risk_level: Mapped[str] = mapped_column(String(20), default="low")
+    next_action: Mapped[str] = mapped_column(String(30), default="clarify")
+    model_alias: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    prompt_version: Mapped[str] = mapped_column(String(80), default="companion-analysis-v1")
+    classifier_version: Mapped[str] = mapped_column(String(80), default="emotion-classifier-v1")
+    schema_valid: Mapped[bool] = mapped_column(Boolean, default=True)
+    correction: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class ResponseFeedback(Base):
+    __tablename__ = "response_feedback"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    assistant_message_id: Mapped[str] = mapped_column(String(36), index=True, unique=True)
+    scope_id: Mapped[str] = mapped_column(String(120), index=True)
+    feedback: Mapped[str] = mapped_column(String(30))
+    correction: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class SafetyEvent(Base):
+    __tablename__ = "safety_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    message_id: Mapped[str] = mapped_column(String(36), index=True)
+    scope_id: Mapped[str] = mapped_column(String(120), index=True)
+    risk_level: Mapped[str] = mapped_column(String(20))
+    action: Mapped[str] = mapped_column(String(40))
+    detector_version: Mapped[str] = mapped_column(String(80), default="companion-safety-v1")
+    details: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
