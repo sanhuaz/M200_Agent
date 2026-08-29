@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "M200 Agent Companion P0 Evaluation Question",
+  "type": "object",
+  "required": [
+    "id",
+    "category",
+    "text",
+    "gold_primary_emotion",
+    "gold_emotions",
+    "gold_intensity",
+    "gold_support_need",
+    "gold_strategy",
+    "gold_risk_level",
+    "label_rationale"
+  ],
+  "properties": {
+    "id": {"type": "string", "minLength": 1},
+    "category": {"type": "string", "minLength": 1},
+    "text": {"type": "string", "minLength": 1},
+    "gold_primary_emotion": {
+      "type": "string",
+      "enum": ["joy", "excitement", "relief", "gratitude", "pride", "hope", "sadness", "loneliness", "anxiety", "fear", "anger", "frustration", "disappointment", "guilt", "shame", "helplessness", "exhaustion", "confusion", "calm", "neutral"]
+    },
+    "gold_emotions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/emotion"}
+    },
+    "gold_intensity": {"type": "string", "enum": ["low", "medium", "high", "unknown"]},
+    "gold_support_need": {"type": "string", "enum": ["listen", "comfort", "reflect", "advice", "celebrate", "space", "unknown"]},
+    "gold_strategy": {"type": "string", "enum": ["listen", "validate", "clarify", "comfort", "reflect", "advise", "celebrate", "safety_redirect"]},
+    "gold_risk_level": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
+    "label_rationale": {"type": "string", "minLength": 1},
+    "gold_version": {"type": "string", "minLength": 1},
+    "evidence_type": {"type": "string", "enum": ["direct", "context", "mixed"]}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"gold_emotions": {"contains": {"const": "neutral"}}}},
+      "then": {"properties": {"gold_emotions": {"maxItems": 1}}}
+    }
+  ],
+  "$defs": {
+    "emotion": {
+      "type": "string",
+      "enum": ["joy", "excitement", "relief", "gratitude", "pride", "hope", "sadness", "loneliness", "anxiety", "fear", "anger", "frustration", "disappointment", "guilt", "shame", "helplessness", "exhaustion", "confusion", "calm", "neutral"]
+    }
+  }
+}
