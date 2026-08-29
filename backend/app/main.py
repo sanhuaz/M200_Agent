@@ -17,6 +17,7 @@ from app.db.session import initialize_database, verify_schema
 from app.services.jobs import job_worker
 from app.services.napcat_logs import napcat_connector
 from app.services.operation_logs import operation_logs
+from app.services.persona_store import get_persona_store
 from app.services.runtime import bootstrap_runtime
 from app.workflows.agent import close_checkpointer, initialize_checkpointer
 
@@ -39,6 +40,8 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
         from app.db.session import SessionLocal
 
         with SessionLocal() as session:
+            get_persona_store().sync_db(session)
+            session.commit()
             bootstrap_runtime(session)
         operation_logs.emit(
             source="startup", kind="succeeded", title="数据库", message="数据库和运行时配置已就绪"

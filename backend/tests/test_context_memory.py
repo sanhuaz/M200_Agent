@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 from app.api.onebot import OneBotManager
 from app.core.config import ModelProfile
@@ -19,6 +20,8 @@ from app.services.context import (
 )
 from app.services.memories import MemoryService
 from app.services.models import model_registry
+from app.services.persona_store import get_persona_store
+from app.services.personas import PersonaCard
 from langchain_core.messages import AIMessage, HumanMessage
 
 
@@ -179,8 +182,17 @@ def test_incremental_compaction_updates_boundary(monkeypatch) -> None:
 
 def test_qq_new_archives_previous_conversation() -> None:
     external_id = "private:test-context-rotation"
+    persona_id = f"rotation-persona-{uuid4().hex[:16]}"
+    persona_store = get_persona_store()
+    persona_store.write(
+        persona_store.envelope_for(
+            persona_id,
+            "rotation-persona",
+            PersonaCard(identity={"role": "保持简洁"}),
+        )
+    )
     with SessionLocal.begin() as session:
-        persona = Persona(name="rotation-persona", raw_prompt="保持简洁")
+        persona = Persona(id=persona_id, name="rotation-persona", raw_prompt="", card_json="{}")
         session.add(persona)
         session.flush()
         session.add(
@@ -202,3 +214,10 @@ def test_qq_new_archives_previous_conversation() -> None:
             Conversation.title.like("%已归档%"),
         ).one()
         assert "已归档" in archived.title
+    with SessionLocal.begin() as session:
+        for conversation in session.query(Conversation).filter(
+            Conversation.external_id.in_([external_id, archived.external_id])
+        ).all():
+            session.delete(conversation)
+        session.delete(session.get(Persona, persona_id))
+    persona_store.delete(persona_id)

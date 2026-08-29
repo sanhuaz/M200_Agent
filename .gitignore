@@ -8,6 +8,8 @@ skills/*
 !skills/.gitkeep
 workspace/generated/
 workspace/evaluations/
+persona/*
+!persona/.gitkeep
 __pycache__/
 *.py[cod]
 .pytest_cache/

@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     tools_path: Path = PROJECT_ROOT / "tools"
     skills_path: Path = PROJECT_ROOT / "skills"
     workspace_path: Path = PROJECT_ROOT / "workspace"
+    persona_path: Path = PROJECT_ROOT / "persona"
 
     model_profiles_json: str = (
         '[{"alias":"default","model":"unconfigured","base_url":"https://api.example.com/v1",'
@@ -100,6 +101,7 @@ class Settings(BaseSettings):
         "tools_path",
         "skills_path",
         "workspace_path",
+        "persona_path",
         mode="after",
     )
     @classmethod
@@ -125,6 +127,7 @@ class Settings(BaseSettings):
             self.tools_path,
             self.skills_path,
             self.workspace_path,
+            self.persona_path,
         ):
             path.mkdir(parents=True, exist_ok=True)
 

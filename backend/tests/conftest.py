@@ -15,6 +15,7 @@ os.environ["DOWNLOAD_PATH"] = str(TEST_ROOT / "downloads")
 os.environ["TOOLS_PATH"] = str(TEST_ROOT / "tools")
 os.environ["SKILLS_PATH"] = str(TEST_ROOT / "skills")
 os.environ["WORKSPACE_PATH"] = str(TEST_ROOT / "workspace")
+os.environ["PERSONA_PATH"] = str(TEST_ROOT / "persona")
 os.environ["MODEL_PROFILES_JSON"] = json.dumps(
     [
         {
