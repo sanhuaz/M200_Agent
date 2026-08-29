@@ -376,7 +376,13 @@ def safety_precheck(text: str) -> SafetyAssessment:
 
 def detect_support_mode(text: str) -> SupportMode | None:
     patterns: tuple[tuple[SupportMode, tuple[str, ...]], ...] = (
-        ("listen", ("只想说说", "只想倾诉", "先听我说", "不用建议", "别给建议", "不需要建议")),
+        (
+            "listen",
+            (
+                "只想说说", "只想倾诉", "只听我说", "听我说就好", "先听我说", "你先听我说",
+                "不用建议", "别给建议", "不需要建议",
+            ),
+        ),
         ("reflect", ("帮我梳理", "一起分析", "帮我理一理", "想和你捋捋")),
         ("advice", ("给我建议", "帮我想办法", "怎么办", "怎么解决", "请你建议")),
     )
@@ -874,6 +880,58 @@ def output_safety_ok(text: str) -> bool:
     return not output_safety_violations(text)
 
 
+_ADVICE_MARKERS = re.compile(r"你可以|建议你|不妨|最好|应该|需要先|可以考虑|试着|不如")
+_BULLET_LINE = re.compile(r"^\s*(?:[-*•]|\d+[.)、]|[一二三四五六七八九十]+[、.)])\s+")
+_HEADING_LINE = re.compile(r"^\s{0,3}(?:#{1,6}\s+|【[^】]+】\s*$|[^。！？\n]{1,24}：\s*$)")
+
+
+def response_style_violations(
+    text: str, user_text: str, strategy: ResponseStrategy | None
+) -> list[str]:
+    """Detect only high-signal style drift; this deliberately avoids hard length caps."""
+
+    violations: list[str] = []
+    explicit_listen = detect_support_mode(user_text) == "listen"
+    if strategy != "advise" and explicit_listen and _ADVICE_MARKERS.search(text):
+        violations.append("advice_overreach")
+    lines = [line for line in text.splitlines() if line.strip()]
+    bullet_count = sum(bool(_BULLET_LINE.match(line)) for line in lines)
+    if strategy in {"listen", "validate", "clarify", "comfort", "reflect", "celebrate"} and (
+        bullet_count >= 3 or any(_HEADING_LINE.match(line) for line in lines)
+    ):
+        violations.append("structured_list")
+    return violations
+
+
+def rewrite_companion_response(
+    model_alias: str,
+    user_text: str,
+    candidate_response: str,
+    violation_codes: list[str],
+    persona_text: str,
+    strategy_guide: str,
+) -> str | None:
+    """Rewrite style drift once while keeping the selected character's voice."""
+
+    system_prompt = (
+        "你是 PersonalAgent 的陪伴回复修订器。只输出给用户看的自然中文正文，不要标题、JSON、"
+        "Markdown、规则说明或修订过程。保留当前角色的身份、关系和语气，只修正本轮交互方向的偏离。"
+        "若用户明确说只想倾诉或不用建议，不得给建议；普通倾听、确认感受、安慰和轻度梳理不要使用标题、"
+        "编号或项目符号。不要硬套固定句式，也不要为了变短而删除用户刚说的关键内容。"
+    )
+    human_prompt = (
+        f"角色卡（只用于保持角色表达）：\n{persona_text[-8_000:] or '无'}\n\n"
+        f"本轮策略攻略：\n{strategy_guide[-4_000:] or '无'}\n\n"
+        f"用户原文：\n{user_text[-8_000:]}\n\n"
+        f"候选回复：\n{candidate_response[-8_000:]}\n\n"
+        f"需要修正的内部代码：{', '.join(violation_codes) or 'style_drift'}"
+    )
+    rewritten = _invoke_text_model(model_alias, system_prompt, human_prompt)
+    if not rewritten or output_safety_violations(rewritten):
+        return None
+    return rewritten
+
+
 def _model_for_text_call(model_alias: str):
     profile = model_registry.profile(model_alias)
     model = model_registry.chat_model(model_alias)
@@ -977,6 +1035,8 @@ def preference_dict(item: CompanionPreference) -> dict[str, object]:
         "support_mode": item.support_mode,
         "memory_enabled": item.memory_enabled,
         "safety_mode": getattr(item, "safety_mode", "standard") or "standard",
+        "listening_enabled": getattr(item, "listening_enabled", False),
+        "listening_silence_seconds": getattr(item, "listening_silence_seconds", 30),
         "analyzer_model_alias": item.analyzer_model_alias,
         "boundaries": boundaries,
         "created_at": item.created_at.isoformat(),

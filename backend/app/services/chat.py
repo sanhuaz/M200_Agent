@@ -43,7 +43,9 @@ from app.services.companion import (
     output_safety_violations,
     relationship_context,
     resolve_analyzer_alias,
+    response_style_violations,
     rewrite_blocked_response,
+    rewrite_companion_response,
     safety_precheck,
     safety_redirect_text,
 )
@@ -68,6 +70,7 @@ from app.services.models import model_registry
 from app.services.operation_logs import operation_logs
 from app.services.personas import active_persona, persona_system_prompt
 from app.services.runtime import is_owner
+from app.services.strategy_guides import NORMAL_STRATEGIES, guide_for_strategy
 from app.workflows.agent import build_agent_graph, final_ai_message, skill_descriptions
 
 logger = logging.getLogger(__name__)
@@ -576,13 +579,28 @@ class ChatService:
             8_192,
         )
         companion_instruction = ""
+        strategy_guide = ""
+        strategy_version: int | None = None
         if companion_enabled and companion_analysis is not None:
+            if companion_analysis.next_action in NORMAL_STRATEGIES:
+                strategy_guide, strategy_version = guide_for_strategy(
+                    session, companion_analysis.next_action
+                )
+            candidate_text = "、".join(companion_analysis.candidate_emotions) or "尚不确定"
+            explicit_support = detect_support_mode(text) or "未明确"
             companion_instruction = (
                 "\n\n当前是 QQ 私聊情感陪伴流程。候选情绪仅是可纠正的推断，不要把它说成诊断。"
-                f"当前策略：{companion_analysis.next_action}；支持需要：{companion_analysis.support_need}。"
-                f"角色关系资料：{relationship_context(relationship)}。"
+                f"当前策略：{companion_analysis.next_action}；"
+                f"策略攻略版本：{strategy_version or '安全链路'}；"
+                f"用户显式支持意图（优先）：{explicit_support}；"
+                f"角色关系资料（仅使用已授权内容）：{relationship_context(relationship)}。"
+                f"支持需要：{companion_analysis.support_need}；主情绪：{companion_analysis.primary_emotion}；"
+                f"候选情绪（内部参考）：{candidate_text}；强度：{companion_analysis.intensity}；"
+                f"置信度：{companion_analysis.confidence:.2f}。"
+                "以上情绪字段只用于调整理解，不要逐项复述、贴标签或做心理诊断。"
+                "策略攻略只说明本轮互动方向，必须通过当前角色卡的身份、语气和节奏自然表达，不能覆盖人格。"
+                f"\n策略攻略：{strategy_guide or '安全流程不加载普通策略攻略。'}\n"
                 "先回应用户明确表达，不要为了展示能力主动调用工具。"
-                "如果策略是 clarify，先用一句简短问题确认用户希望倾听、梳理、安慰还是建议。"
             )
         system = (
             f"{SYSTEM_PROMPT}\n\n当前用户画像和长期记忆：\n{memory_text}"
@@ -715,8 +733,12 @@ class ChatService:
                 else json.dumps(final.content, ensure_ascii=False)
             )
             response_source = "agent"
-            if companion_enabled and companion_safety_mode == "standard":
-                violations = output_safety_violations(answer)
+            if companion_enabled:
+                violations = (
+                    output_safety_violations(answer)
+                    if companion_safety_mode == "standard"
+                    else []
+                )
                 if violations:
                     rewritten = await asyncio.to_thread(
                         rewrite_blocked_response,
@@ -752,6 +774,60 @@ class ChatService:
                         )
                     )
                     session.commit()
+                elif companion_analysis is not None:
+                    style_violations = response_style_violations(
+                        answer, text, companion_analysis.next_action
+                    )
+                    if style_violations:
+                        persona_for_rewrite = clip_text(
+                            persona_system_prompt(active_persona(session, conversation.persona_id)),
+                            8_192,
+                        )
+                        rewritten = await asyncio.to_thread(
+                            rewrite_companion_response,
+                            conversation.model_alias,
+                            text,
+                            answer,
+                            style_violations,
+                            persona_for_rewrite,
+                            strategy_guide,
+                        )
+                        if rewritten:
+                            answer = rewritten
+                            response_source = "style_rewritten"
+                            operation_logs.emit(
+                                source="companion",
+                                kind="style_rewrite",
+                                title="陪伴回复风格修订",
+                                message="已修订策略越权或明显列表化回复",
+                                parent_operation_id=operation_id,
+                                trace_id=user_message.id,
+                                details={"violation_codes": style_violations},
+                            )
+                        elif "advice_overreach" in style_violations:
+                            answer = "我先不急着给建议。你愿意的话，就按自己的节奏说，我在听。"
+                            response_source = "style_template"
+                            operation_logs.emit(
+                                source="companion",
+                                level="warn",
+                                kind="style_fallback",
+                                title="陪伴回复风格降级",
+                                message="建议越权修订失败，使用简短倾听回复",
+                                parent_operation_id=operation_id,
+                                trace_id=user_message.id,
+                                details={"violation_codes": style_violations},
+                            )
+                        else:
+                            operation_logs.emit(
+                                source="companion",
+                                level="warn",
+                                kind="style_violation",
+                                title="陪伴回复风格违规保留",
+                                message="格式修订失败，保留原始回复",
+                                parent_operation_id=operation_id,
+                                trace_id=user_message.id,
+                                details={"violation_codes": style_violations},
+                            )
             if (not profile.streaming or companion_enabled) and answer:
                 yield {"event": "token", "data": {"text": answer}}
             elif not emitted and answer:

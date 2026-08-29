@@ -75,6 +75,9 @@ def verify_schema() -> None:
         "emotion_assessments",
         "response_feedback",
         "safety_events",
+        "strategy_guides",
+        "strategy_guide_revisions",
+        "companion_listening_buffers",
     }
     missing = required.difference(inspect(engine).get_table_names())
     if missing:

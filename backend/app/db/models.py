@@ -179,6 +179,9 @@ class Persona(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     name: Mapped[str] = mapped_column(String(120), unique=True)
     raw_prompt: Mapped[str] = mapped_column(Text, default="")
+    card_json: Mapped[str] = mapped_column(Text, default="{}")
+    status: Mapped[str] = mapped_column(String(30), default="active")
+    card_version: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
@@ -241,6 +244,8 @@ class CompanionPreference(Base):
     support_mode: Mapped[str] = mapped_column(String(20), default="auto")
     memory_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     safety_mode: Mapped[str] = mapped_column(String(20), default="standard")
+    listening_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    listening_silence_seconds: Mapped[int] = mapped_column(Integer, default=30)
     analyzer_model_alias: Mapped[str | None] = mapped_column(String(80), nullable=True)
     boundaries: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
@@ -249,6 +254,43 @@ class CompanionPreference(Base):
     __table_args__ = (
         UniqueConstraint("scope_type", "scope_id", name="uq_companion_preference_scope"),
     )
+
+
+class StrategyGuide(Base):
+    __tablename__ = "strategy_guides"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    strategy: Mapped[str] = mapped_column(String(30), unique=True, index=True)
+    prompt_text: Mapped[str] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class StrategyGuideRevision(Base):
+    __tablename__ = "strategy_guide_revisions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    strategy: Mapped[str] = mapped_column(String(30), index=True)
+    prompt_text: Mapped[str] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer)
+    source: Mapped[str] = mapped_column(String(30), default="edit")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    __table_args__ = (UniqueConstraint("strategy", "version", name="uq_strategy_guide_revision"),)
+
+
+class CompanionListeningBuffer(Base):
+    __tablename__ = "companion_listening_buffers"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    scope_id: Mapped[str] = mapped_column(String(120), index=True)
+    fragments: Mapped[str] = mapped_column(Text, default="[]")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class RelationshipProfile(Base):

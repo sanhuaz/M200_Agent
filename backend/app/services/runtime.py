@@ -10,6 +10,7 @@ from app.db.models import AdminIdentity, AppSetting
 from app.db.session import SessionLocal
 from app.services.extensions import ensure_builtin_packages
 from app.services.model_profiles import bootstrap_model_profiles
+from app.services.strategy_guides import ensure_strategy_guides
 
 OWNER_BOOTSTRAP_KEY = "owner_qq_ids_bootstrapped"
 
@@ -22,6 +23,7 @@ def bootstrap_runtime(session: Session) -> None:
 
     ensure_builtin_packages(session)
     bootstrap_model_profiles(session)
+    ensure_strategy_guides(session)
     marker = session.get(AppSetting, OWNER_BOOTSTRAP_KEY)
     if marker is not None:
         return
