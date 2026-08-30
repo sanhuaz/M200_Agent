@@ -4,7 +4,7 @@ import sys
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
-from app.api import routes
+from app.api import routes, task_routes
 from app.db.models import Document, KnowledgeBase
 from app.db.session import SessionLocal
 from app.main import app
@@ -280,7 +280,7 @@ def test_manga_download_api_returns_task_without_token(monkeypatch) -> None:
         created_at=now,
         updated_at=now,
     )
-    monkeypatch.setattr(routes, "create_manga_download_job", lambda *_args: fake_job)
+    monkeypatch.setattr(task_routes, "create_manga_download_job", lambda *_args: fake_job)
 
     with TestClient(app) as client:
         response = client.post(
