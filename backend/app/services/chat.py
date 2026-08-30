@@ -3,14 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import threading
 import time
 from collections.abc import AsyncGenerator
 from typing import cast
 
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, ToolMessage
 from langgraph.graph import MessagesState
-from sqlalchemy import desc, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.models import (
@@ -18,12 +17,19 @@ from app.db.models import (
     Conversation,
     EmotionAssessment,
     KnowledgeBase,
-    Memory,
     Message,
     SafetyEvent,
     ToolRun,
 )
-from app.db.session import SessionLocal
+from app.services.chat_post_turn import PostTurnService
+from app.services.chat_support import (
+    has_immediate_search_results as _has_immediate_search_results,
+)
+from app.services.chat_support import manga_system_instruction as _manga_system_instruction
+from app.services.chat_support import normalize_tool_result
+from app.services.chat_support import (
+    recall_memories_in_worker_session as _recall_memories_in_worker_session,
+)
 from app.services.companion import (
     EMOTION_LABEL_ZH,
     SAFETY_RESPONSE_PROMPT_VERSION,
@@ -36,7 +42,6 @@ from app.services.companion import (
     SupportMode,
     analyze_message,
     detect_support_mode,
-    extract_relationship,
     generate_safety_response,
     get_or_create_preference,
     get_relationship,
@@ -50,22 +55,15 @@ from app.services.companion import (
     safety_redirect_text,
 )
 from app.services.context import (
-    SUMMARY_INPUT_TOKENS,
-    SUMMARY_KEEP_MESSAGES,
     SUMMARY_MAX_TOKENS,
     ContextOverflowError,
     build_context_messages,
-    choose_summary_batch,
     clip_text,
     load_pending_messages,
-    pending_message_count,
-    pending_prefix,
-    should_compact,
 )
 from app.services.extensions import list_packages
 from app.services.jobs import create_companion_analysis_retry_job
 from app.services.manga_intent import MangaIntent, detect_manga_intent
-from app.services.memories import MemoryService
 from app.services.models import model_registry
 from app.services.operation_logs import operation_logs
 from app.services.personas import active_persona, persona_system_prompt
@@ -82,140 +80,9 @@ QQ 私聊发起的漫画任务成功后，系统会自动把文件发送给 Owne
 不要声称工具成功，除非工具结果明确表示成功。"""
 
 
-def _recall_memories_in_worker_session(
-    user_id: str,
-    query: str,
-    limit: int,
-    *,
-    scope_type: str,
-    scope_id: str | None,
-) -> list[Memory]:
-    """在线程内部创建 Session，避免跨线程复用请求 Session。"""
-
-    with SessionLocal() as worker_session:
-        return MemoryService(worker_session).recall(
-            user_id,
-            query,
-            limit,
-            scope_type=scope_type,
-            scope_id=scope_id,
-        )
-
-
-def normalize_tool_result(content: object) -> dict[str, object]:
-    """兼容 ToolMessage 的对象、数组、JSON 字符串和非 JSON 内容。"""
-
-    metadata_keys = {"kind", "data", "pending_confirmation", "artifact_ids"}
-    if isinstance(content, dict):
-        value: object = content if metadata_keys.intersection(content) else {"data": content}
-    elif isinstance(content, list):
-        value = {"data": {"items": content}}
-    elif isinstance(content, str):
-        try:
-            decoded = json.loads(content)
-        except json.JSONDecodeError:
-            decoded = {"raw": content}
-        if isinstance(decoded, dict):
-            value = (
-                decoded
-                if metadata_keys.intersection(decoded)
-                else {"data": decoded}
-            )
-        elif isinstance(decoded, list):
-            value = {"data": {"items": decoded}}
-        else:
-            value = {"data": {"value": decoded}}
-    else:
-        value = {"data": {"value": content}}
-    result: dict[str, object] = dict(value) if isinstance(value, dict) else {"data": value}
-    result.setdefault("kind", "tool_result")
-    result.setdefault("data", {})
-    result.setdefault("pending_confirmation", False)
-    result.setdefault("artifact_ids", [])
-    return result
-
-
-def _has_immediate_search_results(
-    session: Session,
-    conversation: Conversation,
-    current_message_id: str,
-) -> bool:
-    """只认可上一轮自然语言聊天产生的非空漫画搜索结果。"""
-
-    current_message = session.get(Message, current_message_id)
-    if current_message is None:
-        return False
-    prior_user = session.scalar(
-        select(Message)
-        .where(
-            Message.conversation_id == conversation.id,
-            Message.role == "user",
-            Message.id != current_message_id,
-            Message.created_at < current_message.created_at,
-        )
-        .order_by(desc(Message.created_at))
-        .limit(1)
-    )
-    if prior_user is None:
-        return False
-    prior_assistant = session.scalar(
-        select(Message)
-        .where(
-            Message.conversation_id == conversation.id,
-            Message.role == "assistant",
-            Message.created_at >= prior_user.created_at,
-            Message.created_at < current_message.created_at,
-        )
-        .order_by(desc(Message.created_at))
-        .limit(1)
-    )
-    if prior_assistant is None:
-        return False
-    runs = session.scalars(
-        select(ToolRun)
-        .where(
-            ToolRun.conversation_id == conversation.id,
-            ToolRun.tool_name == "search_manga",
-            ToolRun.status == "succeeded",
-            ToolRun.created_at >= prior_user.created_at,
-            ToolRun.created_at <= prior_assistant.created_at,
-        )
-        .order_by(desc(ToolRun.created_at))
-    )
-    for run in runs:
-        payload = normalize_tool_result(run.result)
-        data = payload.get("data")
-        if isinstance(data, dict) and isinstance(data.get("results"), list) and data["results"]:
-            return True
-    return False
-
-
-def _manga_system_instruction(intent: MangaIntent) -> str:
-    if not intent.actions:
-        return (
-            "\n\n漫画工具默认关闭。本轮没有通过明确漫画意图门禁时，不得调用任何漫画工具；"
-            "不要把普通词语、话题或能力询问当成漫画搜索。"
-        )
-    action_names = {
-        "search": "搜索",
-        "download": "下载",
-        "delete": "删除",
-    }
-    allowed = "、".join(action_names[action] for action in sorted(intent.actions))
-    return (
-        f"\n\n本轮程序已确认用户明确请求漫画{allowed}，只能在完成参数提取后调用对应漫画工具；"
-        "不得额外调用未授权的漫画动作。"
-    )
-
-
 class ChatService:
     def __init__(self) -> None:
-        self._summary_locks: dict[str, threading.Lock] = {}
-        self._summary_locks_guard = threading.Lock()
-
-    def _summary_lock(self, conversation_id: str) -> threading.Lock:
-        with self._summary_locks_guard:
-            return self._summary_locks.setdefault(conversation_id, threading.Lock())
+        self._post_turn_service = PostTurnService()
 
     @staticmethod
     def _companion_scope(
@@ -954,66 +821,17 @@ class ChatService:
         memory_enabled: bool = False,
         persona_id: str | None = None,
     ) -> None:
-        with SessionLocal() as session:
-            conversation = session.get(Conversation, conversation_id)
-            if conversation is None:
-                return
-            context_rows = load_pending_messages(session, conversation, limit=8)
-            turn_context = "\n".join(f"{item.role}: {item.content}" for item in context_rows[:-1])
-            memory_scope_type = "group" if is_group else "user"
-            memory_scope_id = conversation.external_id if is_group else sender_id
-            memory_operation: str | None = None
-            try:
-                if companion_enabled and not memory_enabled:
-                    with self._summary_lock(conversation_id):
-                        self._compact_conversation(session, conversation, model_alias)
-                    return
-                memory_operation = operation_logs.start_operation(
-                    source="memory",
-                    title="自动提取记忆",
-                    message="开始从对话提取长期记忆",
-                    details={"conversation_id": conversation_id, "message_id": message_id},
-                )
-                if companion_enabled:
-                    extract_relationship(
-                        session,
-                        sender_id,
-                        persona_id,
-                        user_text,
-                        turn_context,
-                        model_alias,
-                    )
-                else:
-                    MemoryService(session).extract_from_turn(
-                        sender_id,
-                        user_text,
-                        message_id,
-                        model_alias,
-                        scope_type=memory_scope_type,
-                        scope_id=memory_scope_id,
-                        context=turn_context,
-                    )
-                operation_logs.finish_operation(
-                    memory_operation,
-                    source="memory",
-                    title="自动提取记忆完成",
-                    message="长期记忆提取已完成",
-                    details={"conversation_id": conversation_id},
-                )
-            except Exception as error:
-                session.rollback()
-                logger.warning("自动记忆提取失败: %s", error)
-                if memory_operation is not None:
-                    operation_logs.finish_operation(
-                        memory_operation,
-                        source="memory",
-                        title="自动提取记忆失败",
-                        message="长期记忆提取失败",
-                        success=False,
-                        details={"error": f"{type(error).__name__}: {error}"},
-                    )
-            with self._summary_lock(conversation_id):
-                self._compact_conversation(session, conversation, model_alias)
+        self._post_turn_service.run(
+            conversation_id,
+            sender_id,
+            user_text,
+            message_id,
+            model_alias,
+            is_group,
+            companion_enabled,
+            memory_enabled,
+            persona_id,
+        )
 
     def _compact_conversation(
         self,
@@ -1021,80 +839,7 @@ class ChatService:
         conversation: Conversation,
         model_alias: str,
     ) -> None:
-        pending = pending_prefix(session, conversation)
-        if not should_compact(session, conversation, pending=pending):
-            return
-        pending_count = pending_message_count(session, conversation)
-        if pending_count <= SUMMARY_KEEP_MESSAGES:
-            return
-        candidate_rows = pending[: min(len(pending), pending_count - SUMMARY_KEEP_MESSAGES)]
-        existing_summary = clip_text(conversation.summary or "", SUMMARY_MAX_TOKENS)
-        batch = choose_summary_batch(
-            candidate_rows,
-            existing_summary,
-            max_tokens=SUMMARY_INPUT_TOKENS,
-        )
-        if not batch:
-            return
-        new_material = "\n".join(f"{item.role}: {item.content}" for item in batch)
-        summary_source = (
-            f"已有摘要：\n{existing_summary or '无'}\n\n新增历史：\n{new_material}"
-        )
-        summary_operation: str | None = None
-        try:
-            summary_operation = operation_logs.start_operation(
-                source="memory",
-                title="会话摘要压缩",
-                message="开始压缩历史摘要",
-                details={"conversation_id": conversation.id},
-            )
-            model = model_registry.chat_model(model_alias).bind(max_tokens=SUMMARY_MAX_TOKENS)
-            response = model.invoke(
-                [
-                    (
-                        "system",
-                        (
-                            "将已有摘要和新增历史合并为准确、简短的中文摘要。"
-                            "保留用户明确事实、未完成任务和重要决定，不添加新事实。"
-                        ),
-                    ),
-                    ("human", summary_source),
-                ]
-            )
-            if isinstance(response.content, str) and response.content.strip():
-                conversation.summary = clip_text(response.content.strip(), SUMMARY_MAX_TOKENS)
-                conversation.summary_up_to_message_id = batch[-1].id
-                session.commit()
-                operation_logs.finish_operation(
-                    summary_operation,
-                    source="memory",
-                    title="会话摘要完成",
-                    message="历史摘要已更新",
-                    details={
-                        "conversation_id": conversation.id,
-                        "message_id": conversation.summary_up_to_message_id,
-                    },
-                )
-            else:
-                operation_logs.finish_operation(
-                    summary_operation,
-                    source="memory",
-                    title="会话摘要跳过",
-                    message="模型未返回有效摘要",
-                    details={"conversation_id": conversation.id},
-                )
-        except Exception as error:
-            session.rollback()
-            logger.warning("增量历史摘要失败: %s", error)
-            if summary_operation is not None:
-                operation_logs.finish_operation(
-                    summary_operation,
-                    source="memory",
-                    title="会话摘要失败",
-                    message="历史摘要更新失败",
-                    success=False,
-                    details={"error": f"{type(error).__name__}: {error}"},
-                )
+        self._post_turn_service.compact(session, conversation, model_alias)
 
 
 chat_service = ChatService()

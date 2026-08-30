@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 
-from app.services import chat, jobs
+from app.services import chat_support, jobs
 
 
 def test_memory_recall_creates_worker_session(monkeypatch) -> None:
@@ -17,10 +17,10 @@ def test_memory_recall_creates_worker_session(monkeypatch) -> None:
             seen["arguments"] = (user_id, query, limit, scope_type, scope_id)
             return []
 
-    monkeypatch.setattr(chat, "SessionLocal", lambda: nullcontext(worker_session))
-    monkeypatch.setattr(chat, "MemoryService", FakeMemoryService)
+    monkeypatch.setattr(chat_support, "SessionLocal", lambda: nullcontext(worker_session))
+    monkeypatch.setattr(chat_support, "MemoryService", FakeMemoryService)
 
-    result = chat._recall_memories_in_worker_session(
+    result = chat_support.recall_memories_in_worker_session(
         "owner",
         "query",
         5,
