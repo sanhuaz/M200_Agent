@@ -231,6 +231,7 @@ const strategyGuideDraft = ref('')
 const strategyGuideRevisions = ref<StrategyRevisionRow[]>([])
 const editingStrategy = ref('listen')
 const strategyGuideSaving = ref(false)
+const strategyGuidesLoading = ref(false)
 const adminQq = ref('')
 const adminName = ref('')
 const githubUrl = ref('')
@@ -245,6 +246,9 @@ const memoryRelationshipDraft = ref<RelationshipRow | null>(null)
 const memoryRelationshipBoundaryText = ref('{}')
 const memoryRelationshipDialog = ref(false)
 const memoryRelationshipSaving = ref(false)
+const messagesLoading = ref(false)
+const documentsLoading = ref(false)
+const strategyGuideRevisionsLoading = ref(false)
 const sidebarCollapsed = ref(false)
 const mobileSidebarOpen = ref(false)
 const isNarrow = ref(window.innerWidth < 1024)
@@ -269,6 +273,12 @@ const qqReplySettings = ref<QQReplySettings>({ chunked_output_enabled: true, chu
 const persistedQQReplySettings = ref<QQReplySettings>({ ...qqReplySettings.value })
 const qqReplySettingsSaving = ref(false)
 let logEventSource: EventSource | null = null
+let messagesRequestSeq = 0
+let documentsRequestSeq = 0
+let memoryCenterRequestSeq = 0
+let companionRequestSeq = 0
+let strategyGuidesRequestSeq = 0
+let strategyRevisionRequestSeq = 0
 const theme = ref<ThemeName>('light')
 let followsSystemTheme = false
 let systemThemeQuery: MediaQueryList | undefined
@@ -817,10 +827,36 @@ async function createConversation() {
 }
 
 async function loadMessages(force = true) {
-  if (!currentConversationId.value) return
-  messages.value = await api(`/conversations/${currentConversationId.value}/messages`)
-  if (force) messagesAutoFollow.value = true
-  await scrollMessagesToBottom(force)
+  const conversationId = currentConversationId.value
+  const requestId = ++messagesRequestSeq
+  if (!conversationId) {
+    messages.value = []
+    messagesLoading.value = false
+    return
+  }
+  messages.value = []
+  messagesLoading.value = true
+  try {
+    const data = await api<Message[]>(`/conversations/${conversationId}/messages`)
+    if (requestId !== messagesRequestSeq || currentConversationId.value !== conversationId) return
+    messages.value = data
+    if (force) messagesAutoFollow.value = true
+    await scrollMessagesToBottom(force)
+  } catch (error) {
+    if (requestId === messagesRequestSeq && currentConversationId.value === conversationId) {
+      ElMessage.error(`消息加载失败：${(error as Error).message}`)
+    }
+  } finally {
+    if (requestId === messagesRequestSeq) messagesLoading.value = false
+  }
+}
+
+async function selectConversation(conversationId: string) {
+  if (currentConversationId.value === conversationId && messagesLoading.value) return
+  currentConversationId.value = conversationId
+  messages.value = []
+  messagesAutoFollow.value = true
+  await loadMessages()
 }
 
 async function switchModel(alias: string) {
@@ -905,12 +941,24 @@ async function upload() {
   ElMessage.success('文件已进入索引队列')
 }
 
-async function loadDocuments() {
+async function loadDocuments(clearPrevious = true) {
   const knowledgeBaseId = selectedKb.value
-  const data = await api<DocumentRow[]>(`/documents${knowledgeBaseId ? `?knowledge_base_id=${knowledgeBaseId}` : ''}`)
-  if (knowledgeBaseId !== selectedKb.value) return
-  documents.value = data
-  scheduleDocumentRefresh()
+  const requestId = ++documentsRequestSeq
+  stopDocumentRefresh()
+  if (clearPrevious) documents.value = []
+  documentsLoading.value = true
+  try {
+    const data = await api<DocumentRow[]>(`/documents${knowledgeBaseId ? `?knowledge_base_id=${knowledgeBaseId}` : ''}`)
+    if (requestId !== documentsRequestSeq || knowledgeBaseId !== selectedKb.value) return
+    documents.value = data
+    scheduleDocumentRefresh()
+  } catch (error) {
+    if (requestId === documentsRequestSeq && knowledgeBaseId === selectedKb.value) {
+      ElMessage.error(`文档加载失败：${(error as Error).message}`)
+    }
+  } finally {
+    if (requestId === documentsRequestSeq) documentsLoading.value = false
+  }
 }
 
 function stopDocumentRefresh() {
@@ -927,7 +975,7 @@ function scheduleDocumentRefresh() {
   documentRefreshTimer = window.setTimeout(async () => {
     documentRefreshTimer = undefined
     try {
-      await loadDocuments()
+      await loadDocuments(false)
     } catch (error) {
       ElMessage.error(`索引状态刷新失败：${(error as Error).message}`)
     }
@@ -979,8 +1027,15 @@ async function loadManagement() {
 }
 
 async function loadStrategyGuides() {
+  const requestId = ++strategyGuidesRequestSeq
+  strategyGuides.value = []
+  strategyGuideRevisions.value = []
+  strategyGuideDraft.value = ''
+  strategyGuidesLoading.value = true
   try {
-    strategyGuides.value = await api<StrategyGuideRow[]>('/companion/strategy-guides')
+    const data = await api<StrategyGuideRow[]>('/companion/strategy-guides')
+    if (requestId !== strategyGuidesRequestSeq) return
+    strategyGuides.value = data
     const current = strategyGuides.value.find((item) => item.strategy === editingStrategy.value)
       || strategyGuides.value[0]
     if (current) {
@@ -989,18 +1044,33 @@ async function loadStrategyGuides() {
       await loadStrategyRevisions()
     }
   } catch (error) {
-    ElMessage.error(`策略攻略加载失败：${(error as Error).message}`)
+    if (requestId === strategyGuidesRequestSeq) ElMessage.error(`策略攻略加载失败：${(error as Error).message}`)
+  } finally {
+    if (requestId === strategyGuidesRequestSeq) strategyGuidesLoading.value = false
   }
 }
 
 async function loadStrategyRevisions() {
-  if (!editingStrategy.value) return
+  const strategy = editingStrategy.value
+  const requestId = ++strategyRevisionRequestSeq
+  strategyGuideRevisions.value = []
+  if (!strategy) {
+    strategyGuideRevisionsLoading.value = false
+    return
+  }
+  strategyGuideRevisionsLoading.value = true
   try {
-    strategyGuideRevisions.value = await api<StrategyRevisionRow[]>(
-      `/companion/strategy-guides/${encodeURIComponent(editingStrategy.value)}/revisions`,
+    const data = await api<StrategyRevisionRow[]>(
+      `/companion/strategy-guides/${encodeURIComponent(strategy)}/revisions`,
     )
+    if (requestId !== strategyRevisionRequestSeq || editingStrategy.value !== strategy) return
+    strategyGuideRevisions.value = data
   } catch (error) {
-    ElMessage.error(`策略版本加载失败：${(error as Error).message}`)
+    if (requestId === strategyRevisionRequestSeq && editingStrategy.value === strategy) {
+      ElMessage.error(`策略版本加载失败：${(error as Error).message}`)
+    }
+  } finally {
+    if (requestId === strategyRevisionRequestSeq) strategyGuideRevisionsLoading.value = false
   }
 }
 
@@ -1083,8 +1153,8 @@ async function resetStrategyGuide() {
   }
 }
 
-function companionRequestId() {
-  return companionOwnerId.value ? `?qq_user_id=${encodeURIComponent(companionOwnerId.value)}` : ''
+function companionRequestId(ownerId = companionOwnerId.value) {
+  return ownerId ? `?qq_user_id=${encodeURIComponent(ownerId)}` : ''
 }
 
 function initializeCompanionCorrections(items: EmotionAssessmentRow[]) {
@@ -1101,10 +1171,31 @@ function initializeCompanionCorrections(items: EmotionAssessmentRow[]) {
 }
 
 async function loadCompanionData() {
-  if (!companionOwnerId.value) return
+  const ownerId = companionOwnerId.value
+  const requestId = ++companionRequestSeq
+  if (!ownerId) {
+    companionPreferences.value = null
+    companionRelationships.value = []
+    companionAssessments.value = []
+    companionFeedback.value = []
+    companionSafetyEvents.value = []
+    companionCorrectionDrafts.value = {}
+    companionBoundaryText.value = '{}'
+    companionListeningBuffer.value = { qq_user_id: '', listening_enabled: false, listening_silence_seconds: 30, fragment_count: 0 }
+    companionLoading.value = false
+    return
+  }
+  companionPreferences.value = null
+  companionRelationships.value = []
+  companionAssessments.value = []
+  companionFeedback.value = []
+  companionSafetyEvents.value = []
+  companionCorrectionDrafts.value = {}
+  companionBoundaryText.value = '{}'
+  companionListeningBuffer.value = { qq_user_id: ownerId, listening_enabled: false, listening_silence_seconds: 30, fragment_count: 0 }
   companionLoading.value = true
   try {
-    const scope = companionRequestId()
+    const scope = companionRequestId(ownerId)
     const [preference, relationships, assessments, exported, listeningBuffer] = await Promise.all([
       api<CompanionPreferenceRow>(`/companion/preferences${scope}`),
       api<RelationshipRow[]>(`/companion/relationships${scope}`),
@@ -1112,6 +1203,7 @@ async function loadCompanionData() {
       api<{ feedback: CompanionFeedbackRow[]; safety_events: CompanionSafetyRow[] }>(`/companion/privacy/export${scope}`),
       api<ListeningBufferRow>(`/companion/listening-buffer${scope}`),
     ])
+    if (requestId !== companionRequestSeq || companionOwnerId.value !== ownerId) return
     companionPreferences.value = preference
     companionSavedSafetyMode.value = preference.safety_mode || 'standard'
     companionBoundaryText.value = JSON.stringify(preference.boundaries || {}, null, 2)
@@ -1122,9 +1214,11 @@ async function loadCompanionData() {
     companionSafetyEvents.value = exported.safety_events || []
     companionListeningBuffer.value = listeningBuffer
   } catch (error) {
-    ElMessage.error(`陪伴数据加载失败：${(error as Error).message}`)
+    if (requestId === companionRequestSeq && companionOwnerId.value === ownerId) {
+      ElMessage.error(`陪伴数据加载失败：${(error as Error).message}`)
+    }
   } finally {
-    companionLoading.value = false
+    if (requestId === companionRequestSeq) companionLoading.value = false
   }
 }
 
@@ -1811,8 +1905,8 @@ onUnmounted(() => {
                 <el-select :model-value="currentConversation?.persona_id || ''" placeholder="选择人格" @change="switchPersona"><el-option label="关闭人格" value="" /><el-option v-for="item in personas" :key="item.id" :label="`${item.name}${item.status === 'active' ? '' : '（文件无效）'}`" :value="item.id" :disabled="item.status !== 'active'" /></el-select>
               </div>
             </div>
-            <div ref="messagesContainer" class="messages" @scroll="handleMessagesScroll">
-              <div v-if="!messages.length" class="chat-empty"><span class="empty-orb"><el-icon><ChatDotRound /></el-icon></span><h3>开始一段新对话</h3><p>选择模型和人格，然后输入你的问题。</p></div>
+            <div ref="messagesContainer" class="messages" v-loading="messagesLoading" @scroll="handleMessagesScroll">
+              <div v-if="!messages.length && !messagesLoading" class="chat-empty"><span class="empty-orb"><el-icon><ChatDotRound /></el-icon></span><h3>开始一段新对话</h3><p>选择模型和人格，然后输入你的问题。</p></div>
               <article v-for="(message, index) in messages" :key="message.id || index" :class="['message', message.role]"><span>{{ message.role === 'user' ? '你' : 'M200 Agent' }}</span><p>{{ message.content }}</p></article>
             </div>
             <div class="composer"><el-input v-model="input" type="textarea" :rows="3" resize="none" placeholder="输入消息，Ctrl+Enter 发送" @keydown.ctrl.enter.prevent="send" /><el-button type="primary" :loading="sending" @click="send">发送</el-button></div>
@@ -1825,7 +1919,7 @@ onUnmounted(() => {
             <p class="hint">请先在“管理员”中添加并启用 QQ Owner；陪伴设置不接受任意输入的 QQ 号。</p>
             <el-button type="primary" @click="changeTab('admin')">前往管理员</el-button>
           </section>
-          <div v-else class="two-column">
+          <div v-else class="two-column" v-loading="companionLoading">
             <section class="panel stack">
               <div class="panel-heading"><div><span class="section-kicker">身份范围</span><h2>QQ Owner 陪伴</h2></div><div class="form-row"><el-tag :type="companionPreferences?.companion_enabled ? 'success' : 'warning'">{{ companionPreferences?.companion_enabled ? '已启用' : '已暂停' }}</el-tag><el-tag v-if="companionPreferences?.safety_mode === 'unfiltered'" type="danger">无过滤模式</el-tag></div></div>
               <label class="field-control"><span>选择已启用 QQ Owner</span><el-select v-model="companionOwnerId" @change="loadCompanionData"><el-option v-for="item in companionOwners" :key="item.external_id" :label="`${item.display_name || 'QQ Owner'} · ${item.external_id}`" :value="item.external_id" /></el-select></label>
@@ -1856,12 +1950,12 @@ onUnmounted(() => {
             <section class="panel stack">
               <div class="panel-heading"><div><span class="section-kicker">方向性提示</span><h2>普通策略攻略</h2></div><span class="count-badge">{{ strategyGuides.length }}</span></div>
               <p class="hint">攻略只告诉模型本轮该把注意力放在哪里，不规定固定开场、句式或字数；角色卡的身份和语气始终优先。安全转向攻略不可编辑。</p>
-              <div class="card-list strategy-guide-list">
+              <div class="card-list strategy-guide-list" v-loading="strategyGuidesLoading">
                 <button v-for="item in strategyGuides" :key="item.strategy" class="result strategy-guide-row" :class="{ active: item.strategy === editingStrategy }" @click="selectStrategyGuide(item.strategy)">
                   <span><strong>{{ strategyGuideLabels[item.strategy] || item.strategy }}</strong><small>版本 {{ item.version }}<template v-if="item.is_default"> · 内置</template></small></span>
                   <el-icon><Memo /></el-icon>
                 </button>
-                <div v-if="!strategyGuides.length" class="empty-copy">策略攻略尚未初始化。</div>
+                <div v-if="!strategyGuides.length && !strategyGuidesLoading" class="empty-copy">策略攻略尚未初始化。</div>
               </div>
             </section>
             <section class="panel stack">
@@ -1869,9 +1963,9 @@ onUnmounted(() => {
               <el-input v-model="strategyGuideDraft" type="textarea" :rows="10" maxlength="4000" show-word-limit placeholder="描述本策略要做什么、注意什么，以及应保持怎样的语气；不要写固定模板。" />
               <div class="form-row"><el-button type="primary" :loading="strategyGuideSaving" @click="saveStrategyGuide">保存新版本</el-button><el-button :loading="strategyGuideSaving" @click="resetStrategyGuide">恢复内置默认</el-button></div>
               <div class="advanced-heading"><span>版本历史</span><small>回滚也会创建新版本</small></div>
-              <div class="card-list">
+              <div class="card-list" v-loading="strategyGuideRevisionsLoading">
                 <div v-for="revision in strategyGuideRevisions" :key="`${revision.strategy}-${revision.version}`" class="result"><span><strong>版本 {{ revision.version }} · {{ revision.source === 'default' ? '默认' : revision.source === 'rollback' ? '回滚' : '编辑' }}</strong><small>{{ revision.created_at }} · {{ revision.prompt_text }}</small></span><el-button size="small" :disabled="revision.version === strategyGuides.find((item) => item.strategy === editingStrategy)?.version" @click="rollbackStrategyGuide(revision)">回滚</el-button></div>
-                <div v-if="!strategyGuideRevisions.length" class="empty-copy">暂无版本历史。</div>
+                <div v-if="!strategyGuideRevisions.length && !strategyGuideRevisionsLoading" class="empty-copy">暂无版本历史。</div>
               </div>
             </section>
           </div>
@@ -1954,7 +2048,7 @@ onUnmounted(() => {
 
         <template v-else-if="activeTab === 'knowledge'">
           <section class="panel stack action-panel"><div class="panel-heading"><div><span class="section-kicker">创建</span><h2>知识库配置</h2></div></div><div class="form-row"><el-input v-model="kbName" placeholder="知识库名称" /><el-select v-model="kbEmbedding"><el-option label="本地 BGE" value="local-bge" /><el-option label="在线 Embedding" value="online" /></el-select><el-button type="primary" @click="createKb">创建知识库</el-button></div></section>
-          <section class="panel stack"><div class="panel-heading"><div><span class="section-kicker">文档</span><h2>索引管理</h2></div><el-tag v-if="hasIndexingDocuments" type="warning" effect="plain">索引状态自动刷新中</el-tag></div><div class="form-row"><el-select v-model="selectedKb" placeholder="选择知识库" @change="loadDocuments"><el-option v-for="kb in knowledgeBases" :key="kb.id" :label="`${kb.name} · ${kb.embedding_profile}`" :value="kb.id" /></el-select><label class="file-picker"><input type="file" accept=".txt,.md,.markdown,.html,.htm,.pdf,.docx" @change="uploadFile = ($event.target as HTMLInputElement).files?.[0] || null" /><span>{{ uploadFile?.name || '选择文档' }}</span></label><el-button :disabled="!uploadFile || !selectedKb" @click="upload">上传并索引</el-button><el-button :disabled="!selectedKb" @click="rebuildKb">重建索引</el-button><el-button type="danger" plain :disabled="!selectedKb" @click="deleteKb">删除知识库</el-button></div><div class="table-wrap"><el-table :data="documents"><el-table-column prop="filename" label="文件" min-width="220" /><el-table-column label="状态" width="120"><template #default="scope"><el-tag :type="scope.row.status === 'ready' ? 'success' : scope.row.status === 'failed' ? 'danger' : 'warning'">{{ scope.row.status }}</el-tag></template></el-table-column><el-table-column prop="error" label="错误" min-width="220" /><el-table-column label="操作" width="190"><template #default="scope"><el-button size="small" :loading="reindexingDocumentIds.includes(scope.row.id)" :disabled="['queued', 'indexing'].includes(scope.row.status)" @click="reindexDocument(scope.row.id)">重新索引</el-button><el-button size="small" type="danger" plain @click="deleteDocument(scope.row.id)">删除</el-button></template></el-table-column></el-table></div></section>
+          <section class="panel stack"><div class="panel-heading"><div><span class="section-kicker">文档</span><h2>索引管理</h2></div><el-tag v-if="hasIndexingDocuments" type="warning" effect="plain">索引状态自动刷新中</el-tag></div><div class="form-row"><el-select v-model="selectedKb" placeholder="选择知识库" @change="loadDocuments"><el-option v-for="kb in knowledgeBases" :key="kb.id" :label="`${kb.name} · ${kb.embedding_profile}`" :value="kb.id" /></el-select><label class="file-picker"><input type="file" accept=".txt,.md,.markdown,.html,.htm,.pdf,.docx" @change="uploadFile = ($event.target as HTMLInputElement).files?.[0] || null" /><span>{{ uploadFile?.name || '选择文档' }}</span></label><el-button :disabled="!uploadFile || !selectedKb" @click="upload">上传并索引</el-button><el-button :disabled="!selectedKb" @click="rebuildKb">重建索引</el-button><el-button type="danger" plain :disabled="!selectedKb" @click="deleteKb">删除知识库</el-button></div><div class="table-wrap"><el-table v-loading="documentsLoading" :data="documents" :empty-text="documentsLoading ? '正在加载文档…' : '暂无文档'"><el-table-column prop="filename" label="文件" min-width="220" /><el-table-column label="状态" width="120"><template #default="scope"><el-tag :type="scope.row.status === 'ready' ? 'success' : scope.row.status === 'failed' ? 'danger' : 'warning'">{{ scope.row.status }}</el-tag></template></el-table-column><el-table-column prop="error" label="错误" min-width="220" /><el-table-column label="操作" width="190"><template #default="scope"><el-button size="small" :loading="reindexingDocumentIds.includes(scope.row.id)" :disabled="['queued', 'indexing'].includes(scope.row.status)" @click="reindexDocument(scope.row.id)">重新索引</el-button><el-button size="small" type="danger" plain @click="deleteDocument(scope.row.id)">删除</el-button></template></el-table-column></el-table></div></section>
         </template>
 
         <template v-else-if="activeTab === 'memory'">
