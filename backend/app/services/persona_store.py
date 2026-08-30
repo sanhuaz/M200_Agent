@@ -4,89 +4,28 @@ import json
 import os
 import re
 import tempfile
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.db.models import Conversation, Persona
-from app.services.personas import (
+from app.domain.persona_types import (
     INJECTION_PATTERNS,
+    PERSONA_ID_PATTERN,
     PersonaCard,
-    _string_values,
+    PersonaDocument,
+    PersonaFileEnvelope,
+    PersonaSource,
+    string_values,
     validate_persona_card,
 )
 
-PERSONA_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,35}$")
 MAX_PERSONA_FILE_BYTES = 64 * 1024
-MAX_SOURCES = 12
-
-
-class PersonaSource(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    title: str = Field(min_length=1, max_length=200)
-    url: str = Field(min_length=1, max_length=1_000)
-    kind: str = Field(default="reference", min_length=1, max_length=50)
-
-    @field_validator("url")
-    @classmethod
-    def validate_url(cls, value: str) -> str:
-        if not value.startswith(("http://", "https://")):
-            raise ValueError("来源 URL 必须使用 http:// 或 https://")
-        return value
-
-
-class PersonaFileEnvelope(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    schema_version: Literal[1] = 1
-    id: str = Field(min_length=1, max_length=36)
-    name: str = Field(min_length=1, max_length=120)
-    card_version: int = Field(default=1, ge=1, le=1_000_000)
-    sources: list[PersonaSource] = Field(default_factory=list, max_length=MAX_SOURCES)
-    adaptation: str = Field(default="", max_length=1_000)
-    card: PersonaCard
-
-    @field_validator("id")
-    @classmethod
-    def validate_id(cls, value: str) -> str:
-        if not PERSONA_ID_PATTERN.fullmatch(value):
-            raise ValueError("人格文件 ID 必须匹配 [a-z0-9][a-z0-9_-]{0,35}")
-        return value
-
-    @field_validator("name")
-    @classmethod
-    def validate_name(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("人格名称不能为空")
-        if INJECTION_PATTERNS.search(value):
-            raise ValueError("人格名称包含可能改变系统规则或权限的内容")
-        return value.strip()
-
-
-@dataclass(frozen=True)
-class PersonaDocument:
-    id: str
-    name: str
-    card_version: int
-    card: PersonaCard | None
-    status: Literal["active", "invalid"]
-    file_name: str
-    validation_error: str | None = None
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
-    envelope: PersonaFileEnvelope | None = None
-
-    @property
-    def is_active(self) -> bool:
-        return self.status == "active" and self.card is not None
 
 
 def _file_time(path: Path) -> datetime:
@@ -110,7 +49,7 @@ def _validate_provenance(envelope: PersonaFileEnvelope) -> None:
         "sources": [source.model_dump() for source in envelope.sources],
         "adaptation": envelope.adaptation,
     }
-    if any(INJECTION_PATTERNS.search(value) for value in _string_values(provenance)):
+    if any(INJECTION_PATTERNS.search(value) for value in string_values(provenance)):
         raise ValueError("来源或适配说明包含可能改变系统规则或权限的内容")
 
 
