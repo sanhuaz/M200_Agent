@@ -4,7 +4,7 @@ import sys
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
-from app.api import routes, task_routes
+from app.api import knowledge_routes, task_routes
 from app.db.models import Document, KnowledgeBase
 from app.db.session import SessionLocal
 from app.main import app
@@ -313,7 +313,7 @@ def test_failed_document_can_be_queued_for_reindex(monkeypatch, tmp_path) -> Non
         document_id = document.id
 
     monkeypatch.setattr(
-        routes,
+        knowledge_routes,
         "create_job",
         lambda job_type, payload: SimpleNamespace(id="reindex-task", status="queued"),
     )
