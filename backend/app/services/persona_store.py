@@ -276,16 +276,12 @@ class PersonaStore:
             if existing_id is not None and existing_id != persona_id:
                 # Keep the file visible as invalid, but do not violate the DB unique index.
                 if item is not None:
-                    item.raw_prompt = ""
-                    item.card_json = "{}"
                     item.status = "invalid"
                 continue
             if item is None:
                 item = Persona(
                     id=persona_id,
                     name=entry.name,
-                    raw_prompt="",
-                    card_json="{}",
                     status=entry.status,
                     card_version=entry.card_version if entry.card_version > 0 else 1,
                 )
@@ -293,8 +289,6 @@ class PersonaStore:
                 rows[persona_id] = item
             else:
                 item.name = entry.name
-                item.raw_prompt = ""
-                item.card_json = "{}"
                 item.status = entry.status
                 item.card_version = entry.card_version if entry.card_version > 0 else item.card_version or 1
             indexed_names[entry.name.casefold()] = persona_id

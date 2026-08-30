@@ -1661,8 +1661,6 @@ def create_persona(payload: PersonaCreate, session: Session = Depends(get_db)) -
     item = Persona(
         id=persona_id,
         name=normalized_name,
-        raw_prompt="",
-        card_json="{}",
         status="active",
         card_version=envelope.card_version,
     )
@@ -1703,7 +1701,7 @@ def update_persona(
         if other.id != persona_id and other.name.casefold() == new_name.casefold():
             raise HTTPException(409, "人格名称已存在")
     if item is None:
-        item = Persona(id=persona_id, name=new_name, raw_prompt="", card_json="{}")
+        item = Persona(id=persona_id, name=new_name)
         session.add(item)
     current_version = document.card_version if document is not None else getattr(item, "card_version", 0) or 0
     next_version = current_version + 1
@@ -1720,8 +1718,6 @@ def update_persona(
     except (ValueError, OSError) as error:
         raise HTTPException(400, str(error)) from error
     item.name = new_name
-    item.raw_prompt = ""
-    item.card_json = "{}"
     item.status = "active"
     item.card_version = next_version
     try:

@@ -192,7 +192,7 @@ def test_qq_new_archives_previous_conversation() -> None:
         )
     )
     with SessionLocal.begin() as session:
-        persona = Persona(id=persona_id, name="rotation-persona", raw_prompt="", card_json="{}")
+        persona = Persona(id=persona_id, name="rotation-persona")
         session.add(persona)
         session.flush()
         session.add(

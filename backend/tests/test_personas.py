@@ -34,11 +34,10 @@ def test_persona_prompt_is_loaded_from_file_and_manual_changes_take_effect() -> 
         with SessionLocal() as session:
             persona = session.get(Persona, row["id"])
             assert persona is not None
-            persona.card_json = '{"identity":{"role":"数据库里的错误正文"}}'
+            persona.card_version = 999
             session.commit()
             rendered = persona_system_prompt(persona)
             assert "简洁的代码助手" in rendered
-            assert "数据库里的错误正文" not in rendered
 
         store = get_persona_store()
         document = store.load(row["id"])

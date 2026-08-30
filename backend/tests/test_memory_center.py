@@ -35,7 +35,7 @@ def test_memory_center_unifies_filters_and_hides_non_owner_relationships() -> No
     group_id = "group:90001"
     persona_id = f"center-persona-{uuid4().hex[:16]}"
     persona_name = f"中心人格-{uuid4().hex}"
-    persona = Persona(id=persona_id, name=persona_name, raw_prompt="", card_json='{}')
+    persona = Persona(id=persona_id, name=persona_name)
     persona_store = get_persona_store()
     persona_store.write(
         persona_store.envelope_for(
