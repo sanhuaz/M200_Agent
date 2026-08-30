@@ -31,3 +31,18 @@ logs/
 htmlcov/
 .mypy_cache/
 .pyright/
+
+# 本机开发、测试与评测资产（不进入公开发行树）
+backend/tests/
+frontend/src/**/*.test.ts
+scripts/check.ps1
+scripts/companion*_eval.py
+scripts/rag_eval.py
+scripts/generate_companion_*.py
+scripts/fixtures/companion_p0_smoke.json
+
+# 本机项目材料（不进入公开仓库）
+/M200情感陪伴产品优化方案.md
+/QQ自然分批输出测试报告.md
+/Windows正式版制作路线.md
+/项目交接文档.md
