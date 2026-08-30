@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import json
 import logging
 import re
@@ -9,11 +8,15 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket
 from sqlalchemy import desc, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.api.onebot_delivery import send_private_file as deliver_private_file
+from app.api.onebot_delivery import send_text as deliver_text
+from app.api.onebot_messages import normalize_cq_text, text_from_event
+from app.api.onebot_transport import OneBotTransport
 from app.core.config import get_settings
 from app.db.models import (
     AppSetting,
@@ -147,10 +150,8 @@ def set_qq_reply_settings(
 
 class OneBotManager:
     def __init__(self) -> None:
-        self.websocket: WebSocket | None = None
+        self._transport = OneBotTransport(settings.onebot_token)
         self.self_id: str | None = None
-        self._send_lock = asyncio.Lock()
-        self._pending: dict[str, asyncio.Future[dict[str, object]]] = {}
         self.qq_status = "unknown"
         self.qq_nickname: str | None = None
         self._monitor_task: asyncio.Task[None] | None = None
@@ -159,6 +160,10 @@ class OneBotManager:
         self._listening_processing: set[str] = set()
         self._listening_processing_done: dict[str, asyncio.Event] = {}
         self._chat_locks: dict[str, asyncio.Lock] = {}
+
+    @property
+    def websocket(self) -> WebSocket | None:
+        return self._transport.websocket
 
     def status(self) -> dict[str, object]:
         return {
@@ -223,68 +228,25 @@ class OneBotManager:
             await asyncio.sleep(30)
 
     async def serve(self, websocket: WebSocket) -> None:
-        token = self._extract_token(websocket)
-        if (
-            not settings.onebot_token
-            or settings.onebot_token == "change-me"
-            or token != settings.onebot_token
-        ):
-            await websocket.close(code=1008, reason="OneBot Token 未配置或不匹配")
-            return
-        await websocket.accept()
-        self.websocket = websocket
         self.qq_status = "unknown"
-        operation_logs.emit(
-            source="onebot", kind="started", title="OneBot 连接", message="OneBot WebSocket 已连接"
-        )
-        try:
-            while True:
-                payload = await websocket.receive_json()
-                echo = payload.get("echo")
-                if echo is not None and str(echo) in self._pending:
-                    future = self._pending.pop(str(echo))
-                    if not future.done():
-                        future.set_result(payload)
-                    continue
-                if payload.get("post_type") == "message":
-                    if self._text_from_event(payload):
-                        operation_logs.emit(
-                            source="onebot",
-                            kind="message",
-                            title="收到 QQ 消息",
-                            message="收到文本消息（正文不写入连接日志）",
-                            details={
-                                "user_id": payload.get("user_id"),
-                                "group_id": payload.get("group_id"),
-                                "message_id": payload.get("message_id"),
-                            },
-                        )
-                    asyncio.create_task(self._handle_message(payload))
-        except WebSocketDisconnect:
-            logger.info("NapCat OneBot 已断开")
+        await self._transport.serve(websocket, self._dispatch_message_event)
+        self.self_id = None
+        self.qq_status = "offline"
+
+    async def _dispatch_message_event(self, payload: dict[str, object]) -> None:
+        if self._text_from_event(payload):
             operation_logs.emit(
                 source="onebot",
-                level="warn",
-                kind="failed",
-                title="OneBot 连接断开",
-                message="OneBot WebSocket 已断开",
+                kind="message",
+                title="收到 QQ 消息",
+                message="收到文本消息（正文不写入连接日志）",
+                details={
+                    "user_id": payload.get("user_id"),
+                    "group_id": payload.get("group_id"),
+                    "message_id": payload.get("message_id"),
+                },
             )
-        finally:
-            if self.websocket is websocket:
-                self.websocket = None
-                self.self_id = None
-                self.qq_status = "offline"
-            for future in self._pending.values():
-                if not future.done():
-                    future.set_exception(ConnectionError("OneBot 连接已断开"))
-            self._pending.clear()
-
-    def _extract_token(self, websocket: WebSocket) -> str:
-        query_token = websocket.query_params.get("access_token") or websocket.query_params.get("token")
-        if query_token:
-            return query_token
-        authorization = websocket.headers.get("authorization", "")
-        return authorization.removeprefix("Bearer ").strip()
+        await self._handle_message(payload)
 
     async def action(
         self,
@@ -293,91 +255,21 @@ class OneBotManager:
         *,
         timeout_seconds: float = 30,
     ) -> dict[str, object]:
-        if self.websocket is None:
-            raise ConnectionError("NapCat 未连接")
-        echo = uuid.uuid4().hex
-        future: asyncio.Future[dict[str, object]] = asyncio.get_running_loop().create_future()
-        self._pending[echo] = future
-        async with self._send_lock:
-            await self.websocket.send_json({"action": action, "params": params, "echo": echo})
-        try:
-            return await asyncio.wait_for(future, timeout=timeout_seconds)
-        finally:
-            self._pending.pop(echo, None)
+        return await self._transport.action(action, params, timeout_seconds=timeout_seconds)
 
     async def send_text(self, user_id: str, text: str, group_id: str | None = None) -> None:
-        if group_id:
-            response = await self.action(
-                "send_group_msg", {"group_id": int(group_id), "message": text}
-            )
-        else:
-            response = await self.action(
-                "send_private_msg", {"user_id": int(user_id), "message": text}
-            )
-        if response.get("status") != "ok" or int(str(response.get("retcode", -1))) != 0:
-            raise RuntimeError(f"QQ 文本发送失败: {response.get('message') or response.get('wording')}")
+        await deliver_text(self.action, user_id, text, group_id)
 
     async def send_private_file(self, user_id: str, path: Path) -> None:
-        response = await self.action(
-            "upload_private_file",
-            {"user_id": int(user_id), "file": str(path.resolve()), "name": path.name},
-            timeout_seconds=300,
-        )
-        if response.get("status") != "ok" or int(str(response.get("retcode", -1))) != 0:
-            raise RuntimeError(f"QQ 文件上传失败: {response.get('message') or response.get('wording')}")
+        await deliver_private_file(self.action, user_id, path)
 
     @staticmethod
     def _normalize_cq_text(value: str, *, preserve_mentions: bool = False) -> str:
-        """Keep CQ text segments and remove attachments/receipts."""
-
-        value = value.strip()
-        if "[CQ:" not in value:
-            return value
-
-        def replace_segment(match: re.Match[str]) -> str:
-            segment_type, payload = match.group(1), match.group(2) or ""
-            if segment_type == "at" and preserve_mentions:
-                return match.group(0)
-            if segment_type != "text":
-                return ""
-            text_value = ""
-            for part in payload.split(","):
-                if part.startswith("text="):
-                    text_value = part[5:]
-                    break
-            return html.unescape(
-                text_value.replace("&#44;", ",").replace("&#91;", "[").replace("&#93;", "]")
-            )
-
-        return re.sub(r"\[CQ:([^,\]]+)(?:,([^\]]*))?\]", replace_segment, value).strip()
+        return normalize_cq_text(value, preserve_mentions=preserve_mentions)
 
     @classmethod
     def _text_from_event(cls, event: dict[str, object]) -> str:
-        raw_message = event.get("raw_message")
-        if isinstance(raw_message, str) and raw_message.strip():
-            # NapCat may put a file/image receipt entirely in raw_message as
-            # CQ segments. Keep text segments and drop non-text segments so a
-            # receipt never reaches commands, companion analysis or Agent.
-            return cls._normalize_cq_text(raw_message, preserve_mentions=event.get("message_type") == "group")
-        message = event.get("message")
-        if isinstance(message, str):
-            return cls._normalize_cq_text(message, preserve_mentions=event.get("message_type") == "group")
-        if isinstance(message, list):
-            parts: list[str] = []
-            for segment in message:
-                if not isinstance(segment, dict):
-                    continue
-                segment_type = segment.get("type")
-                data = segment.get("data")
-                if isinstance(data, dict):
-                    value = data.get("text")
-                    if segment_type == "text" and isinstance(value, str):
-                        parts.append(value)
-                    elif event.get("message_type") == "group" and segment_type == "at":
-                        qq = str(data.get("qq") or "")
-                        parts.append(f"[CQ:at,qq={qq}]")
-            return "".join(parts).strip()
-        return ""
+        return text_from_event(event)
 
     async def _handle_message(self, event: dict[str, object]) -> None:
         message_id = str(event.get("message_id", ""))
