@@ -27,6 +27,8 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 Push-Location (Join-Path $ProjectRoot "frontend")
 try {
+    & ".\node_modules\.bin\vitest.cmd" run
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     & ".\node_modules\.bin\vue-tsc.cmd" --noEmit
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     & ".\node_modules\.bin\vite.cmd" build
