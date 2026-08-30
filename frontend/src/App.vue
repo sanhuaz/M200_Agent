@@ -1,12 +1,19 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
+import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import {
   ChatDotRound, Collection, DataAnalysis, Delete, Expand, Fold, MagicStick, Memo, Menu,
   Monitor, Moon, PictureFilled, Setting, Sunny, Tools, UserFilled, Bell, CircleCheck, Refresh,
   VideoPause, VideoPlay, Warning,
 } from '@element-plus/icons-vue'
+import { buildMemoryCenterQuery } from './features/memory'
+import { normalizeTab, pathForTab, resolveRoute } from './features/navigation'
+import { LatestRequestGate } from './features/requestGate'
 import { API, api, streamChat } from './services/api'
+import type { AdminRow, HealthData, NapcatStatus } from './types/management'
+
+const AdminPage = defineAsyncComponent(() => import('./pages/AdminPage.vue'))
+const StatusPage = defineAsyncComponent(() => import('./pages/StatusPage.vue'))
 
 type Conversation = { id: string; title: string; platform: string; model_alias: string; persona_id?: string | null }
 type ReasoningEffort = 'low' | 'medium' | 'high' | null
@@ -82,7 +89,6 @@ type PersonaCard = {
 type PersonaRow = { id: string; name: string; status: 'active' | 'invalid'; card_version: number; card: PersonaCard | null; file_name: string; source: 'file'; validation_error?: string; created_at?: string; updated_at?: string }
 type StrategyGuideRow = { strategy: string; prompt_text: string; version: number; is_default: boolean; updated_at: string }
 type StrategyRevisionRow = { strategy: string; version: number; prompt_text: string; source: string; created_at: string }
-type AdminRow = { id: string; external_id: string; display_name?: string; platform: string; enabled: boolean }
 type CompanionPreferenceRow = {
   scope_id: string
   companion_enabled: boolean
@@ -136,14 +142,12 @@ type EmotionAssessmentRow = {
 }
 type CompanionFeedbackRow = { id: string; assistant_message_id: string; feedback: string; correction: { note?: string }; created_at: string; updated_at: string }
 type CompanionSafetyRow = { id: string; message_id: string; risk_level: string; action: string; detector_version: string; details: { rules?: string[]; source?: string; safety_mode?: string; response_source?: string; violation_codes?: string[] }; created_at: string }
-type HealthItem = { alias?: string; model?: string; configured?: boolean }
 type LogProgress = { current?: number; total?: number; percent?: number; unit?: string }
 type LogEvent = {
   id: string; timestamp: string; session_id: string; source: string; level: string; kind: string
   title: string; message: string; details?: unknown; operation_id?: string; trace_id?: string
   parent_operation_id?: string; progress?: LogProgress
 }
-type NapcatStatus = { url: string; configured: boolean; status: string; two_factor: boolean; last_error?: string | null; last_log_at?: string | null }
 type QQReplySettings = {
   chunked_output_enabled: boolean
   chunk_target_chars: number
@@ -151,21 +155,6 @@ type QQReplySettings = {
   chunk_max_chars: number
 }
 type ActiveLogResponse = { session_id: string; operations: LogEvent[]; napcat: NapcatStatus; onebot: { connection: string; qq: string; self_id?: string | null; nickname?: string | null } }
-type HealthData = {
-  status?: string
-  database?: string
-  chroma?: string
-  worker?: string
-  onebot?: string
-  reranker?: string
-  qq?: string
-  napcat?: NapcatStatus
-  logs?: { session_id?: string; events?: number }
-  python_executable?: string
-  models?: HealthItem[]
-  embedding_profiles?: HealthItem[]
-  [key: string]: unknown
-}
 type ThemeName = 'light' | 'dark'
 
 const activeTab = ref('chat')
@@ -275,12 +264,12 @@ const qqReplySettings = ref<QQReplySettings>({ chunked_output_enabled: true, chu
 const persistedQQReplySettings = ref<QQReplySettings>({ ...qqReplySettings.value })
 const qqReplySettingsSaving = ref(false)
 let logEventSource: EventSource | null = null
-let messagesRequestSeq = 0
-let documentsRequestSeq = 0
-let memoryCenterRequestSeq = 0
+const messagesRequests = new LatestRequestGate<string>()
+const documentRequests = new LatestRequestGate<string>()
+const memoryCenterRequests = new LatestRequestGate<string>()
 let companionRequestSeq = 0
 let strategyGuidesRequestSeq = 0
-let strategyRevisionRequestSeq = 0
+const strategyRevisionRequests = new LatestRequestGate<string>()
 const theme = ref<ThemeName>('light')
 let followsSystemTheme = false
 let systemThemeQuery: MediaQueryList | undefined
@@ -317,11 +306,6 @@ function companionAnalysisStatusLabel(status: string) { return companionAnalysis
 function companionAnalysisStatusType(status: string) { return companionAnalysisStatusTypes[status as EmotionAssessmentRow['analysis_status']] || 'danger' }
 const DOCUMENT_REFRESH_INTERVAL_MS = 1000
 let documentRefreshTimer: number | undefined
-const routePaths: Record<string, string> = {
-  chat: '/chat', models: '/models', knowledge: '/knowledge', tools: '/tools', skills: '/skills',
-  personas: '/personas', memory: '/memories', companion: '/companion',
-  strategyGuides: '/strategy-guides', emotionRecords: '/emotion-records', privacy: '/privacy', admin: '/admin', tasks: '/tasks', status: '/status', logs: '/logs',
-}
 const pageDetails: Record<string, { title: string; description: string }> = {
   chat: { title: '对话', description: '与 M200 Agent 对话并管理会话模型和人格' },
   models: { title: '模型管理', description: '配置主聊天 LLM，并在会话中快捷切换' },
@@ -735,37 +719,22 @@ initializeTheme()
 function syncRoute() {
   const previous = activeTab.value
   const url = new URL(window.location.href)
-  let route: string | undefined
-  if (url.pathname === '/relationships') {
-    route = 'memory'
-    memoryType.value = 'relationship'
-    window.history.replaceState({}, '', '/memories?memory_type=relationship')
-  } else {
-    route = Object.entries(routePaths).find(([, path]) => url.pathname === path)?.[0]
-    if (route === 'memory') {
-      const requestedType = url.searchParams.get('memory_type')
-      if (requestedType === 'fact' || requestedType === 'relationship' || requestedType === 'all') {
-        memoryType.value = requestedType
-      }
-    }
-  }
-  if (route) activeTab.value = route
+  const route = resolveRoute(url.pathname, url.search)
+  if (route.memoryType) memoryType.value = route.memoryType
+  if (route.replacePath) window.history.replaceState({}, '', route.replacePath)
+  if (route.tab) activeTab.value = route.tab
   mobileSidebarOpen.value = false
   if (previous === 'logs' && activeTab.value !== 'logs') closeLogStream()
   if (previous !== 'logs' && activeTab.value === 'logs') void enterLogsPage()
 }
 
 function changeTab(tab: string | number) {
-  let name = String(tab)
-  if (name === 'relationships') {
-    name = 'memory'
-    memoryType.value = 'relationship'
-  }
+  const route = normalizeTab(tab)
+  const name = route.tab
+  if (route.memoryType) memoryType.value = route.memoryType
   const previous = activeTab.value
   activeTab.value = name
-  const path = name === 'memory' && memoryType.value === 'relationship'
-    ? '/memories?memory_type=relationship'
-    : routePaths[name] || '/chat'
+  const path = pathForTab(name, memoryType.value)
   if (`${window.location.pathname}${window.location.search}` !== path) window.history.pushState({}, '', path)
   mobileSidebarOpen.value = false
   if (previous === 'logs' && name !== 'logs') closeLogStream()
@@ -830,7 +799,7 @@ async function createConversation() {
 
 async function loadMessages(force = true) {
   const conversationId = currentConversationId.value
-  const requestId = ++messagesRequestSeq
+  const request = messagesRequests.begin(conversationId)
   if (!conversationId) {
     messages.value = []
     messagesLoading.value = false
@@ -840,16 +809,16 @@ async function loadMessages(force = true) {
   messagesLoading.value = true
   try {
     const data = await api<Message[]>(`/conversations/${conversationId}/messages`)
-    if (requestId !== messagesRequestSeq || currentConversationId.value !== conversationId) return
+    if (!messagesRequests.isCurrent(request, currentConversationId.value)) return
     messages.value = data
     if (force) messagesAutoFollow.value = true
     await scrollMessagesToBottom(force)
   } catch (error) {
-    if (requestId === messagesRequestSeq && currentConversationId.value === conversationId) {
+    if (messagesRequests.isCurrent(request, currentConversationId.value)) {
       ElMessage.error(`消息加载失败：${(error as Error).message}`)
     }
   } finally {
-    if (requestId === messagesRequestSeq) messagesLoading.value = false
+    if (messagesRequests.isCurrent(request, currentConversationId.value)) messagesLoading.value = false
   }
 }
 
@@ -945,21 +914,21 @@ async function upload() {
 
 async function loadDocuments(clearPrevious = true) {
   const knowledgeBaseId = selectedKb.value
-  const requestId = ++documentsRequestSeq
+  const request = documentRequests.begin(knowledgeBaseId)
   stopDocumentRefresh()
   if (clearPrevious) documents.value = []
   documentsLoading.value = true
   try {
     const data = await api<DocumentRow[]>(`/documents${knowledgeBaseId ? `?knowledge_base_id=${knowledgeBaseId}` : ''}`)
-    if (requestId !== documentsRequestSeq || knowledgeBaseId !== selectedKb.value) return
+    if (!documentRequests.isCurrent(request, selectedKb.value)) return
     documents.value = data
     scheduleDocumentRefresh()
   } catch (error) {
-    if (requestId === documentsRequestSeq && knowledgeBaseId === selectedKb.value) {
+    if (documentRequests.isCurrent(request, selectedKb.value)) {
       ElMessage.error(`文档加载失败：${(error as Error).message}`)
     }
   } finally {
-    if (requestId === documentsRequestSeq) documentsLoading.value = false
+    if (documentRequests.isCurrent(request, selectedKb.value)) documentsLoading.value = false
   }
 }
 
@@ -985,33 +954,32 @@ function scheduleDocumentRefresh() {
 }
 
 function memoryCenterQuery() {
-  const params = new URLSearchParams({
-    memory_type: memoryType.value,
-    scope_type: memoryScope.value,
+  return buildMemoryCenterQuery({
+    memoryType: memoryType.value,
+    scopeType: memoryScope.value,
     status: memoryStatus.value,
+    scopeId: memoryScopeId.value,
+    personaKey: memoryPersonaKey.value,
+    keyword: memoryKeyword.value,
   })
-  if (memoryScopeId.value.trim()) params.set('scope_id', memoryScopeId.value.trim())
-  if (memoryPersonaKey.value && memoryType.value === 'relationship') params.set('persona_key', memoryPersonaKey.value)
-  if (memoryKeyword.value.trim()) params.set('keyword', memoryKeyword.value.trim())
-  return params
 }
 
 async function loadMemoryCenter() {
   const params = memoryCenterQuery()
   const queryKey = params.toString()
-  const requestId = ++memoryCenterRequestSeq
+  const request = memoryCenterRequests.begin(queryKey)
   memories.value = []
   memoryCenterLoading.value = true
   try {
     const data = await api<MemoryCenterRow[]>(`/memory-center?${queryKey}`)
-    if (requestId !== memoryCenterRequestSeq || memoryCenterQuery().toString() !== queryKey) return
+    if (!memoryCenterRequests.isCurrent(request, memoryCenterQuery().toString())) return
     memories.value = data
   } catch (error) {
-    if (requestId === memoryCenterRequestSeq && memoryCenterQuery().toString() === queryKey) {
+    if (memoryCenterRequests.isCurrent(request, memoryCenterQuery().toString())) {
       ElMessage.error(`长期记忆加载失败：${(error as Error).message}`)
     }
   } finally {
-    if (requestId === memoryCenterRequestSeq) memoryCenterLoading.value = false
+    if (memoryCenterRequests.isCurrent(request, memoryCenterQuery().toString())) memoryCenterLoading.value = false
   }
 }
 
@@ -1066,7 +1034,7 @@ async function loadStrategyGuides() {
 
 async function loadStrategyRevisions() {
   const strategy = editingStrategy.value
-  const requestId = ++strategyRevisionRequestSeq
+  const request = strategyRevisionRequests.begin(strategy)
   strategyGuideRevisions.value = []
   if (!strategy) {
     strategyGuideRevisionsLoading.value = false
@@ -1077,14 +1045,14 @@ async function loadStrategyRevisions() {
     const data = await api<StrategyRevisionRow[]>(
       `/companion/strategy-guides/${encodeURIComponent(strategy)}/revisions`,
     )
-    if (requestId !== strategyRevisionRequestSeq || editingStrategy.value !== strategy) return
+    if (!strategyRevisionRequests.isCurrent(request, editingStrategy.value)) return
     strategyGuideRevisions.value = data
   } catch (error) {
-    if (requestId === strategyRevisionRequestSeq && editingStrategy.value === strategy) {
+    if (strategyRevisionRequests.isCurrent(request, editingStrategy.value)) {
       ElMessage.error(`策略版本加载失败：${(error as Error).message}`)
     }
   } finally {
-    if (requestId === strategyRevisionRequestSeq) strategyGuideRevisionsLoading.value = false
+    if (strategyRevisionRequests.isCurrent(request, editingStrategy.value)) strategyGuideRevisionsLoading.value = false
   }
 }
 
@@ -2221,13 +2189,11 @@ onUnmounted(() => {
         </template>
 
         <template v-else-if="activeTab === 'admin'">
-          <section class="panel stack"><div class="panel-heading"><div><span class="section-kicker">权限</span><h2>QQ Owner</h2></div><span class="count-badge">{{ admins.length }}</span></div><p class="hint">local-owner 永久存在且不可删除；这里的变更会立即生效。</p><div class="form-row"><el-input v-model="adminQq" placeholder="QQ 号" /><el-input v-model="adminName" placeholder="备注（可选）" /><el-button type="primary" @click="addAdmin">添加 Owner</el-button></div><div class="table-wrap"><el-table :data="admins"><el-table-column prop="external_id" label="身份" min-width="180" /><el-table-column prop="display_name" label="备注" min-width="180" /><el-table-column prop="platform" label="平台" width="130" /><el-table-column label="操作" width="120"><template #default="scope"><el-button size="small" type="danger" plain :disabled="scope.row.external_id === 'local-owner'" @click="removeAdmin(scope.row)">删除</el-button></template></el-table-column></el-table></div></section>
+          <AdminPage v-model:qq="adminQq" v-model:name="adminName" :admins="admins" @add="addAdmin" @remove="removeAdmin" />
         </template>
 
         <template v-else-if="activeTab === 'status'">
-          <div class="status-grid"><article class="status-card"><span>服务状态</span><el-icon><Monitor /></el-icon><strong>{{ statusLabel(health.status) }}</strong><el-tag :type="statusType(health.status)">{{ health.status || 'loading' }}</el-tag></article><article class="status-card"><span>数据库</span><el-icon><DataAnalysis /></el-icon><strong>{{ statusLabel(health.database) }}</strong><el-tag :type="statusType(health.database)">{{ health.database || 'unknown' }}</el-tag></article><article class="status-card"><span>向量索引</span><el-icon><Collection /></el-icon><strong>{{ statusLabel(health.chroma) }}</strong><el-tag :type="statusType(health.chroma)">{{ health.chroma || 'unknown' }}</el-tag></article><article class="status-card"><span>任务 Worker</span><el-icon><Setting /></el-icon><strong>{{ statusLabel(health.worker) }}</strong><el-tag :type="statusType(health.worker)">{{ health.worker || 'unknown' }}</el-tag></article><article class="status-card"><span>OneBot</span><el-icon><ChatDotRound /></el-icon><strong>{{ statusLabel(health.onebot) }}</strong><el-tag :type="statusType(health.onebot)">{{ health.onebot || 'unknown' }}</el-tag></article><article class="status-card"><span>Reranker</span><el-icon><MagicStick /></el-icon><strong>{{ statusLabel(health.reranker) }}</strong><el-tag :type="statusType(health.reranker)">{{ health.reranker || 'unknown' }}</el-tag></article></div>
-          <div class="two-column status-detail-grid"><section class="panel stack"><div class="panel-heading"><div><span class="section-kicker">模型</span><h2>模型配置</h2></div></div><div class="card-list"><div v-for="item in health.models || []" :key="item.alias" class="result"><span><strong>{{ item.alias }}</strong><small>{{ item.model }}</small></span><el-tag :type="item.configured ? 'success' : 'warning'">{{ item.configured ? '已配置' : '未配置' }}</el-tag></div></div></section><section class="panel stack"><div class="panel-heading"><div><span class="section-kicker">检索</span><h2>Embedding 配置</h2></div></div><div class="card-list"><div v-for="item in health.embedding_profiles || []" :key="item.alias" class="result"><span><strong>{{ item.alias }}</strong><small>{{ item.model }}</small></span><el-tag :type="item.configured ? 'success' : 'warning'">{{ item.configured ? '已配置' : '未配置' }}</el-tag></div></div></section></div>
-          <section class="panel raw-status"><el-collapse><el-collapse-item title="查看原始运行详情" name="raw"><pre>{{ JSON.stringify(health, null, 2) }}</pre></el-collapse-item></el-collapse></section>
+          <StatusPage :health="health" />
         </template>
       </main>
     </div>

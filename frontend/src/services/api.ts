@@ -1,5 +1,34 @@
 export const API = '/api/v1'
 
+export type StreamEvent = {
+  event: string
+  data: Record<string, unknown>
+}
+
+export class SseEventParser {
+  private buffer = ''
+
+  feed(text: string): StreamEvent[] {
+    this.buffer += text
+    const blocks = this.buffer.split('\n\n')
+    this.buffer = blocks.pop() || ''
+    return blocks.flatMap(parseEventBlock)
+  }
+
+  finish(): StreamEvent[] {
+    const block = this.buffer
+    this.buffer = ''
+    return block ? parseEventBlock(block) : []
+  }
+}
+
+function parseEventBlock(block: string): StreamEvent[] {
+  const event = block.match(/^event: (.+)$/m)?.[1]
+  const data = block.match(/^data: (.+)$/m)?.[1]
+  if (!event || !data) return []
+  return [{ event, data: JSON.parse(data) as Record<string, unknown> }]
+}
+
 export async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`${API}${path}`, options)
   if (!response.ok) {
@@ -21,17 +50,18 @@ export async function streamChat(
   if (!response.ok || !response.body) throw new Error(`聊天请求失败：${response.status}`)
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
-  let buffer = ''
+  const parser = new SseEventParser()
   while (true) {
     const { value, done } = await reader.read()
     if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    const blocks = buffer.split('\n\n')
-    buffer = blocks.pop() || ''
-    for (const block of blocks) {
-      const event = block.match(/^event: (.+)$/m)?.[1]
-      const data = block.match(/^data: (.+)$/m)?.[1]
-      if (event && data) onEvent(event, JSON.parse(data))
+    for (const item of parser.feed(decoder.decode(value, { stream: true }))) {
+      onEvent(item.event, item.data)
     }
+  }
+  for (const item of parser.feed(decoder.decode())) {
+    onEvent(item.event, item.data)
+  }
+  for (const item of parser.finish()) {
+    onEvent(item.event, item.data)
   }
 }
