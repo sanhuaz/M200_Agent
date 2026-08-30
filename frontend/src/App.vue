@@ -142,7 +142,12 @@ type LogEvent = {
   parent_operation_id?: string; progress?: LogProgress
 }
 type NapcatStatus = { url: string; configured: boolean; status: string; two_factor: boolean; last_error?: string | null; last_log_at?: string | null }
-type QQReplySettings = { chunked_output_enabled: boolean }
+type QQReplySettings = {
+  chunked_output_enabled: boolean
+  chunk_target_chars: number
+  chunk_min_chars: number
+  chunk_max_chars: number
+}
 type ActiveLogResponse = { session_id: string; operations: LogEvent[]; napcat: NapcatStatus; onebot: { connection: string; qq: string; self_id?: string | null; nickname?: string | null } }
 type HealthData = {
   status?: string
@@ -260,13 +265,18 @@ const napcatConfig = ref<NapcatStatus>({ url: 'http://127.0.0.1:6099', configure
 const napcatToken = ref('')
 const napcatSaving = ref(false)
 const napcatTesting = ref(false)
-const qqReplySettings = ref<QQReplySettings>({ chunked_output_enabled: true })
+const qqReplySettings = ref<QQReplySettings>({ chunked_output_enabled: true, chunk_target_chars: 20, chunk_min_chars: 14, chunk_max_chars: 26 })
+const persistedQQReplySettings = ref<QQReplySettings>({ ...qqReplySettings.value })
 const qqReplySettingsSaving = ref(false)
 let logEventSource: EventSource | null = null
 const theme = ref<ThemeName>('light')
 let followsSystemTheme = false
 let systemThemeQuery: MediaQueryList | undefined
 const currentConversation = computed(() => conversations.value.find((item) => item.id === currentConversationId.value))
+const qqChunkRange = computed(() => {
+  const target = Math.min(100, Math.max(5, Number(qqReplySettings.value.chunk_target_chars) || 20))
+  return { min: Math.floor(target * 0.7), max: Math.ceil(target * 1.3) }
+})
 const hasIndexingDocuments = computed(() => documents.value.some((item) => ['queued', 'indexing'].includes(item.status)))
 const companionOwners = computed(() => admins.value.filter((item) => item.platform === 'qq' && item.enabled && /^\d{5,20}$/.test(item.external_id)))
 const companionPersonas = computed(() => [{ id: 'default', name: '默认人格' }, ...personas.value.filter((item) => item.status === 'active').map((item) => ({ id: item.id, name: item.name }))])
@@ -487,7 +497,13 @@ async function loadLogs() {
   logEvents.value = history.events || []
   activeLogOperations.value = active.operations || []
   napcatConfig.value = config.napcat
-  qqReplySettings.value = replySettings
+  qqReplySettings.value = {
+    chunked_output_enabled: replySettings.chunked_output_enabled,
+    chunk_target_chars: replySettings.chunk_target_chars ?? 20,
+    chunk_min_chars: replySettings.chunk_min_chars ?? 14,
+    chunk_max_chars: replySettings.chunk_max_chars ?? 26,
+  }
+  persistedQQReplySettings.value = { ...qqReplySettings.value }
   await scrollLogsToBottom(true)
 }
 
@@ -542,20 +558,21 @@ async function clearNapcatToken() {
   } catch (error) { ElMessage.error(`清除 Token 失败：${(error as Error).message}`) }
 }
 
-async function saveQQReplySettings(value: boolean) {
-  // Element Plus updates v-model before emitting `change`; the previous
-  // persisted value is therefore the opposite of the newly selected switch
-  // state. Restore it if the PUT fails.
-  const previous = !value
+async function saveQQReplySettings() {
+  const previous = { ...persistedQQReplySettings.value }
   qqReplySettingsSaving.value = true
   try {
     qqReplySettings.value = await api<QQReplySettings>('/onebot/reply-settings', {
       method: 'PUT', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chunked_output_enabled: value }),
+      body: JSON.stringify({
+        chunked_output_enabled: qqReplySettings.value.chunked_output_enabled,
+        chunk_target_chars: qqReplySettings.value.chunk_target_chars,
+      }),
     })
+    persistedQQReplySettings.value = { ...qqReplySettings.value }
     ElMessage.success(qqReplySettings.value.chunked_output_enabled ? 'QQ 自然分批输出已开启' : 'QQ 自然分批输出已关闭')
   } catch (error) {
-    qqReplySettings.value.chunked_output_enabled = previous
+    qqReplySettings.value = previous
     ElMessage.error(`QQ 回复设置保存失败：${(error as Error).message}`)
   } finally {
     qqReplySettingsSaving.value = false
@@ -2053,8 +2070,9 @@ onUnmounted(() => {
           </div>
 
           <section class="panel stack log-config-panel">
-            <div class="panel-heading"><div><span class="section-kicker">QQ 回复</span><h2>自然分批输出</h2></div><el-switch v-model="qqReplySettings.chunked_output_enabled" :loading="qqReplySettingsSaving" active-text="已开启" inactive-text="单条发送" @change="saveQQReplySettings" /></div>
+            <div class="panel-heading"><div><span class="section-kicker">QQ 回复</span><h2>自然分批输出</h2></div><el-switch v-model="qqReplySettings.chunked_output_enabled" :loading="qqReplySettingsSaving" :disabled="qqReplySettingsSaving" active-text="已开启" inactive-text="单条发送" @change="saveQQReplySettings" /></div>
             <p class="hint">全局作用于 QQ 的模型聊天回复。回复会在安全与角色复核完成后，按语义分成几条自然发送；命令、错误、任务通知和文件说明保持单条。</p>
+            <div class="form-row qq-reply-settings-row"><label class="field-control"><span>分段目标字数</span><el-input-number v-model="qqReplySettings.chunk_target_chars" :min="5" :max="100" :step="1" :disabled="qqReplySettingsSaving" @change="saveQQReplySettings" /></label><span class="hint-inline">目标 {{ qqReplySettings.chunk_target_chars }} 字，实际约 {{ qqChunkRange.min }}–{{ qqChunkRange.max }} 字</span></div>
           </section>
 
           <section class="panel stack log-config-panel">

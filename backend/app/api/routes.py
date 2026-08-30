@@ -19,8 +19,8 @@ from sqlalchemy.orm import Session
 
 from app.api.onebot import (
     onebot_manager,
-    qq_chunked_output_enabled,
-    set_qq_chunked_output_enabled,
+    qq_reply_settings,
+    set_qq_reply_settings,
 )
 from app.core.config import get_settings
 from app.db.models import (
@@ -240,7 +240,8 @@ class NapCatLogTest(BaseModel):
 
 
 class QQReplySettingsUpdate(BaseModel):
-    chunked_output_enabled: bool
+    chunked_output_enabled: bool | None = None
+    chunk_target_chars: int | None = Field(default=None, ge=5, le=100)
 
 
 class CompanionPreferenceUpdate(BaseModel):
@@ -875,17 +876,23 @@ def list_operation_logs(
 
 
 @router.get("/onebot/reply-settings", dependencies=[Depends(require_loopback)])
-def get_qq_reply_settings(session: Session = Depends(get_db)) -> dict[str, bool]:
-    return {"chunked_output_enabled": qq_chunked_output_enabled(session)}
+def get_qq_reply_settings(session: Session = Depends(get_db)) -> dict[str, object]:
+    return qq_reply_settings(session)
 
 
 @router.put("/onebot/reply-settings", dependencies=[Depends(require_loopback)])
 def update_qq_reply_settings(
     payload: QQReplySettingsUpdate, session: Session = Depends(get_db)
-) -> dict[str, bool]:
-    set_qq_chunked_output_enabled(session, payload.chunked_output_enabled)
+) -> dict[str, object]:
+    if payload.chunked_output_enabled is None and payload.chunk_target_chars is None:
+        raise HTTPException(422, "至少提供一个 QQ 回复设置")
+    set_qq_reply_settings(
+        session,
+        enabled=payload.chunked_output_enabled,
+        target_chars=payload.chunk_target_chars,
+    )
     session.commit()
-    return {"chunked_output_enabled": qq_chunked_output_enabled(session)}
+    return qq_reply_settings(session)
 
 
 @router.get("/logs/active", dependencies=[Depends(require_loopback)])

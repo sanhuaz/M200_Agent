@@ -57,12 +57,21 @@ from app.services.manga import manga_service
 from app.services.models import model_registry
 from app.services.operation_logs import operation_logs
 from app.services.persona_store import get_persona_store
-from app.services.qq_delivery import qq_reply_delay_seconds, split_qq_reply
+from app.services.qq_delivery import (
+    DEFAULT_CHUNK_TARGET_CHARS,
+    MAX_CHUNK_TARGET_CHARS,
+    MIN_CHUNK_TARGET_CHARS,
+    chunk_length_bounds,
+    normalize_chunk_target,
+    qq_reply_delay_seconds,
+    split_qq_reply,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 settings = get_settings()
 QQ_CHUNKED_OUTPUT_SETTING_KEY = "qq_chunked_output_enabled"
+QQ_CHUNK_TARGET_SETTING_KEY = "qq_chunk_target_chars"
 DEFAULT_QQ_CHUNKED_OUTPUT_ENABLED = True
 
 
@@ -89,6 +98,50 @@ def set_qq_chunked_output_enabled(session: Session, enabled: bool) -> None:
         item = AppSetting(key=QQ_CHUNKED_OUTPUT_SETTING_KEY, value="")
         session.add(item)
     item.value = json.dumps(bool(enabled))
+
+
+def qq_chunk_target_chars(session: Session) -> int:
+    item = session.get(AppSetting, QQ_CHUNK_TARGET_SETTING_KEY)
+    if item is None:
+        return DEFAULT_CHUNK_TARGET_CHARS
+    try:
+        value = json.loads(item.value)
+    except json.JSONDecodeError:
+        value = item.value.strip()
+    return normalize_chunk_target(value)
+
+
+def qq_reply_settings(session: Session) -> dict[str, object]:
+    target = qq_chunk_target_chars(session)
+    minimum, maximum = chunk_length_bounds(target)
+    return {
+        "chunked_output_enabled": qq_chunked_output_enabled(session),
+        "chunk_target_chars": target,
+        "chunk_min_chars": minimum,
+        "chunk_max_chars": maximum,
+    }
+
+
+def set_qq_reply_settings(
+    session: Session,
+    *,
+    enabled: bool | None = None,
+    target_chars: int | None = None,
+) -> None:
+    if enabled is not None:
+        set_qq_chunked_output_enabled(session, enabled)
+    if target_chars is not None:
+        try:
+            target = int(target_chars)
+        except (TypeError, ValueError) as error:
+            raise ValueError("QQ 分段目标字数必须是整数") from error
+        if not MIN_CHUNK_TARGET_CHARS <= target <= MAX_CHUNK_TARGET_CHARS:
+            raise ValueError("QQ 分段目标字数必须在 5–100 之间")
+        item = session.get(AppSetting, QQ_CHUNK_TARGET_SETTING_KEY)
+        if item is None:
+            item = AppSetting(key=QQ_CHUNK_TARGET_SETTING_KEY, value="")
+            session.add(item)
+        item.value = json.dumps(target)
 
 
 class OneBotManager:
@@ -435,6 +488,7 @@ class OneBotManager:
                 if conversation is None:
                     raise RuntimeError("无法创建 QQ 会话")
             chunked_output = qq_chunked_output_enabled(session)
+            chunk_target_chars = qq_chunk_target_chars(session)
             final_text = ""
             response_source = ""
             error_text = ""
@@ -466,7 +520,7 @@ class OneBotManager:
             reply_text = final_text or f"处理失败：{error_text}"
             chunkable_response_sources = {"agent", "rewritten", "style_rewritten"}
             chunks = (
-                split_qq_reply(reply_text)
+                split_qq_reply(reply_text, target_chars=chunk_target_chars)
                 if (
                     final_text
                     and not error_text

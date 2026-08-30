@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import math
 import re
 
-TARGET_MIN_CHARS = 10
-TARGET_MAX_CHARS = 50
+DEFAULT_CHUNK_TARGET_CHARS = 20
+MIN_CHUNK_TARGET_CHARS = 5
+MAX_CHUNK_TARGET_CHARS = 100
 MAX_REPLY_CHUNKS = 12
 MIN_DELAY_SECONDS = 0.3
 MAX_DELAY_SECONDS = 0.8
@@ -15,6 +17,27 @@ _PROTECTED_PATTERN = re.compile(
     r"```[\s\S]*?(?:```|$)|https?://[^\s<>\u3000`。！？；，、：]+|www\.[^\s<>\u3000`。！？；，、：]+"
 )
 _MASK_PATTERN = re.compile("\\ue000\\d+\\ue001")
+
+
+def normalize_chunk_target(value: object) -> int:
+    """Return a safe target length for user-configured QQ chunks."""
+
+    try:
+        target = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return DEFAULT_CHUNK_TARGET_CHARS
+    if not MIN_CHUNK_TARGET_CHARS <= target <= MAX_CHUNK_TARGET_CHARS:
+        return DEFAULT_CHUNK_TARGET_CHARS
+    return target
+
+
+def chunk_length_bounds(target_chars: object) -> tuple[int, int]:
+    """Calculate the soft semantic range around a target character count."""
+
+    target = normalize_chunk_target(target_chars)
+    minimum = max(1, math.floor(target * 0.7))
+    maximum = max(minimum, math.ceil(target * 1.3))
+    return minimum, maximum
 
 
 def _mask_protected(text: str) -> tuple[str, list[str]]:
@@ -75,13 +98,13 @@ def _split_sentences(masked: str) -> list[str]:
     return [piece for piece in pieces if piece.strip()]
 
 
-def _split_secondary(masked: str, protected: list[str]) -> list[str]:
+def _split_secondary(masked: str, protected: list[str], minimum: int) -> list[str]:
     pieces: list[str] = []
     current: list[str] = []
     for atom, is_protected in _atoms(masked):
         current.append(atom)
         if not is_protected and (atom in _SECONDARY_PUNCTUATION or atom.isspace()):
-            if _visible_length("".join(current), protected) >= TARGET_MIN_CHARS:
+            if _visible_length("".join(current), protected) >= minimum:
                 pieces.append("".join(current))
                 current = []
     if current:
@@ -89,18 +112,18 @@ def _split_secondary(masked: str, protected: list[str]) -> list[str]:
     return pieces or [masked]
 
 
-def _hard_split(masked: str, protected: list[str]) -> list[str]:
+def _hard_split(masked: str, protected: list[str], maximum: int) -> list[str]:
     pieces: list[str] = []
     current: list[str] = []
     for atom, is_protected in _atoms(masked):
-        if is_protected and _visible_length(atom, protected) > TARGET_MAX_CHARS:
+        if is_protected and _visible_length(atom, protected) > maximum:
             if current:
                 pieces.append("".join(current))
                 current = []
             pieces.append(atom)
             continue
         candidate = "".join(current) + atom
-        if current and _visible_length(candidate, protected) > TARGET_MAX_CHARS:
+        if current and _visible_length(candidate, protected) > maximum:
             pieces.append("".join(current))
             current = [atom]
         else:
@@ -110,17 +133,19 @@ def _hard_split(masked: str, protected: list[str]) -> list[str]:
     return pieces
 
 
-def _merge_short_pieces(pieces: list[str], protected: list[str]) -> list[str]:
+def _merge_short_pieces(
+    pieces: list[str], protected: list[str], minimum: int, maximum: int
+) -> list[str]:
     merged: list[str] = []
     for piece in pieces:
         if not piece.strip():
             continue
-        if merged and _visible_length(merged[-1] + piece, protected) <= TARGET_MAX_CHARS:
+        if merged and _visible_length(merged[-1] + piece, protected) <= maximum:
             merged[-1] += piece
         else:
             merged.append(piece)
-    if len(merged) > 1 and _visible_length(merged[0], protected) < TARGET_MIN_CHARS:
-        if _visible_length(merged[0] + merged[1], protected) <= TARGET_MAX_CHARS:
+    if len(merged) > 1 and _visible_length(merged[0], protected) < minimum:
+        if _visible_length(merged[0] + merged[1], protected) <= maximum:
             merged[1] = merged[0] + merged[1]
             merged.pop(0)
     return merged
@@ -139,28 +164,29 @@ def _limit_chunks(pieces: list[str], protected: list[str]) -> list[str]:
     return grouped
 
 
-def split_qq_reply(text: str) -> list[str]:
+def split_qq_reply(text: str, target_chars: object = DEFAULT_CHUNK_TARGET_CHARS) -> list[str]:
     """Split a reviewed model reply into a small number of natural QQ messages."""
 
     normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not normalized:
         return []
+    minimum, maximum = chunk_length_bounds(target_chars)
     masked, protected = _mask_protected(normalized)
-    if _visible_length(masked, protected) <= TARGET_MAX_CHARS:
+    if _visible_length(masked, protected) <= maximum:
         return [normalized]
 
     pieces: list[str] = []
     for sentence in _split_sentences(masked):
-        if _visible_length(sentence, protected) <= TARGET_MAX_CHARS:
+        if _visible_length(sentence, protected) <= maximum:
             pieces.append(sentence)
             continue
-        for secondary in _split_secondary(sentence, protected):
-            if _visible_length(secondary, protected) <= TARGET_MAX_CHARS:
+        for secondary in _split_secondary(sentence, protected, minimum):
+            if _visible_length(secondary, protected) <= maximum:
                 pieces.append(secondary)
             else:
-                pieces.extend(_hard_split(secondary, protected))
+                pieces.extend(_hard_split(secondary, protected, maximum))
 
-    pieces = _merge_short_pieces(pieces, protected)
+    pieces = _merge_short_pieces(pieces, protected, minimum, maximum)
     pieces = _limit_chunks(pieces, protected)
     # Keep whitespace at internal chunk boundaries.  Trimming every chunk would
     # silently concatenate words (for example, ``"hello world"`` becoming

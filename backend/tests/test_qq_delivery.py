@@ -8,7 +8,7 @@ from app.api.onebot import OneBotManager
 from app.db.models import AppSetting, Conversation, Message
 from app.db.session import SessionLocal
 from app.main import app
-from app.services.qq_delivery import split_qq_reply
+from app.services.qq_delivery import chunk_length_bounds, split_qq_reply
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
@@ -24,7 +24,16 @@ def test_split_qq_reply_keeps_short_text_and_semantic_order() -> None:
 
     assert len(chunks) > 1
     assert "".join(chunks) == text
-    assert all(10 <= len(chunk) <= 50 for chunk in chunks)
+    minimum, maximum = chunk_length_bounds(20)
+    assert all(len(chunk) <= maximum for chunk in chunks)
+    assert any(len(chunk) >= minimum for chunk in chunks)
+
+
+def test_chunk_length_bounds_follow_configured_target() -> None:
+    assert chunk_length_bounds(10) == (7, 13)
+    assert chunk_length_bounds(20) == (14, 26)
+    assert chunk_length_bounds(4) == (14, 26)
+    assert chunk_length_bounds(101) == (14, 26)
 
 
 def test_split_qq_reply_keeps_urls_and_code_blocks_atomic() -> None:
@@ -63,31 +72,65 @@ def test_split_qq_reply_preserves_internal_english_whitespace() -> None:
 
 def test_qq_reply_settings_default_and_persist() -> None:
     with SessionLocal.begin() as session:
-        setting = session.get(AppSetting, onebot_module.QQ_CHUNKED_OUTPUT_SETTING_KEY)
-        if setting is not None:
-            session.delete(setting)
+        for key in (
+            onebot_module.QQ_CHUNKED_OUTPUT_SETTING_KEY,
+            onebot_module.QQ_CHUNK_TARGET_SETTING_KEY,
+        ):
+            setting = session.get(AppSetting, key)
+            if setting is not None:
+                session.delete(setting)
 
     try:
         with TestClient(app) as client:
             response = client.get("/api/v1/onebot/reply-settings")
             assert response.status_code == 200
-            assert response.json() == {"chunked_output_enabled": True}
+            assert response.json() == {
+                "chunked_output_enabled": True,
+                "chunk_target_chars": 20,
+                "chunk_min_chars": 14,
+                "chunk_max_chars": 26,
+            }
 
             response = client.put(
                 "/api/v1/onebot/reply-settings",
                 json={"chunked_output_enabled": False},
             )
             assert response.status_code == 200
-            assert response.json() == {"chunked_output_enabled": False}
+            assert response.json() == {
+                "chunked_output_enabled": False,
+                "chunk_target_chars": 20,
+                "chunk_min_chars": 14,
+                "chunk_max_chars": 26,
+            }
+
+            response = client.put(
+                "/api/v1/onebot/reply-settings",
+                json={"chunk_target_chars": 10},
+            )
+            assert response.status_code == 200
+            assert response.json()["chunk_target_chars"] == 10
+            assert response.json()["chunk_min_chars"] == 7
+            assert response.json()["chunk_max_chars"] == 13
+
+            response = client.put(
+                "/api/v1/onebot/reply-settings",
+                json={"chunk_target_chars": 101},
+            )
+            assert response.status_code == 422
 
             response = client.get("/api/v1/onebot/reply-settings")
             assert response.status_code == 200
-            assert response.json() == {"chunked_output_enabled": False}
+            assert response.json()["chunked_output_enabled"] is False
+            assert response.json()["chunk_target_chars"] == 10
     finally:
         with SessionLocal.begin() as session:
-            setting = session.get(AppSetting, onebot_module.QQ_CHUNKED_OUTPUT_SETTING_KEY)
-            if setting is not None:
-                session.delete(setting)
+            for key in (
+                onebot_module.QQ_CHUNKED_OUTPUT_SETTING_KEY,
+                onebot_module.QQ_CHUNK_TARGET_SETTING_KEY,
+            ):
+                setting = session.get(AppSetting, key)
+                if setting is not None:
+                    session.delete(setting)
 
 
 def test_onebot_sends_reviewed_reply_in_order_and_keeps_one_message(monkeypatch) -> None:
