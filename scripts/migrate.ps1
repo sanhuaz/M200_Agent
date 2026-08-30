@@ -22,35 +22,68 @@ function Backup-RuntimeData([string]$Label) {
             Copy-Item -LiteralPath $source -Destination $destination -Recurse -Force | Out-Null
         }
     }
+    @{
+        format_version = 1
+        kind = "automatic_migration"
+        created_at = (Get-Date).ToUniversalTime().ToString("o")
+        label = $Label
+    } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backupRoot "backup.json") -Encoding utf8
     return $backupRoot
+}
+
+function Remove-ExpiredAutomaticBackups([int]$Keep = 3) {
+    $backupBase = Join-Path $ProjectRoot "_v020_backups"
+    if (-not (Test-Path -LiteralPath $backupBase)) { return }
+    $automatic = @(
+        Get-ChildItem -LiteralPath $backupBase -Directory -Force | Where-Object {
+            $manifestPath = Join-Path $_.FullName "backup.json"
+            if (-not (Test-Path -LiteralPath $manifestPath)) { return $false }
+            try {
+                $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
+                return $manifest.kind -eq "automatic_migration"
+            } catch {
+                return $false
+            }
+        } | Sort-Object LastWriteTime -Descending
+    )
+    foreach ($directory in ($automatic | Select-Object -Skip $Keep)) {
+        $resolved = [System.IO.Path]::GetFullPath($directory.FullName)
+        $expectedParent = [System.IO.Path]::GetFullPath($backupBase)
+        if ((Split-Path -Parent $resolved) -ne $expectedParent) {
+            throw "自动备份路径越界，拒绝清理：$resolved"
+        }
+        Remove-Item -LiteralPath $resolved -Recurse -Force
+        Write-Host "已按保留策略清理自动迁移备份：$resolved"
+    }
 }
 
 if (-not (Test-Path -LiteralPath $PythonExe)) {
     throw "Python 不存在：$PythonExe"
 }
 
-$databaseLiteral = $DatabasePath.Replace("'", "''")
-$state = & $PythonExe -c "import sqlite3; p=r'$databaseLiteral'; c=sqlite3.connect(p); names={r[0] for r in c.execute('select name from sqlite_master')}; print('empty' if not names else 'legacy' if 'alembic_version' not in names else 'versioned'); c.close()"
+$planJson = & $PythonExe (Join-Path $PSScriptRoot "migration_plan.py") `
+    --database $DatabasePath --config (Join-Path $ProjectRoot "alembic.ini")
 if ($LASTEXITCODE -ne 0) { throw "无法读取数据库迁移状态" }
+$plan = $planJson | ConvertFrom-Json
+$backupCreated = $false
 
-if ($state -eq "legacy") {
+if ($plan.needs_stamp) {
     $backupRoot = Backup-RuntimeData "migration"
+    $backupCreated = $true
     & $PythonExe -m alembic stamp 0001_initial
     if ($LASTEXITCODE -ne 0) { throw "旧数据库基线标记失败，已保留备份：$backupRoot" }
     Write-Host "旧数据库已标记为 v0.1 基线，备份：$backupRoot"
 }
 
-if ($state -eq "versioned") {
-    $version = & $PythonExe -c "import sqlite3; c=sqlite3.connect(r'$databaseLiteral'); print(c.execute('select version_num from alembic_version').fetchone()[0]); c.close()"
-    if ($LASTEXITCODE -ne 0) { throw "无法读取当前迁移版本" }
-    if ($version -ne "0005_conversation_persona_fk") {
-        $backupRoot = Backup-RuntimeData "migration"
-        Write-Host "迁移前已备份运行数据：$backupRoot"
-    }
+if ($plan.needs_backup -and -not $plan.needs_stamp) {
+    $backupRoot = Backup-RuntimeData "migration"
+    $backupCreated = $true
+    Write-Host "迁移前已备份运行数据：$backupRoot"
 }
 
     & $PythonExe -m alembic upgrade head
     if ($LASTEXITCODE -ne 0) { throw "数据库迁移失败，后端不会启动" }
+    if ($backupCreated) { Remove-ExpiredAutomaticBackups }
     Write-Host "数据库迁移完成"
 } finally {
     Set-Location -LiteralPath $OriginalLocation
