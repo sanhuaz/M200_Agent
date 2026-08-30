@@ -11,9 +11,11 @@ import { normalizeTab, pathForTab, resolveRoute } from './features/navigation'
 import { LatestRequestGate } from './features/requestGate'
 import { API, api, streamChat } from './services/api'
 import type { AdminRow, HealthData, NapcatStatus } from './types/management'
+import type { Confirmation, TaskRow } from './types/tasks'
 
 const AdminPage = defineAsyncComponent(() => import('./pages/AdminPage.vue'))
 const StatusPage = defineAsyncComponent(() => import('./pages/StatusPage.vue'))
+const TasksPage = defineAsyncComponent(() => import('./pages/TasksPage.vue'))
 
 type Conversation = { id: string; title: string; platform: string; model_alias: string; persona_id?: string | null }
 type ReasoningEffort = 'low' | 'medium' | 'high' | null
@@ -73,8 +75,6 @@ type MemoryCenterRelationship = {
   updated_at: string
 }
 type MemoryCenterRow = MemoryCenterFact | MemoryCenterRelationship
-type TaskRow = { id: string; type: string; status: string; error?: string; result?: { path?: string; delivery_status?: string; artifact_deleted?: boolean } }
-type Confirmation = { token: string; action: string; payload: Record<string, unknown>; status: string; expires_at: string }
 type ExtensionRow = { id: string; kind: string; name: string; version: string; description: string; enabled: boolean; builtin: boolean; status: string; access_policy: string; error?: string }
 type PersonaCard = {
   identity: { role: string; setting?: string; background?: string; experience?: string }
@@ -2121,30 +2121,18 @@ onUnmounted(() => {
         </template>
 
         <template v-else-if="activeTab === 'tasks'">
-          <section class="panel stack">
-            <div class="panel-heading">
-              <div><span class="section-kicker">授权记录</span><h2>确认操作</h2></div>
-              <div class="heading-actions"><span class="count-badge">{{ confirmations.length }}</span><el-button size="small" type="danger" plain :disabled="!selectedConfirmationTokens.length" @click="deleteSelectedConfirmations">删除选中</el-button></div>
-            </div>
-            <p class="hint">待确认请求可以直接删除使其失效；已处理记录也可批量清理。</p>
-            <el-checkbox-group v-model="selectedConfirmationTokens" class="record-list">
-              <div v-for="item in confirmations" :key="item.token" class="result record-row">
-                <el-checkbox :label="item.token"><code>{{ item.token }}</code></el-checkbox>
-                <span>{{ item.action }}</span>
-                <el-tag size="small" :type="item.status === 'pending' ? 'warning' : 'info'">{{ item.status === 'pending' ? '待确认' : item.status }}</el-tag>
-                <div><el-button v-if="item.status === 'pending'" size="small" type="primary" @click="resolve(item.token, true)">确认</el-button><el-button v-if="item.status === 'pending'" size="small" @click="resolve(item.token, false)">拒绝</el-button></div>
-              </div>
-            </el-checkbox-group>
-            <div v-if="!confirmations.length" class="empty-copy compact">当前没有确认记录。</div>
-          </section>
-          <section class="panel stack">
-            <div class="panel-heading">
-              <div><span class="section-kicker">后台任务</span><h2>任务列表</h2></div>
-              <div class="heading-actions"><span class="count-badge">{{ tasks.length }}</span><el-button size="small" type="danger" plain :disabled="!selectedTaskIds.length" @click="deleteSelectedTasks">删除选中</el-button></div>
-            </div>
-            <p class="hint">仅成功、失败、已取消任务可删除；排队中和运行中任务必须先完成或取消。本地下载文件不会因删除记录而删除。</p>
-            <div class="table-wrap"><el-table :data="tasks" @selection-change="taskSelectionChange"><el-table-column type="selection" width="48" :selectable="taskSelectable" /><el-table-column prop="id" label="ID" min-width="210" /><el-table-column prop="type" label="类型" min-width="150" /><el-table-column prop="status" label="状态" width="110" /><el-table-column prop="result.delivery_status" label="QQ 发送" width="120" /><el-table-column prop="error" label="错误" min-width="200" /><el-table-column label="操作" width="250"><template #default="scope"><el-button v-if="['queued', 'running'].includes(scope.row.status)" size="small" @click="cancelTask(scope.row.id)">取消</el-button><el-link v-if="scope.row.status === 'succeeded' && !scope.row.result?.artifact_deleted" :href="`${API}/tasks/${scope.row.id}/artifact`" target="_blank" type="primary">下载产物</el-link><el-button v-if="scope.row.status === 'succeeded' && scope.row.type === 'manga_download' && !scope.row.result?.artifact_deleted" size="small" type="danger" plain @click="deleteTaskArtifact(scope.row)">删除本地文件</el-button><el-tag v-if="scope.row.result?.artifact_deleted" type="info">已删除</el-tag></template></el-table-column></el-table></div>
-          </section>
+          <TasksPage
+            v-model:selected-confirmation-tokens="selectedConfirmationTokens"
+            :confirmations="confirmations"
+            :tasks="tasks"
+            :selected-task-ids="selectedTaskIds"
+            @resolve="resolve"
+            @delete-confirmations="deleteSelectedConfirmations"
+            @task-selection-change="taskSelectionChange"
+            @delete-tasks="deleteSelectedTasks"
+            @cancel-task="cancelTask"
+            @delete-task-artifact="deleteTaskArtifact"
+          />
         </template>
 
         <template v-else-if="activeTab === 'logs'">
