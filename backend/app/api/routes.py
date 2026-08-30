@@ -53,6 +53,7 @@ from app.services.companion import (
     get_or_create_preference,
     parse_emotion_labels_strict,
     preference_dict,
+    relationship_content_items,
     relationship_dict,
     safety_event_dict,
 )
@@ -1499,6 +1500,9 @@ def list_memory_center(
                     boundaries: object = json.loads(item.boundaries or "{}")
                 except json.JSONDecodeError:
                     boundaries = {}
+                content_items = relationship_content_items(
+                    item.nickname, item.shared_summary, boundaries
+                )
                 persona_name = persona_names.get(item.persona_id or "", item.persona_key)
                 if normalized_keyword:
                     searchable = " ".join(
@@ -1508,6 +1512,10 @@ def list_memory_center(
                             item.nickname or "",
                             item.shared_summary or "",
                             json.dumps(boundaries, ensure_ascii=False),
+                            " ".join(
+                                f"{entry['label']} {entry['content']}"
+                                for entry in content_items
+                            ),
                         )
                     ).casefold()
                     if normalized_keyword not in searchable:
@@ -1526,6 +1534,7 @@ def list_memory_center(
                         "nickname": item.nickname,
                         "shared_summary": item.shared_summary,
                         "boundaries": boundaries,
+                        "content_items": content_items,
                         "version": item.version,
                         "status": "active",
                         "created_at": item.created_at.isoformat(),

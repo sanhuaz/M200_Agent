@@ -153,6 +153,8 @@ h3 { margin: 0; }
 .el-table th.el-table__cell { color: var(--text-soft); font-size: 12px; font-weight: 800; }
 .table-primary { display: grid; gap: 3px; }
 .table-primary small { overflow: hidden; color: var(--text-soft); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.memory-content-list { display: grid; gap: 3px; }
+.memory-content-list small { overflow: visible; text-overflow: clip; white-space: normal; }
 
 .two-column { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
 .persona-layout { align-items: start; }

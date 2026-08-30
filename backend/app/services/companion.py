@@ -1065,6 +1065,51 @@ def get_relationship(
     return item
 
 
+def relationship_content_items(
+    nickname: str | None,
+    shared_summary: str | None,
+    boundaries: object,
+) -> list[dict[str, str]]:
+    """Normalize relationship fields into the same categories used by the UI and prompt."""
+
+    items: list[dict[str, str]] = []
+
+    def add(kind: str, label: str, value: object) -> None:
+        if value is None:
+            return
+        if isinstance(value, str):
+            content = re.sub(r"\s+", " ", value).strip()
+        elif isinstance(value, (dict, list)):
+            try:
+                content = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            except (TypeError, ValueError):
+                content = str(value).strip()
+        else:
+            content = str(value).strip()
+        if content:
+            items.append({"kind": kind, "label": label, "content": content})
+
+    def add_many(kind: str, label: str, value: object) -> None:
+        if isinstance(value, list):
+            for entry in value:
+                add(kind, label, entry)
+        else:
+            add(kind, label, value)
+
+    if isinstance(boundaries, dict):
+        add_many("preference", "偏好", boundaries.get("preferences"))
+        add_many("boundary", "边界", boundaries.get("items"))
+        for key, value in boundaries.items():
+            if key in {"preferences", "items"}:
+                continue
+            add_many("detail", f"其他资料（{key}）", value)
+    else:
+        add("detail", "其他资料", boundaries)
+    add("nickname", "称呼", nickname)
+    add("shared_event", "共同经历", shared_summary)
+    return items
+
+
 def relationship_dict(
     item: RelationshipProfile | None, scope_id: str, persona_id: str | None
 ) -> dict[str, object]:
@@ -1076,6 +1121,7 @@ def relationship_dict(
             "nickname": None,
             "shared_summary": "",
             "boundaries": {},
+            "content_items": [],
             "version": 0,
         }
     try:
@@ -1090,6 +1136,7 @@ def relationship_dict(
         "nickname": item.nickname,
         "shared_summary": item.shared_summary,
         "boundaries": boundaries,
+        "content_items": relationship_content_items(item.nickname, item.shared_summary, boundaries),
         "version": item.version,
         "created_at": item.created_at.isoformat(),
         "updated_at": item.updated_at.isoformat(),
@@ -1103,13 +1150,8 @@ def relationship_context(item: RelationshipProfile | None) -> str:
         boundaries = json.loads(item.boundaries or "{}")
     except json.JSONDecodeError:
         boundaries = {}
-    parts = []
-    if item.nickname:
-        parts.append(f"称呼：{item.nickname}")
-    if item.shared_summary:
-        parts.append(f"共同经历：{item.shared_summary}")
-    if boundaries:
-        parts.append(f"边界：{json.dumps(boundaries, ensure_ascii=False)}")
+    content_items = relationship_content_items(item.nickname, item.shared_summary, boundaries)
+    parts = [f"{entry['label']}：{entry['content']}" for entry in content_items]
     return "- " + ("；".join(parts) if parts else "暂无已授权的角色关系资料")
 
 

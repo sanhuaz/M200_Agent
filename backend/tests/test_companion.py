@@ -33,6 +33,7 @@ from app.services.companion import (
     output_safety_ok,
     parse_emotion_labels,
     parse_emotion_labels_strict,
+    relationship_context,
     resolve_analyzer_alias,
     safety_precheck,
 )
@@ -595,6 +596,10 @@ def test_relationship_extraction_filters_sensitive_values(monkeypatch: pytest.Mo
         assert "喜欢散步" in json.loads(item.boundaries)["preferences"]
         assert "API key=secret" not in json.dumps(json.loads(item.boundaries), ensure_ascii=False)
         assert "一起看过展览" in item.shared_summary
+        context_text = relationship_context(item)
+        assert "偏好：喜欢散步" in context_text
+        assert "边界：不想被催着给建议" in context_text
+        assert "共同经历：一起看过展览" in context_text
 
 
 def test_analyzer_alias_falls_back_to_session_model(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -6,6 +6,7 @@ from uuid import uuid4
 from app.db.models import AdminIdentity, Memory, Persona, RelationshipProfile
 from app.db.session import SessionLocal
 from app.main import app
+from app.services.companion import relationship_content_items
 from app.services.memories import memory_collection_name
 from app.services.persona_store import get_persona_store
 from app.services.personas import PersonaCard
@@ -14,6 +15,18 @@ from fastapi.testclient import TestClient
 
 def _token() -> str:
     return f"memory-center-{uuid4().hex}"
+
+
+def test_relationship_content_items_preserve_preferences_and_custom_fields() -> None:
+    assert relationship_content_items(
+        "",
+        "",
+        {"preferences": ["不使用emoji表情"], "items": ["不催促"], "tone": "简短"},
+    ) == [
+        {"kind": "preference", "label": "偏好", "content": "不使用emoji表情"},
+        {"kind": "boundary", "label": "边界", "content": "不催促"},
+        {"kind": "detail", "label": "其他资料（tone）", "content": "简短"},
+    ]
 
 
 def test_memory_center_unifies_filters_and_hides_non_owner_relationships() -> None:
@@ -84,6 +97,11 @@ def test_memory_center_unifies_filters_and_hides_non_owner_relationships() -> No
             relationship = next(row for row in rows if row["memory_type"] == "relationship")
             assert relationship["persona_name"] == persona.name
             assert relationship["boundaries"] == {"items": ["不催促"]}
+            assert relationship["content_items"] == [
+                {"kind": "boundary", "label": "边界", "content": "不催促"},
+                {"kind": "nickname", "label": "称呼", "content": f"称呼-{token}"},
+                {"kind": "shared_event", "label": "共同经历", "content": f"一起经历 {token}"},
+            ]
 
             group_rows = client.get(
                 f"/api/v1/memory-center?memory_type=fact&scope_type=group&scope_id={group_id}"

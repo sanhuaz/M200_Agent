@@ -57,6 +57,7 @@ type MemoryCenterRelationship = {
   nickname: string | null
   shared_summary: string
   boundaries: Record<string, unknown>
+  content_items: Array<{ kind: 'preference' | 'boundary' | 'nickname' | 'shared_event' | 'detail'; label: string; content: string }>
   version: number
   status: 'active'
   source_message_id?: null
@@ -103,6 +104,7 @@ type RelationshipRow = {
   nickname: string | null
   shared_summary: string
   boundaries: Record<string, unknown>
+  content_items?: Array<{ kind: 'preference' | 'boundary' | 'nickname' | 'shared_event' | 'detail'; label: string; content: string }>
   version: number
   updated_at?: string
 }
@@ -982,7 +984,7 @@ function scheduleDocumentRefresh() {
   }, DOCUMENT_REFRESH_INTERVAL_MS)
 }
 
-async function loadMemoryCenter() {
+function memoryCenterQuery() {
   const params = new URLSearchParams({
     memory_type: memoryType.value,
     scope_type: memoryScope.value,
@@ -991,13 +993,25 @@ async function loadMemoryCenter() {
   if (memoryScopeId.value.trim()) params.set('scope_id', memoryScopeId.value.trim())
   if (memoryPersonaKey.value && memoryType.value === 'relationship') params.set('persona_key', memoryPersonaKey.value)
   if (memoryKeyword.value.trim()) params.set('keyword', memoryKeyword.value.trim())
+  return params
+}
+
+async function loadMemoryCenter() {
+  const params = memoryCenterQuery()
+  const queryKey = params.toString()
+  const requestId = ++memoryCenterRequestSeq
+  memories.value = []
   memoryCenterLoading.value = true
   try {
-    memories.value = await api<MemoryCenterRow[]>(`/memory-center?${params.toString()}`)
+    const data = await api<MemoryCenterRow[]>(`/memory-center?${queryKey}`)
+    if (requestId !== memoryCenterRequestSeq || memoryCenterQuery().toString() !== queryKey) return
+    memories.value = data
   } catch (error) {
-    ElMessage.error(`长期记忆加载失败：${(error as Error).message}`)
+    if (requestId === memoryCenterRequestSeq && memoryCenterQuery().toString() === queryKey) {
+      ElMessage.error(`长期记忆加载失败：${(error as Error).message}`)
+    }
   } finally {
-    memoryCenterLoading.value = false
+    if (requestId === memoryCenterRequestSeq) memoryCenterLoading.value = false
   }
 }
 
@@ -1580,6 +1594,12 @@ function memoryTypeLabel(item: MemoryCenterRow) {
   return item.memory_type === 'fact' ? '普通事实' : '陪伴关系'
 }
 
+function changeMemoryType(value: string | number) {
+  memoryType.value = value === 'relationship' ? 'relationship' : value === 'fact' ? 'fact' : 'all'
+  if (memoryType.value !== 'relationship') memoryPersonaKey.value = ''
+  void loadMemoryCenter()
+}
+
 function memoryScopeLabel(item: MemoryCenterRow) {
   if (item.scope_type === 'global') return '全局'
   if (item.scope_type === 'group') return `群组 · ${item.scope_id || '未知'}`
@@ -1587,7 +1607,11 @@ function memoryScopeLabel(item: MemoryCenterRow) {
 }
 
 function memoryRelationshipBoundaryCount(item: MemoryCenterRelationship) {
-  return Object.keys(item.boundaries || {}).length
+  return (item.content_items || []).filter((content) => content.kind === 'boundary').length
+}
+
+function memoryRelationshipContentItems(item: MemoryCenterRelationship) {
+  return item.content_items || []
 }
 
 function editMemoryRelationship(item: MemoryCenterRelationship) {
@@ -2052,13 +2076,13 @@ onUnmounted(() => {
         </template>
 
         <template v-else-if="activeTab === 'memory'">
-          <section class="panel stack">
+          <section class="panel stack" v-loading="memoryCenterLoading">
             <div class="panel-heading">
               <div><span class="section-kicker">统一长期记忆中心</span><h2>长期记忆</h2></div>
-              <el-button v-if="memoryType !== 'fact'" type="primary" :disabled="!companionOwners.length" @click="newMemoryRelationship">添加陪伴关系</el-button>
+              <el-button v-if="memoryType !== 'fact'" type="primary" :disabled="memoryCenterLoading || !companionOwners.length" @click="newMemoryRelationship">添加陪伴关系</el-button>
             </div>
             <div class="form-row memory-center-filters">
-              <el-select v-model="memoryType" @change="loadMemoryCenter"><el-option label="全部记忆" value="all" /><el-option label="普通事实" value="fact" /><el-option label="陪伴关系" value="relationship" /></el-select>
+              <el-select v-model="memoryType" @change="changeMemoryType"><el-option label="全部记忆" value="all" /><el-option label="普通事实" value="fact" /><el-option label="陪伴关系" value="relationship" /></el-select>
               <el-select v-model="memoryScope" @change="loadMemoryCenter"><el-option label="全部作用域" value="all" /><el-option label="全局" value="global" /><el-option label="用户" value="user" /><el-option label="群组" value="group" /></el-select>
               <el-input v-model="memoryScopeId" placeholder="用户 / 群组 ID（可选）" @change="loadMemoryCenter" />
               <el-select v-if="memoryType === 'relationship'" v-model="memoryPersonaKey" clearable placeholder="全部人格" @change="loadMemoryCenter"><el-option v-for="item in companionPersonas" :key="item.id" :label="item.name" :value="item.id" /></el-select>
@@ -2072,13 +2096,13 @@ onUnmounted(() => {
                 <el-table-column label="类型" width="120"><template #default="scope"><el-tag :type="scope.row.memory_type === 'fact' ? 'info' : 'success'">{{ memoryTypeLabel(scope.row) }}</el-tag></template></el-table-column>
                 <el-table-column label="作用域" min-width="170"><template #default="scope">{{ memoryScopeLabel(scope.row) }}</template></el-table-column>
                 <el-table-column label="人格" min-width="130"><template #default="scope"><span v-if="scope.row.memory_type === 'relationship'">{{ scope.row.persona_name }}</span><span v-else>—</span></template></el-table-column>
-                <el-table-column label="内容" min-width="360"><template #default="scope"><template v-if="scope.row.memory_type === 'fact'"><div class="table-primary"><strong>{{ scope.row.fact_key }}</strong><small>{{ scope.row.content }}</small></div></template><template v-else><div class="table-primary"><strong>{{ scope.row.nickname || '未设置称呼' }}</strong><small>{{ scope.row.shared_summary || '暂无共同经历摘要' }} · 边界 {{ memoryRelationshipBoundaryCount(scope.row) }} 项</small></div></template></template></el-table-column>
+                <el-table-column label="内容" min-width="360"><template #default="scope"><template v-if="scope.row.memory_type === 'fact'"><div class="table-primary"><strong>{{ scope.row.fact_key }}</strong><small>{{ scope.row.content }}</small></div></template><template v-else><div class="table-primary"><div v-if="memoryRelationshipContentItems(scope.row).length" class="memory-content-list"><small v-for="content in memoryRelationshipContentItems(scope.row)" :key="`${content.kind}-${content.label}-${content.content}`"><strong>{{ content.label }}：</strong>{{ content.content }}</small></div><small v-else>暂无关系记忆内容</small><small v-if="memoryRelationshipBoundaryCount(scope.row)">边界 {{ memoryRelationshipBoundaryCount(scope.row) }} 项</small></div></template></template></el-table-column>
                 <el-table-column label="状态" width="100"><template #default="scope"><el-tag :type="scope.row.status === 'active' ? 'success' : 'warning'">{{ scope.row.status === 'active' ? '有效' : '已归档' }}</el-tag></template></el-table-column>
                 <el-table-column label="更新时间" min-width="165"><template #default="scope">{{ scope.row.updated_at }}</template></el-table-column>
                 <el-table-column label="操作" width="250" fixed="right"><template #default="scope"><template v-if="scope.row.memory_type === 'fact'"><el-button size="small" @click="editMemory(scope.row)">编辑</el-button><el-button v-if="scope.row.status === 'active'" size="small" @click="archiveMemory(scope.row.id)">归档</el-button><el-button v-else size="small" @click="restoreMemory(scope.row.id)">恢复</el-button><el-button size="small" type="danger" plain @click="deleteMemory(scope.row.id)">删除</el-button></template><template v-else><el-button size="small" @click="editMemoryRelationship(scope.row)">编辑</el-button><el-button size="small" type="danger" plain @click="deleteMemoryRelationship(scope.row)">删除</el-button></template></template></el-table-column>
               </el-table>
             </div>
-            <el-empty v-else description="当前没有符合条件的记忆" />
+            <el-empty v-else-if="!memoryCenterLoading" description="当前没有符合条件的记忆" />
           </section>
           <el-dialog v-model="memoryRelationshipDialog" title="编辑陪伴关系资料" width="620px">
             <div v-if="memoryRelationshipDraft" class="stack">
@@ -2088,7 +2112,7 @@ onUnmounted(() => {
               </div>
               <label class="field-control"><span>称呼</span><el-input v-model="memoryRelationshipDraft.nickname" placeholder="用户希望的称呼" /></label>
               <label class="field-control"><span>共同经历</span><el-input v-model="memoryRelationshipDraft.shared_summary" type="textarea" :rows="4" maxlength="4000" /></label>
-              <label class="field-control"><span>边界（JSON）</span><el-input v-model="memoryRelationshipBoundaryText" type="textarea" :rows="5" placeholder='例如：{"items":["不想被催着给建议"]}' /></label>
+              <label class="field-control"><span>偏好与边界（JSON）</span><el-input v-model="memoryRelationshipBoundaryText" type="textarea" :rows="5" placeholder='例如：{"items":["不想被催着给建议"]}' /></label>
             </div>
             <template #footer><el-button @click="memoryRelationshipDialog = false">取消</el-button><el-button type="primary" :loading="memoryRelationshipSaving" @click="saveMemoryRelationship">保存</el-button></template>
           </el-dialog>
