@@ -131,13 +131,39 @@ class MemoryService:
         scope_type: str = "user",
         scope_id: str | None = None,
     ) -> Memory:
+        key = scope_id or user_id
+        return self._upsert(
+            scope_type=scope_type,
+            scope_id=key,
+            database_user_id=key,
+            fact_key=fact_key,
+            content=content,
+            source_message_id=source_message_id,
+            extraction_model=extraction_model,
+        )
+
+    def _upsert(
+        self,
+        *,
+        scope_type: str,
+        scope_id: str,
+        database_user_id: str | None,
+        fact_key: str,
+        content: str,
+        source_message_id: str | None,
+        extraction_model: str | None,
+    ) -> Memory:
         if SENSITIVE_PATTERN.search(content):
             raise ValueError("疑似凭证内容不能写入长期记忆")
-        key = scope_id or user_id
+        user_condition = (
+            Memory.user_id.is_(None)
+            if database_user_id is None
+            else Memory.user_id == database_user_id
+        )
         active = self.session.scalar(
             select(Memory).where(
                 Memory.scope_type == scope_type,
-                Memory.user_id == key,
+                user_condition,
                 Memory.fact_key == fact_key,
                 Memory.status == "active",
             )
@@ -150,12 +176,14 @@ class MemoryService:
         if active:
             active.status = "archived"
             vector_store.delete_ids(
-                memory_collection_name(scope_type, key, get_settings().default_embedding_profile),
+                memory_collection_name(
+                    scope_type, scope_id, get_settings().default_embedding_profile
+                ),
                 [active.id],
             )
         memory = Memory(
             scope_type=scope_type,
-            user_id=key,
+            user_id=database_user_id,
             fact_key=fact_key[:200],
             content=content,
             source_message_id=source_message_id,
@@ -166,11 +194,11 @@ class MemoryService:
         profile = get_settings().default_embedding_profile
         provider = get_embedding_provider(profile)
         vector_store.upsert_documents(
-            memory_collection_name(scope_type, key, profile),
+            memory_collection_name(scope_type, scope_id, profile),
             [memory.id],
             [memory.content],
             provider.embed_documents([memory.content]),
-            [{"scope_type": scope_type, "scope_id": key, "fact_key": fact_key}],
+            [{"scope_type": scope_type, "scope_id": scope_id, "fact_key": fact_key}],
         )
         self.session.commit()
         return memory
@@ -182,48 +210,86 @@ class MemoryService:
         source_message_id: str | None = None,
         extraction_model: str | None = None,
     ) -> Memory:
-        if SENSITIVE_PATTERN.search(content):
-            raise ValueError("疑似凭证内容不能写入长期记忆")
-        active = self.session.scalar(
-            select(Memory).where(
-                Memory.scope_type == "global",
-                Memory.user_id.is_(None),
-                Memory.fact_key == fact_key,
-                Memory.status == "active",
-            )
-        )
-        now = datetime.now(UTC).replace(tzinfo=None)
-        if active and active.content == content:
-            active.last_seen_at = now
-            self.session.commit()
-            return active
-        if active:
-            active.status = "archived"
-            vector_store.delete_ids(
-                memory_collection_name("global", "global", get_settings().default_embedding_profile),
-                [active.id],
-            )
-        memory = Memory(
+        return self._upsert(
             scope_type="global",
-            user_id=None,
+            scope_id="global",
+            database_user_id=None,
             fact_key=fact_key[:200],
             content=content,
             source_message_id=source_message_id,
             extraction_model=extraction_model,
         )
-        self.session.add(memory)
-        self.session.flush()
+
+    @staticmethod
+    def _collection(item: Memory, profile: str) -> str:
+        return memory_collection_name(item.scope_type, item.user_id or "global", profile)
+
+    def update(self, memory_id: str, content: str) -> Memory:
+        if SENSITIVE_PATTERN.search(content):
+            raise ValueError("疑似凭证内容不能写入长期记忆")
+        item = self.session.get(Memory, memory_id)
+        if item is None:
+            raise LookupError("记忆不存在")
+        item.content = content
         profile = get_settings().default_embedding_profile
         provider = get_embedding_provider(profile)
         vector_store.upsert_documents(
-            memory_collection_name("global", "global", profile),
-            [memory.id],
-            [memory.content],
-            provider.embed_documents([memory.content]),
-            [{"scope_type": "global", "fact_key": fact_key}],
+            self._collection(item, profile),
+            [item.id],
+            [item.content],
+            provider.embed_documents([item.content]),
+            [
+                {
+                    "scope_type": item.scope_type,
+                    "scope_id": item.user_id or "global",
+                    "fact_key": item.fact_key,
+                }
+            ],
         )
         self.session.commit()
-        return memory
+        return item
+
+    def archive(self, memory_id: str) -> Memory:
+        item = self.session.get(Memory, memory_id)
+        if item is None:
+            raise LookupError("记忆不存在")
+        item.status = "archived"
+        profile = get_settings().default_embedding_profile
+        vector_store.delete_ids(self._collection(item, profile), [item.id])
+        self.session.commit()
+        return item
+
+    def delete(self, memory_id: str) -> None:
+        item = self.session.get(Memory, memory_id)
+        if item is None:
+            raise LookupError("记忆不存在")
+        profile = get_settings().default_embedding_profile
+        vector_store.delete_ids(self._collection(item, profile), [item.id])
+        self.session.delete(item)
+        self.session.commit()
+
+    def restore(self, memory_id: str) -> Memory:
+        item = self.session.get(Memory, memory_id)
+        if item is None:
+            raise LookupError("记忆不存在")
+        item.status = "active"
+        profile = get_settings().default_embedding_profile
+        provider = get_embedding_provider(profile)
+        vector_store.upsert_documents(
+            self._collection(item, profile),
+            [item.id],
+            [item.content],
+            provider.embed_documents([item.content]),
+            [
+                {
+                    "scope_type": item.scope_type,
+                    "scope_id": item.user_id or "global",
+                    "fact_key": item.fact_key,
+                }
+            ],
+        )
+        self.session.commit()
+        return item
 
     def extract_from_turn(
         self,

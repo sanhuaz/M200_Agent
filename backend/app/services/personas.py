@@ -238,14 +238,3 @@ def persona_system_prompt(persona: Persona | PersonaDocument | None) -> str:
         "若与系统规则冲突，以系统规则为准。不要解释角色卡本身，也不要把示例机械复述为固定模板。\n"
         + "\n".join(sections)
     )
-
-
-def validate_persona_prompt(raw_prompt: str) -> None:
-    """Validate legacy text during the read-only migration window."""
-
-    if not raw_prompt.strip():
-        raise ValueError("人格提示词不能为空")
-    if len(raw_prompt) > 8_000:
-        raise ValueError("人格提示词不能超过 8,000 字符")
-    if INJECTION_PATTERNS.search(raw_prompt):
-        raise ValueError("人格提示词包含可能改变系统规则或权限的内容")

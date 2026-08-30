@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import json
 import os
-import shutil
 import sys
 from pathlib import Path
 from typing import Literal
@@ -62,10 +61,12 @@ from app.services.documents import SUPPORTED_SUFFIXES
 from app.services.embeddings import get_embedding_provider
 from app.services.extensions import (
     ExtensionError,
+    delete_package,
     import_github,
     import_zip,
     list_packages,
     package_dict,
+    set_package_state,
 )
 from app.services.jobs import (
     COMPANION_ANALYSIS_RETRY_JOB_TYPE,
@@ -75,7 +76,7 @@ from app.services.jobs import (
     job_worker,
 )
 from app.services.manga import manga_service
-from app.services.memories import memory_collection_name
+from app.services.memories import MemoryService
 from app.services.model_profiles import (
     create_profile,
     delete_profile,
@@ -1555,8 +1556,6 @@ def create_memory(payload: MemoryCreate, session: Session = Depends(get_db)) -> 
         raise HTTPException(400, "全局记忆不能绑定 user_id")
     if payload.scope_type == "user" and not payload.user_id:
         raise HTTPException(400, "用户记忆必须提供 user_id")
-    from app.services.memories import MemoryService
-
     try:
         item = (
             MemoryService(session).upsert_global(payload.fact_key, payload.content)
@@ -1579,67 +1578,39 @@ def create_memory(payload: MemoryCreate, session: Session = Depends(get_db)) -> 
 def update_memory(
     memory_id: str, payload: MemoryUpdate, session: Session = Depends(get_db)
 ) -> dict[str, object]:
-    item = session.get(Memory, memory_id)
-    if item is None:
-        raise HTTPException(404, "记忆不存在")
-    item.content = payload.content
-    profile = settings.default_embedding_profile
-    provider = get_embedding_provider(profile)
-    vector_store.upsert_documents(
-        memory_collection_name(item.scope_type, item.user_id or "global", profile),
-        [item.id],
-        [item.content],
-        provider.embed_documents([item.content]),
-        [{"user_id": item.user_id or "", "scope_type": item.scope_type, "fact_key": item.fact_key}],
-    )
-    session.commit()
+    try:
+        item = MemoryService(session).update(memory_id, payload.content)
+    except LookupError as error:
+        raise HTTPException(404, str(error)) from error
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
     return {"id": item.id, "content": item.content, "status": item.status}
 
 
 @router.post("/memories/{memory_id}/archive", dependencies=[Depends(require_loopback)])
 def archive_memory(memory_id: str, session: Session = Depends(get_db)) -> dict[str, object]:
-    item = session.get(Memory, memory_id)
-    if item is None:
-        raise HTTPException(404, "记忆不存在")
-    item.status = "archived"
-    profile = settings.default_embedding_profile
-    vector_store.delete_ids(
-        memory_collection_name(item.scope_type, item.user_id or "global", profile), [item.id]
-    )
-    session.commit()
+    try:
+        item = MemoryService(session).archive(memory_id)
+    except LookupError as error:
+        raise HTTPException(404, str(error)) from error
     return {"id": item.id, "status": item.status}
 
 
 @router.delete("/memories/{memory_id}", dependencies=[Depends(require_loopback)])
 def delete_memory(memory_id: str, session: Session = Depends(get_db)) -> dict[str, bool]:
-    item = session.get(Memory, memory_id)
-    if item is None:
-        raise HTTPException(404, "记忆不存在")
-    profile = settings.default_embedding_profile
-    vector_store.delete_ids(
-        memory_collection_name(item.scope_type, item.user_id or "global", profile), [item.id]
-    )
-    session.delete(item)
-    session.commit()
+    try:
+        MemoryService(session).delete(memory_id)
+    except LookupError as error:
+        raise HTTPException(404, str(error)) from error
     return {"deleted": True}
 
 
 @router.post("/memories/{memory_id}/restore", dependencies=[Depends(require_loopback)])
 def restore_memory(memory_id: str, session: Session = Depends(get_db)) -> dict[str, object]:
-    item = session.get(Memory, memory_id)
-    if item is None:
-        raise HTTPException(404, "记忆不存在")
-    item.status = "active"
-    profile = settings.default_embedding_profile
-    provider = get_embedding_provider(profile)
-    vector_store.upsert_documents(
-        memory_collection_name(item.scope_type, item.user_id or "global", profile),
-        [item.id],
-        [item.content],
-        provider.embed_documents([item.content]),
-        [{"user_id": item.user_id or "", "scope_type": item.scope_type, "fact_key": item.fact_key}],
-    )
-    session.commit()
+    try:
+        item = MemoryService(session).restore(memory_id)
+    except LookupError as error:
+        raise HTTPException(404, str(error)) from error
     return {"id": item.id, "status": item.status}
 
 
@@ -1867,20 +1838,17 @@ def import_skill_github(
 def _set_extension_state(
     kind: str, name: str, payload: ExtensionState, session: Session
 ) -> dict[str, object]:
-    item = session.scalar(
-        select(ExtensionPackage).where(
-            ExtensionPackage.kind == kind, ExtensionPackage.name == name
+    try:
+        item = set_package_state(
+            session,
+            kind,
+            name,
+            enabled=payload.enabled,
+            access_policy=payload.access_policy,
         )
-    )
-    if item is None:
-        raise HTTPException(404, "扩展不存在")
-    if payload.access_policy is not None:
-        if payload.access_policy not in {"owner_only", "private_users"}:
-            raise HTTPException(400, "access_policy 只能是 owner_only 或 private_users")
-        item.access_policy = payload.access_policy
-    item.enabled = payload.enabled
-    item.status = "ready" if payload.enabled else "installed_disabled"
-    item.error = None
+    except ExtensionError as error:
+        status_code = 404 if str(error) == "扩展不存在" else 400
+        raise HTTPException(status_code, str(error)) from error
     session.commit()
     session.refresh(item)
     return _extension_response(item)
@@ -1941,23 +1909,12 @@ def delete_skill(name: str, session: Session = Depends(get_db)) -> dict[str, boo
 
 
 def _delete_extension(kind: str, name: str, session: Session) -> dict[str, bool]:
-    item = session.scalar(
-        select(ExtensionPackage).where(
-            ExtensionPackage.kind == kind, ExtensionPackage.name == name
-        )
-    )
-    if item is None:
-        raise HTTPException(404, "扩展不存在")
-    if item.builtin:
-        raise HTTPException(400, "内置扩展不能删除")
-    install_path = Path(item.install_path).resolve()
-    root = (settings.tools_path if kind == "tool" else settings.skills_path).resolve()
-    if install_path != root and root not in install_path.parents:
-        raise HTTPException(400, "扩展路径无效")
-    session.delete(item)
+    try:
+        delete_package(session, kind, name)
+    except ExtensionError as error:
+        status_code = 404 if str(error) == "扩展不存在" else 400
+        raise HTTPException(status_code, str(error)) from error
     session.commit()
-    if install_path.is_dir():
-        shutil.rmtree(install_path, ignore_errors=True)
     return {"deleted": True}
 
 

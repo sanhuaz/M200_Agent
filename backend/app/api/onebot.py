@@ -54,6 +54,7 @@ from app.services.jobs import (
     update_job_result,
 )
 from app.services.manga import manga_service
+from app.services.memories import MemoryService
 from app.services.models import model_registry
 from app.services.operation_logs import operation_logs
 from app.services.persona_store import get_persona_store
@@ -799,42 +800,10 @@ class OneBotManager:
             phrase in text for phrase in ("你先听我说", "等我说完再回", "我说完你再回复")
         )
         natural_done = any(phrase in text for phrase in ("我说完了", "你可以说了", "现在可以回复了"))
+        if command == "/listening" or command.startswith("/listening "):
+            return await self._handle_listening_command(command, user_id, external_id)
         if external_id.startswith("group:") or not is_owner(user_id):
             return None
-        if command in {
-            "/listening on",
-            "/listening off",
-            "/listening done",
-            "/listening cancel",
-            "/listening status",
-        }:
-            if command == "/listening on":
-                with SessionLocal.begin() as session:
-                    preference = get_or_create_preference(session, user_id)
-                    preference.listening_enabled = True
-                return (
-                    "已开启‘你听我说’模式。你可以分段发送，30 秒没有新消息或发送 "
-                    "/listening done 后我再回复。"
-                )
-            if command == "/listening status":
-                with SessionLocal() as session:
-                    preference = get_or_create_preference(session, user_id)
-                    conversation = session.scalar(select(Conversation).where(
-                        Conversation.platform == "qq", Conversation.external_id == external_id
-                    ))
-                    buffer = session.scalar(select(CompanionListeningBuffer).where(
-                        CompanionListeningBuffer.conversation_id == conversation.id
-                    )) if conversation is not None else None
-                    return (
-                        f"你听我说模式：{'已开启' if preference.listening_enabled else '已关闭'}；"
-                        f"待处理片段：{self._buffer_count(buffer)}。"
-                    )
-            if command == "/listening cancel":
-                await self._cancel_listening(user_id, external_id)
-                return "已取消当前连续消息，并关闭‘你听我说’模式。"
-            if command == "/listening done":
-                return await self._flush_listening_now(user_id, external_id)
-            return await self._flush_listening_now(user_id, external_id, disable_after=True)
 
         with SessionLocal() as session:
             preference = get_or_create_preference(session, user_id)
@@ -894,6 +863,55 @@ class OneBotManager:
             details={"conversation_id": conversation_id, "fragment_count": len(fragments)},
         )
         return ""
+
+    async def _handle_listening_command(
+        self, command: str, user_id: str, external_id: str
+    ) -> str:
+        if external_id.startswith("group:"):
+            return "‘你听我说’模式仅支持 QQ Owner 私聊。"
+        if not is_owner(user_id):
+            return "只有 Owner 可以使用‘你听我说’模式。"
+        action = command.removeprefix("/listening").strip().lower()
+        if action == "on":
+            with SessionLocal.begin() as session:
+                preference = get_or_create_preference(session, user_id)
+                preference.listening_enabled = True
+            return (
+                "已开启‘你听我说’模式。你可以分段发送，30 秒没有新消息或发送 "
+                "/listening done 后我再回复。"
+            )
+        if action == "status":
+            with SessionLocal() as session:
+                preference = get_or_create_preference(session, user_id)
+                conversation = session.scalar(
+                    select(Conversation).where(
+                        Conversation.platform == "qq",
+                        Conversation.external_id == external_id,
+                    )
+                )
+                buffer = (
+                    session.scalar(
+                        select(CompanionListeningBuffer).where(
+                            CompanionListeningBuffer.conversation_id == conversation.id
+                        )
+                    )
+                    if conversation is not None
+                    else None
+                )
+                return (
+                    f"你听我说模式：{'已开启' if preference.listening_enabled else '已关闭'}；"
+                    f"待处理片段：{self._buffer_count(buffer)}。"
+                )
+        if action == "cancel":
+            await self._cancel_listening(user_id, external_id)
+            return "已取消当前连续消息，并关闭‘你听我说’模式。"
+        if action in {"done", "off"}:
+            return await self._flush_listening_now(
+                user_id,
+                external_id,
+                disable_after=action == "off",
+            )
+        return "用法：/listening on|done|off|cancel|status"
 
     def _extract_triggered_text(self, raw: str, message_type: str) -> str | None:
         if message_type != "group":
@@ -964,47 +982,7 @@ class OneBotManager:
                  "/cancel <token>"
             )
         if text == "/listening" or text.startswith("/listening "):
-            if external_id.startswith("group:"):
-                return "‘你听我说’模式仅支持 QQ Owner 私聊。"
-            if not is_owner(user_id):
-                return "只有 Owner 可以使用‘你听我说’模式。"
-            action = text.removeprefix("/listening").strip().lower()
-            if action == "on":
-                with SessionLocal.begin() as session:
-                    preference = get_or_create_preference(session, user_id)
-                    preference.listening_enabled = True
-                return (
-                    "已开启‘你听我说’模式。你可以分段发送，30 秒没有新消息或发送 "
-                    "/listening done 后我再回复。"
-                )
-            if action == "status":
-                with SessionLocal() as session:
-                    preference = get_or_create_preference(session, user_id)
-                    conversation = session.scalar(
-                        select(Conversation).where(
-                            Conversation.platform == "qq", Conversation.external_id == external_id
-                        )
-                    )
-                    count = 0
-                    if conversation is not None:
-                        buffer = session.scalar(
-                            select(CompanionListeningBuffer).where(
-                                CompanionListeningBuffer.conversation_id == conversation.id
-                            )
-                        )
-                        count = self._buffer_count(buffer)
-                    return (
-                        f"你听我说模式：{'已开启' if preference.listening_enabled else '已关闭'}；"
-                        f"待处理片段：{count}。"
-                    )
-            if action in {"done", "off", "cancel"}:
-                if action == "cancel":
-                    await self._cancel_listening(user_id, external_id)
-                    return "已关闭‘你听我说’模式；当前未处理片段不会进入模型。"
-                return await self._flush_listening_now(
-                    user_id, external_id, disable_after=action == "off"
-                )
-            return "用法：/listening on|done|off|cancel|status"
+            return await self._handle_listening_command(text, user_id, external_id)
         if text == "/support" or text.startswith("/support "):
             if external_id.startswith("group:"):
                 return "情感陪伴仅支持 QQ 私聊，群聊不会加载私人陪伴资料。"
@@ -1360,11 +1338,11 @@ class OneBotManager:
             scope_id = external_id if scope_type == "group" else user_id
             if scope_type == "group" and not is_owner(user_id):
                 return "只有 Owner 可以删除群聊记忆。"
-            with SessionLocal.begin() as session:
+            with SessionLocal() as session:
                 item = session.get(Memory, memory_id)
                 if item is None or item.scope_type != scope_type or item.user_id != scope_id:
                     return "找不到属于你的这条记忆。"
-                item.status = "archived"
+                MemoryService(session).archive(item.id)
             return "已删除指定记忆。"
         if text == "/tools":
             with SessionLocal() as session:

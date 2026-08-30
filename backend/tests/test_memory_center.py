@@ -163,10 +163,11 @@ def test_group_memory_management_uses_runtime_collection(monkeypatch) -> None:
             return [[0.1, 0.2]]
 
     from app.api import routes
+    from app.services import memories as memory_service
 
-    monkeypatch.setattr(routes.vector_store, "delete_ids", fake_delete)
-    monkeypatch.setattr(routes.vector_store, "upsert_documents", fake_upsert)
-    monkeypatch.setattr(routes, "get_embedding_provider", lambda _profile: FakeProvider())
+    monkeypatch.setattr(memory_service.vector_store, "delete_ids", fake_delete)
+    monkeypatch.setattr(memory_service.vector_store, "upsert_documents", fake_upsert)
+    monkeypatch.setattr(memory_service, "get_embedding_provider", lambda _profile: FakeProvider())
     expected = memory_collection_name("group", group_id, routes.settings.default_embedding_profile)
 
     try:

@@ -5,9 +5,10 @@ from pathlib import Path
 
 from app.api.onebot import OneBotManager
 from app.core.config import get_settings
-from app.db.models import CompanionPreference, EmotionAssessment, Job
+from app.db.models import CompanionPreference, EmotionAssessment, Job, Memory
 from app.db.session import SessionLocal
 from app.services.companion import COMPANION_ANALYSIS_RETRY_JOB_TYPE
+from app.services.memories import memory_collection_name
 
 
 def test_help_returns_grouped_multiline_commands() -> None:
@@ -98,6 +99,48 @@ def test_companion_commands_enforce_owner_private_scope_and_update_preference() 
     assert "只有 Owner" in asyncio.run(
         manager._command("/support listen", "20002", "private:20002")
     )
+
+
+def test_qq_memory_archive_uses_the_same_vector_cleanup_as_web(monkeypatch) -> None:
+    memory_id = str(uuid.uuid4())
+    with SessionLocal.begin() as session:
+        session.add(
+            Memory(
+                id=memory_id,
+                scope_type="user",
+                user_id="10001",
+                fact_key=f"qq-memory-{memory_id}",
+                content="需要归档的 QQ 记忆",
+            )
+        )
+    calls: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(
+        "app.services.memories.vector_store.delete_ids",
+        lambda collection, ids: calls.append((collection, ids)),
+    )
+    try:
+        response = asyncio.run(
+            OneBotManager()._command(
+                f"/memory delete {memory_id}",
+                "10001",
+                "private:10001",
+            )
+        )
+        assert response == "已删除指定记忆。"
+        expected = memory_collection_name(
+            "user",
+            "10001",
+            get_settings().default_embedding_profile,
+        )
+        assert calls == [(expected, [memory_id])]
+        with SessionLocal() as session:
+            item = session.get(Memory, memory_id)
+            assert item is not None and item.status == "archived"
+    finally:
+        with SessionLocal.begin() as session:
+            item = session.get(Memory, memory_id)
+            if item is not None:
+                session.delete(item)
 
 
 def test_emotion_command_hides_failed_placeholder_and_uses_correction() -> None:

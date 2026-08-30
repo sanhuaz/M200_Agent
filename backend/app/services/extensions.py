@@ -278,6 +278,96 @@ def list_packages(session: Session, kind: str | None = None) -> list[ExtensionPa
     return list(session.scalars(query))
 
 
+def get_package(session: Session, kind: str, name: str) -> ExtensionPackage:
+    item = session.scalar(
+        select(ExtensionPackage).where(
+            ExtensionPackage.kind == kind,
+            ExtensionPackage.name == name,
+        )
+    )
+    if item is None:
+        raise ExtensionError("扩展不存在")
+    return item
+
+
+def set_package_state(
+    session: Session,
+    kind: str,
+    name: str,
+    *,
+    enabled: bool,
+    access_policy: str | None = None,
+) -> ExtensionPackage:
+    item = get_package(session, kind, name)
+    if access_policy is not None:
+        if access_policy not in {"owner_only", "private_users"}:
+            raise ExtensionError("access_policy 只能是 owner_only 或 private_users")
+        item.access_policy = access_policy
+    item.enabled = enabled
+    item.status = "ready" if enabled else "installed_disabled"
+    item.error = None
+    session.flush()
+    return item
+
+
+def delete_package(session: Session, kind: str, name: str) -> None:
+    item = get_package(session, kind, name)
+    if item.builtin:
+        raise ExtensionError("内置扩展不能删除")
+    root = (get_settings().tools_path if kind == "tool" else get_settings().skills_path).resolve()
+    path = Path(item.install_path).resolve()
+    if path == root or root not in path.parents:
+        raise ExtensionError("扩展路径无效")
+    session.delete(item)
+    session.flush()
+    if path.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def apply_package_operation(
+    session: Session,
+    *,
+    kind: str,
+    operation: str,
+    name_or_url: str,
+) -> dict[str, object]:
+    if kind not in {"tool", "skill"} or operation not in {
+        "install",
+        "enable",
+        "disable",
+        "remove",
+    }:
+        raise ExtensionError("扩展确认参数无效")
+    if operation == "install":
+        item = import_github(session, kind, name_or_url)
+        return {
+            "kind": kind,
+            "name": item.name,
+            "operation": operation,
+            "status": item.status,
+        }
+    if operation == "remove":
+        delete_package(session, kind, name_or_url)
+        return {
+            "kind": kind,
+            "name": name_or_url,
+            "operation": operation,
+            "status": "removed",
+        }
+    item = set_package_state(
+        session,
+        kind,
+        name_or_url,
+        enabled=operation == "enable",
+    )
+    return {
+        "kind": kind,
+        "name": name_or_url,
+        "operation": operation,
+        "status": item.status,
+    }
+
+
 def load_skill_text(session: Session, name: str) -> str:
     item = session.scalar(
         select(ExtensionPackage).where(

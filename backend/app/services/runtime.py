@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -72,13 +70,3 @@ def admin_dict(item: AdminIdentity) -> dict[str, object]:
         "created_by": item.created_by,
         "created_at": item.created_at.isoformat(),
     }
-
-
-def setting_json(session: Session, key: str, default: object) -> object:
-    item = session.get(AppSetting, key)
-    if item is None:
-        return default
-    try:
-        return json.loads(item.value)
-    except json.JSONDecodeError:
-        return item.value
