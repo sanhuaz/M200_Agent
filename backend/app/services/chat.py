@@ -8,8 +8,7 @@ import time
 from collections.abc import AsyncGenerator
 from typing import cast
 
-from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
-from langchain_core.runnables import RunnableConfig
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, ToolMessage
 from langgraph.graph import MessagesState
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
@@ -19,6 +18,7 @@ from app.db.models import (
     Conversation,
     EmotionAssessment,
     KnowledgeBase,
+    Memory,
     Message,
     SafetyEvent,
     ToolRun,
@@ -80,6 +80,26 @@ SYSTEM_PROMPT = """你是 PersonalAgent，一个本地个人助理。
 QQ 私聊发起的漫画任务成功后，系统会自动把文件发送给 Owner；不要声称没有文件发送能力。
 只有 Owner 明确要求删除某个已发送任务时，才能调用 delete_manga_download；不要自行清理产物。
 不要声称工具成功，除非工具结果明确表示成功。"""
+
+
+def _recall_memories_in_worker_session(
+    user_id: str,
+    query: str,
+    limit: int,
+    *,
+    scope_type: str,
+    scope_id: str | None,
+) -> list[Memory]:
+    """在线程内部创建 Session，避免跨线程复用请求 Session。"""
+
+    with SessionLocal() as worker_session:
+        return MemoryService(worker_session).recall(
+            user_id,
+            query,
+            limit,
+            scope_type=scope_type,
+            scope_id=scope_id,
+        )
 
 
 def normalize_tool_result(content: object) -> dict[str, object]:
@@ -530,7 +550,7 @@ class ChatService:
                     details={"conversation_id": conversation.id, "sender_id": sender_id, "query": text},
                 )
                 memories = await asyncio.to_thread(
-                    MemoryService(session).recall,
+                    _recall_memories_in_worker_session,
                     sender_id,
                     text,
                     5,
@@ -638,8 +658,8 @@ class ChatService:
                 is_group=is_group,
                 allowed_manga_actions=allowed_manga_actions,
             )
-            config: RunnableConfig = {"configurable": {"thread_id": f"{conversation.id}:{user_message.id}"}}
             input_state: MessagesState = {"messages": messages}
+            final_messages: list[BaseMessage] = []
             model_operation = operation_logs.start_operation(
                 source="model",
                 title="模型调用",
@@ -654,7 +674,19 @@ class ChatService:
                     "conversation_id": conversation.id,
                 },
             )
-            async for chunk, _metadata in graph.astream(input_state, config=config, stream_mode="messages"):
+            async for stream_mode, payload in graph.astream(
+                input_state,
+                stream_mode=["messages", "values"],
+            ):
+                if stream_mode == "values":
+                    if isinstance(payload, dict):
+                        state_messages = payload.get("messages")
+                        if isinstance(state_messages, list):
+                            final_messages = state_messages
+                    continue
+                if not isinstance(payload, tuple) or len(payload) != 2:
+                    continue
+                chunk, _metadata = payload
                 if isinstance(chunk, (AIMessage, AIMessageChunk)):
                     if isinstance(chunk.content, str) and chunk.content:
                         emitted += chunk.content
@@ -725,8 +757,7 @@ class ChatService:
                                 "event": "artifact_created",
                                 "data": {"artifact_id": str(artifact_id)},
                             }
-            snapshot = await graph.aget_state(config)
-            final = final_ai_message(snapshot.values["messages"])
+            final = final_ai_message(final_messages)
             answer = (
                 final.content
                 if isinstance(final.content, str)

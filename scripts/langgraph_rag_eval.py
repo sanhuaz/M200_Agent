@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
@@ -30,9 +29,7 @@ from app.services.models import model_registry  # noqa: E402
 from app.services.personas import persona_system_prompt  # noqa: E402
 from app.workflows.agent import (  # noqa: E402
     build_agent_graph,
-    close_checkpointer,
     final_ai_message,
-    initialize_checkpointer,
     skill_descriptions,
 )
 
@@ -248,9 +245,6 @@ async def evaluate_one(
         with SessionLocal() as session:
             system = build_system_prompt(knowledge_bases, session, requester_id)
             graph = build_agent_graph(session, model_alias, requester_id, conversation_id)
-            config: RunnableConfig = {
-                "configurable": {"thread_id": f"langgraph-eval:{run_id}:{question['id']}"}
-            }
             chain_started = time.perf_counter()
             state = await graph.ainvoke(
                 {
@@ -258,8 +252,7 @@ async def evaluate_one(
                         SystemMessage(content=system),
                         HumanMessage(content=str(question["question"])),
                     ]
-                },
-                config=config,
+                }
             )
             chain_ms = round((time.perf_counter() - chain_started) * 1000, 1)
             messages = list(state["messages"])
@@ -549,7 +542,6 @@ async def async_main() -> int:
         f"workers={args.workers} knowledge_bases={[item.name for item in knowledge_bases]}",
         flush=True,
     )
-    await initialize_checkpointer()
     semaphore = asyncio.Semaphore(max(1, args.workers))
     tasks = [
         asyncio.create_task(
@@ -557,26 +549,23 @@ async def async_main() -> int:
         )
         for item in pending
     ]
-    try:
-        with checkpoint_path.open("a", encoding="utf-8") as checkpoint:
-            finished = len(completed)
-            for task in asyncio.as_completed(tasks):
-                result = await task
-                completed[str(result["id"])] = result
-                checkpoint.write(json.dumps(result, ensure_ascii=False) + "\n")
-                checkpoint.flush()
-                finished += 1
-                status = "ok" if "error" not in result else "error"
-                chain = result.get("chain", {})
-                selected = ",".join(chain.get("selected_knowledge_bases", [])) or "none"
-                executed = chain.get("executed_search_count", "-")
-                print(
-                    f"[eval {finished:03d}] {result['id']} {status} "
-                    f"executed={executed} selected={selected}",
-                    flush=True,
-                )
-    finally:
-        await close_checkpointer()
+    with checkpoint_path.open("a", encoding="utf-8") as checkpoint:
+        finished = len(completed)
+        for task in asyncio.as_completed(tasks):
+            result = await task
+            completed[str(result["id"])] = result
+            checkpoint.write(json.dumps(result, ensure_ascii=False) + "\n")
+            checkpoint.flush()
+            finished += 1
+            status = "ok" if "error" not in result else "error"
+            chain = result.get("chain", {})
+            selected = ",".join(chain.get("selected_knowledge_bases", [])) or "none"
+            executed = chain.get("executed_search_count", "-")
+            print(
+                f"[eval {finished:03d}] {result['id']} {status} "
+                f"executed={executed} selected={selected}",
+                flush=True,
+            )
 
     ordered = [
         completed[str(question["id"])]

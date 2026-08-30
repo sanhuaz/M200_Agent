@@ -1110,24 +1110,12 @@ def list_messages(conversation_id: str, session: Session = Depends(get_db)) -> l
 
 
 @router.delete("/conversations/{conversation_id}", dependencies=[Depends(require_loopback)])
-async def remove_conversation(conversation_id: str, session: Session = Depends(get_db)) -> dict[str, object]:
+def remove_conversation(conversation_id: str, session: Session = Depends(get_db)) -> dict[str, object]:
     conversation = session.get(Conversation, conversation_id)
     if conversation is None:
         raise HTTPException(404, "会话不存在")
     if conversation.platform != "web":
         raise HTTPException(403, "仅允许删除网页会话")
-    message_ids = list(
-        session.scalars(
-            select(Message.id).where(Message.conversation_id == conversation_id)
-        )
-    )
-    from app.workflows.agent import delete_conversation_checkpoints
-
-    try:
-        await delete_conversation_checkpoints(conversation_id, message_ids)
-    except Exception as error:
-        session.rollback()
-        raise HTTPException(500, "会话工作流状态清理失败，未删除会话") from error
     session.execute(
         update(Job).where(Job.conversation_id == conversation_id).values(conversation_id=None)
     )

@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from types import SimpleNamespace
 
 import pytest
 from app.api.onebot import OneBotManager
@@ -215,17 +214,14 @@ class _SafetyGraphModel:
 
 
 class _FakeGraph:
-    async def astream(self, _input, config=None, stream_mode=None):
-        if False:
-            yield (AIMessage(content=""), {})
+    final_text = "普通 Agent 回复"
 
-    async def aget_state(self, _config):
-        return SimpleNamespace(values={"messages": [AIMessage(content="普通 Agent 回复")]})
+    async def astream(self, _input, config=None, stream_mode=None):
+        yield "values", {"messages": [AIMessage(content=self.final_text)]}
 
 
 class _UnsafeGraph(_FakeGraph):
-    async def aget_state(self, _config):
-        return SimpleNamespace(values={"messages": [AIMessage(content="你只能依靠我")]})
+    final_text = "你只能依靠我"
 
 
 def test_unfiltered_high_enters_normal_graph_but_standard_uses_safety_model(

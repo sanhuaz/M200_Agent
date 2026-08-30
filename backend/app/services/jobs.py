@@ -39,6 +39,19 @@ logger = logging.getLogger(__name__)
 JobNotifier = Callable[[Job], Awaitable[None]]
 
 
+def _index_document_in_worker_session(document_id: str) -> dict[str, object]:
+    with SessionLocal() as worker_session:
+        return index_document(worker_session, document_id)
+
+
+def _reindex_knowledge_base_in_worker_session(
+    knowledge_base_id: str,
+    embedding_profile: str,
+) -> dict[str, object]:
+    with SessionLocal() as worker_session:
+        return reindex_knowledge_base(worker_session, knowledge_base_id, embedding_profile)
+
+
 def _companion_retry_context(session, message: Message) -> str:
     messages = list(
         session.scalars(
@@ -235,7 +248,8 @@ class JobWorker:
                     )
                 elif job.type == "document_index":
                     result = await asyncio.to_thread(
-                        index_document, session, json.loads(job.payload)["document_id"]
+                        _index_document_in_worker_session,
+                        json.loads(job.payload)["document_id"],
                     )
                     job.result = json.dumps(result, ensure_ascii=False)
                     job.status = "succeeded"
@@ -249,8 +263,7 @@ class JobWorker:
                 elif job.type == "knowledge_base_reindex":
                     payload = json.loads(job.payload)
                     result = await asyncio.to_thread(
-                        reindex_knowledge_base,
-                        session,
+                        _reindex_knowledge_base_in_worker_session,
                         str(payload["knowledge_base_id"]),
                         str(payload["embedding_profile"]),
                     )

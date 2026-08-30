@@ -18,7 +18,7 @@ Docker、Redis、Celery、完整 RBAC、OCR、语音/视觉模型、生产日志
 - OpenAI 兼容文本模型，多模型配置并按会话切换；模型管理页可设主默认模型并同步现有会话。
 - LangGraph 原生 Function Calling，不使用正则模拟工具调用。
 - SQLite 保存会话、消息、用户事实、确认请求和后台任务。
-- LangGraph SQLite Checkpointer 保存工作流中断与恢复状态。
+- LangGraph 负责单轮工具编排，最终状态直接从流中取得；会话历史与摘要由业务数据库保存。
 - 角色规则、结构化用户事实和向量语义记忆组成三层记忆。
 - TXT、Markdown、HTML、文本型 PDF、DOCX 文档解析与结构化切块。
 - Chroma 语义召回 + SQLite FTS5/jieba 关键词召回 + RRF 融合。
@@ -71,7 +71,7 @@ SQLite + Chroma + Generated Artifacts
 ## 技术栈
 
 - Python 3.13、FastAPI、SQLAlchemy、Alembic、Uvicorn
-- LangChain 1.2、LangGraph 1.1、`langgraph-checkpoint-sqlite`
+- LangChain 1.2、LangGraph 1.1
 - SQLite FTS5、ChromaDB、Sentence Transformers、jieba
 - Vue 3、TypeScript、Vite、Element Plus
 - NapCat OneBot v11、JMComic-Crawler-Python

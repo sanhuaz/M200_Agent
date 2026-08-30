@@ -14,7 +14,7 @@ function Backup-RuntimeData([string]$Label) {
     $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
     $backupRoot = Join-Path $ProjectRoot ("_v020_backups\" + $Label + "-" + $stamp)
     New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
-    foreach ($relative in @("data\personal_agent.db", "data\langgraph_checkpoints.db", "data\chroma", "data\uploads", "data\downloads")) {
+    foreach ($relative in @("data\personal_agent.db", "data\chroma", "data\uploads", "data\downloads")) {
         $source = Join-Path $ProjectRoot $relative
         if (Test-Path -LiteralPath $source) {
             $destination = Join-Path $backupRoot $relative

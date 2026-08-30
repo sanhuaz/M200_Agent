@@ -4,10 +4,8 @@ import json
 import threading
 from dataclasses import dataclass, field
 
-import aiosqlite
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 from sqlalchemy import select
@@ -37,8 +35,6 @@ from app.services.models import model_registry
 from app.services.retrieval import HybridRetriever
 from app.services.runtime import is_owner
 
-_checkpoint_connection: aiosqlite.Connection | None = None
-_checkpointer: AsyncSqliteSaver | None = None
 MAX_KNOWLEDGE_SEARCHES_PER_TURN = 4
 MANGA_TOOL_ACTIONS = {
     "search_manga": "search",
@@ -112,38 +108,6 @@ def reject_unauthorized_manga_calls(
         if action is not None and action not in allowed_manga_actions:
             return AIMessage(content="本轮未检测到明确的漫画操作意图，未执行漫画工具。")
     return response
-
-
-async def initialize_checkpointer() -> None:
-    global _checkpoint_connection, _checkpointer
-    if _checkpointer is None:
-        path = get_settings().database_path.with_name("langgraph_checkpoints.db")
-        _checkpoint_connection = await aiosqlite.connect(path)
-        _checkpointer = AsyncSqliteSaver(_checkpoint_connection)
-
-
-def get_checkpointer() -> AsyncSqliteSaver:
-    if _checkpointer is None:
-        raise RuntimeError("LangGraph Checkpointer 尚未初始化")
-    return _checkpointer
-
-
-async def close_checkpointer() -> None:
-    global _checkpoint_connection, _checkpointer
-    if _checkpoint_connection is not None:
-        await _checkpoint_connection.close()
-    _checkpoint_connection = None
-    _checkpointer = None
-
-
-async def delete_conversation_checkpoints(conversation_id: str, message_ids: list[str]) -> None:
-    """删除网页会话对应的每轮 LangGraph 状态。"""
-
-    if _checkpointer is None:
-        return
-    await _checkpointer.setup()
-    for message_id in message_ids:
-        await _checkpointer.adelete_thread(f"{conversation_id}:{message_id}")
 
 
 def build_agent_graph(
@@ -374,7 +338,7 @@ def build_agent_graph(
     builder.add_edge(START, "agent")
     builder.add_conditional_edges("agent", tools_condition, {"tools": "tools", END: END})
     builder.add_edge("tools", "agent")
-    return builder.compile(checkpointer=get_checkpointer())
+    return builder.compile()
 
 
 def skill_descriptions(session: Session) -> str:

@@ -19,7 +19,6 @@ from app.services.napcat_logs import napcat_connector
 from app.services.operation_logs import operation_logs
 from app.services.persona_store import get_persona_store
 from app.services.runtime import bootstrap_runtime
-from app.workflows.agent import close_checkpointer, initialize_checkpointer
 
 for stream in (sys.stdout, sys.stderr):
     if isinstance(stream, TextIOWrapper):
@@ -46,10 +45,6 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
         operation_logs.emit(
             source="startup", kind="succeeded", title="数据库", message="数据库和运行时配置已就绪"
         )
-        await initialize_checkpointer()
-        operation_logs.emit(
-            source="startup", kind="succeeded", title="Checkpoint", message="工作流 Checkpoint 已就绪"
-        )
         job_worker.start()
         onebot_manager.start_monitor()
         await napcat_connector.start()
@@ -68,7 +63,6 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
         await napcat_connector.stop()
         await onebot_manager.stop_monitor()
         await job_worker.stop()
-        await close_checkpointer()
         operation_logs.emit(source="shutdown", kind="succeeded", title="项目停止", message="后端资源已释放")
         operation_logs.flush()
         operation_logs.close()
