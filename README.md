@@ -84,8 +84,10 @@ SQLite + Chroma + Generated Artifacts
 Windows PowerShell 示例：
 
 ```powershell
-& python -m pip install --no-user -r requirements.txt
+& python -m pip install --no-user -r requirements-dev.txt
 ```
+
+仅运行应用、不执行项目检查时，可以改装 `requirements.txt` 中的运行依赖。
 
 安装前端依赖：
 
@@ -287,6 +289,7 @@ Chroma 语义召回 20 条
 - Ruff
 - Pyright
 - Pytest
+- Vitest
 - Vue TypeScript 检查
 - Vite 构建
 - 日志中心事件、凭据递归脱敏、活动操作快照和 NapCat 配置边界
