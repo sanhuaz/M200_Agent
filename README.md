@@ -10,7 +10,7 @@ Docker、Redis、Celery、完整 RBAC、OCR、语音/视觉模型、生产日志
 
 ## 当前发布
 
-- 当前版本：`v0.4.3`
+- 当前版本：`v0.4.4`
 - 仓库：<https://github.com/sanhuaz/M200_Agent>
 
 ## 功能
@@ -68,6 +68,53 @@ LangGraph Agent
 SQLite + Chroma + Generated Artifacts
 ```
 
+### 公开仓库目录架构
+
+以下是 `v0.4.4` 实际发布到 GitHub 的源码结构；本机测试、评测、运行数据和私有材料不在其中：
+
+```text
+M200_Agent/
+├─ backend/
+│  ├─ alembic/
+│  │  ├─ env.py
+│  │  └─ versions/                 # 0001—0009，支持旧数据库逐版升级
+│  └─ app/
+│     ├─ api/                      # 分域 Router、OneBot 入口/传输/消息/投递
+│     ├─ core/                     # 环境配置
+│     ├─ db/                       # SQLAlchemy 模型与 Session
+│     ├─ domain/                   # 与存储无关的领域类型
+│     ├─ services/                 # 聊天、记忆、RAG、陪伴、扩展与任务服务
+│     ├─ workflows/                # LangGraph Agent 图
+│     └─ main.py                   # FastAPI 生命周期与应用入口
+├─ frontend/
+│  ├─ src/
+│  │  ├─ features/                 # 导航、筛选和请求竞态等纯逻辑
+│  │  ├─ pages/                    # 页面级异步组件
+│  │  ├─ services/                 # API 与 SSE 客户端
+│  │  ├─ types/                    # 前端领域类型
+│  │  ├─ App.vue                   # 顶层状态和主要工作区
+│  │  └─ main.ts
+│  ├─ package.json
+│  └─ pnpm-lock.yaml
+├─ scripts/
+│  ├─ start.ps1 / stop.ps1         # 本机启动与安全停止
+│  ├─ migrate.ps1                  # 迁移判断、升级前备份和自动保留
+│  ├─ migration_plan.py            # 当前版本与目标 head 比较
+│  ├─ backup_inventory.ps1         # 旧备份只读清单
+│  └─ langgraph_rag_eval.py        # LangGraph 知识库选路评测方法
+├─ data/                            # 仅发布运行目录占位文件
+├─ persona/ / skills/ / tools/     # 仅发布目录占位文件
+├─ .env.example                    # 无真实密钥的配置模板
+├─ alembic.ini
+├─ pyproject.toml
+├─ requirements.txt
+├─ requirements-dev.txt
+└─ README.md
+```
+
+`backend/alembic/versions/` 中的历史迁移不是重复文件。Alembic 需要按修订链将旧版本数据库逐步升级到
+`0009_remove_legacy_persona_payload`，因此公开发行必须保留 `0001`—`0009`。
+
 ## 技术栈
 
 - Python 3.13、FastAPI、SQLAlchemy、Alembic、Uvicorn
@@ -84,10 +131,10 @@ SQLite + Chroma + Generated Artifacts
 Windows PowerShell 示例：
 
 ```powershell
-& python -m pip install --no-user -r requirements-dev.txt
+& python -m pip install --no-user -r requirements.txt
 ```
 
-仅运行应用、不执行项目检查时，可以改装 `requirements.txt` 中的运行依赖。
+`requirements-dev.txt` 仅供维护者在本机安装 Ruff、Pyright、Pytest 等开发工具；普通用户运行应用无需安装。
 
 安装前端依赖：
 
@@ -278,35 +325,26 @@ Chroma 语义召回 20 条
 
 ## 验证
 
+公开发行树可执行以下基础检查：
+
 ```powershell
-.\scripts\check.ps1
+& python -m pip check
+& python -m compileall backend
+& python -m alembic upgrade head
+Set-Location frontend
+pnpm run build
 ```
 
-检查包括：
+发布维护使用的后端/前端自动测试、完整检查脚本、陪伴评测与题集生成脚本只保留在维护者本机，
+不随 GitHub 源码发行。它们覆盖 API、迁移、记忆、权限、OneBot、聊天流、前端竞态和陪伴安全等关键行为。
 
-- `pip check`
-- Python 字节码编译
-- Ruff
-- Pyright
-- Pytest
-- Vitest
-- Vue TypeScript 检查
-- Vite 构建
-- 日志中心事件、凭据递归脱敏、活动操作快照和 NapCat 配置边界
-- Companion P0 情绪/安全分析单元、管理 API、QQ 命令、记忆授权和关系隔离测试
-- 标准安全回应、输出复写、无过滤审计与安全模式权限测试；四条真实安全冒烟结果写入忽略目录
-- 评测器与题集 Schema 校验：`python scripts\companion_eval.py --smoke --limit 8`
-- 安全回应链路冒烟：`python scripts\companion_safety_eval.py`；结果只保存在被版本控制忽略的评测目录。
-
-完整 150 题题集由 `scripts/generate_companion_dataset.py` 生成到被版本控制忽略的评测目录。
-评测器同时报告严格主情绪 Top-1、主情绪 Top-3
+维护者本机曾用完整 150 题题集报告严格主情绪 Top-1、主情绪 Top-3
 命中率、排名分布和多标签 F1；高/危风险安全预检样本不计入情绪指标。已用 DSvision 和
 `companion-emotion-only-v2` 完成全量复测：150/150 成功，141 条进入情绪评测，
 9 条由高/危风险预检跳过；严格 Top-1 为 59.57%，Top-3 命中率为 78.72%，多标签 Micro-F1 为 0.6356。
 该结果用于当前工作树回归与问题定位，不代表真实参与者体验或产品质量已经达标。
 
-另有独立的 50 条新增低风险日常题，由 `scripts/generate_companion_daily50.py` 生成，并与
-`gold-v2` 的 120 条日常题合并为 170 条日常评测集。当前生产结构化链路
+另有独立的 50 条新增低风险日常题，与 `gold-v2` 的 120 条日常题合并为 170 条日常评测集。当前生产结构化链路
 `companion-analysis-v3` / `emotion-classifier-v2` 已完成 170 条 DSvision 全新调用：Top-1 65.88%、
 Top-3 87.65%、Micro-F1 0.7024，报告保存在被版本控制忽略的评测目录。
 为保持与此前情绪-only 报告的口径可比，另复用旧 120 条真实结果并对新增 50 条调用模型，
@@ -325,13 +363,35 @@ Element Plus 仍使主包约为 1.11 MB，后续可继续按页面拆分。
 - SQLite 数据库、Chroma 索引、上传文档和下载产物；
 - 模型缓存、运行日志、真实测试结果和绝对路径；
 - NapCat 配置文件。
+- 后端/前端测试源码、本机完整检查脚本、陪伴/RAG 评测脚本及题集生成脚本；
+- 本机交接文档、产品优化方案、测试报告和 Windows 正式版路线。
 
 应用默认仅监听回环地址。如需暴露到局域网或公网，应另行增加身份认证、权限控制、TLS、
 限流和完整审计，不应直接复用当前 V1 配置。
 
+## 未完成内容
+
+- `start.ps1`、本机 `check.ps1` 与 `stop.ps1` 仍包含维护者机器的 Python 回退路径
+  `D:\miniconda\envs\langchain1.2\python.exe`。其他机器当前应显式配置 `PERSONAL_AGENT_PYTHON`；
+  后续需要改为项目 `.venv`、Python Launcher 或 `PATH` 自动发现。本版本只记录该问题，不改变脚本行为。
+- 前端仍由 `App.vue` 维护顶层状态和多数工作区；目前仅管理员、系统状态和任务中心形成页面级异步分包，
+  尚未完成全页面组件拆分，主包体积仍需继续治理。
+- 当前定位仍是 Windows 本机单用户原型，不包含公网认证、多用户并发、云部署或安装器。
+
 ## 版本更新记录
 
-### v0.4.3（当前已发布）
+### v0.4.4（当前已发布）
+
+- 修复迁移脚本写死旧版本导致每次启动重复备份的问题：动态比较 `alembic current` 与 `heads`，只在确需升级时备份，自动迁移备份默认保留最近 3 份；人工快照和 NapCat 原始备份不自动删除。
+- 统一长期记忆、Tool/Skill 扩展和 QQ 命令的领域服务路径，消除 Web 与 QQ 删除记忆时 SQLite/Chroma 行为不一致，以及启停、删除扩展的重复实现。
+- 按会话、模型、知识库、记忆、扩展、任务和监控拆分 FastAPI Router；将 OneBot 连接传输、消息解析、文件投递，以及聊天轮后任务和编排辅助逻辑拆成独立模块，保持原 URL、SSE 和 QQ 命令不变。
+- 普通聊天不再持久化无恢复用途的 LangGraph Checkpoint；会话历史继续由消息和摘要保存，同时将后台线程数据库操作改为在线程内创建独立 Session。
+- 将角色卡领域类型与关系资料存储独立，新增 `0009_remove_legacy_persona_payload`，移除数据库中长期为空的旧人格正文列；历史迁移继续完整保留，支持旧数据库升级。
+- 前端拆分导航、请求竞态、记忆筛选、API/SSE 与管理类型模块；管理员、状态和任务中心改为异步页面组件，保持现有交互和 URL。
+- GitHub 发行树不再包含后端/前端测试源码、本机检查脚本、陪伴/RAG 评测器、题集生成器和本机材料；这些文件仍保存在维护者本机，不随发布外发。
+- FastAPI 与前端包版本同步为 `0.4.4`。解释器回退路径和剩余前端单体边界已登记为未完成内容。
+
+### v0.4.3
 
 - 陪伴回复完整性升级：主模型接收 Top-3 情绪候选、强度、置信度、支持需要和最终策略；增加七种可编辑策略攻略、版本历史、回滚与恢复默认值。
 - 增加结构化角色卡和运行时风格复核，重点处理明确拒绝建议后的建议越权，以及非建议策略中的标题和明显列表；失败时按问题类型安全降级。
