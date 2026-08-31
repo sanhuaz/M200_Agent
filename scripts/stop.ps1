@@ -124,6 +124,43 @@ function Test-FrontendEndpointIdentity {
     }
 }
 
+function Test-PythonExecutableIdentity {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ActualExecutable,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedPython
+    )
+
+    $actualPath = [System.IO.Path]::GetFullPath($ActualExecutable)
+    $expectedPath = [System.IO.Path]::GetFullPath($ExpectedPython)
+    if ([string]::Equals($actualPath, $expectedPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
+
+    $venvRoot = Split-Path -Parent (Split-Path -Parent $expectedPath)
+    $venvConfig = Join-Path $venvRoot "pyvenv.cfg"
+    if (-not (Test-Path -LiteralPath $venvConfig)) {
+        return $false
+    }
+
+    $baseExecutable = Get-Content -LiteralPath $venvConfig -Encoding utf8 |
+        Where-Object { $_ -match '^\s*executable\s*=\s*(?<path>.+?)\s*$' } |
+        Select-Object -First 1
+    if (-not $baseExecutable) {
+        return $false
+    }
+
+    $baseExecutable -match '^\s*executable\s*=\s*(?<path>.+?)\s*$' | Out-Null
+    $configuredPath = [System.IO.Path]::GetFullPath($Matches.path.Trim().Trim('"'))
+    return [string]::Equals(
+        $actualPath,
+        $configuredPath,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+}
+
 function Test-BackendProcess {
     param(
         [Parameter(Mandatory)]
@@ -136,7 +173,9 @@ function Test-BackendProcess {
 
     $expectedPython = [System.IO.Path]::GetFullPath($PythonExe)
     $actualExecutable = [System.IO.Path]::GetFullPath($Process.ExecutablePath)
-    if ($actualExecutable -ne $expectedPython) { return $false }
+    if (-not (Test-PythonExecutableIdentity -ActualExecutable $actualExecutable -ExpectedPython $expectedPython)) {
+        return $false
+    }
     if ($Process.CommandLine) {
         return (
             $Process.CommandLine -match "(?i)(?:^|\s)-m\s+uvicorn\s+app\.main:app(?:\s|$)" -and
