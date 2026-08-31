@@ -285,8 +285,20 @@ h3 { margin: 0; }
 .message.user { margin-left: auto; }
 .message.user > span { display: block; text-align: right; }
 .message.user p { color: #fff; border-radius: 14px 4px 14px 14px; background: linear-gradient(135deg, var(--primary), var(--primary-strong)); }
+.message-attachments, .pending-attachments { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 9px; }
+.message-attachment, .pending-attachment { width: 156px; margin: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.message-attachment img, .pending-attachment img { display: block; width: 100%; height: 116px; object-fit: cover; background: var(--surface-soft); }
+.message-attachment figcaption, .pending-attachment figcaption { display: flex; min-height: 32px; align-items: center; justify-content: space-between; gap: 6px; padding: 5px 7px; color: var(--text-soft); font-size: 10px; }
+.message-attachment figcaption span, .pending-attachment figcaption span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.message-attachment figcaption button, .pending-attachment figcaption button { flex: 0 0 auto; padding: 2px 4px; color: var(--text-soft); border: 0; border-radius: 5px; background: transparent; cursor: pointer; }
+.message-attachment figcaption button:hover, .pending-attachment figcaption button:hover { color: var(--danger); background: var(--surface-hover); }
+.attachment-placeholder { display: grid; height: 116px; place-items: center; color: var(--text-soft); font-size: 11px; background: var(--surface-soft); }
 .composer { display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: end; padding: 14px 16px; border-top: 1px solid var(--border); background: var(--surface-soft); }
 .composer .el-button { height: 74px; padding-inline: 22px; }
+.composer-actions { display: flex; min-width: 112px; flex-direction: column; align-items: stretch; gap: 7px; }
+.composer-actions .el-button { height: 34px; padding-inline: 14px; }
+.chat-file-picker { justify-content: center; min-height: 32px; padding-inline: 9px; font-size: 11px; text-align: center; }
+.chat-file-picker.disabled { cursor: not-allowed; opacity: .58; }
 .chat-empty { display: grid; height: 100%; place-content: center; justify-items: center; color: var(--text-soft); text-align: center; }
 .chat-empty h3 { margin-top: 14px; color: var(--text); }
 .chat-empty p { margin: 7px 0 0; font-size: 13px; }
@@ -372,6 +384,7 @@ h3 { margin: 0; }
   .toolbar-selects { width: 100%; }
   .toolbar-selects .el-select { flex: 1; width: auto; }
   .composer { grid-template-columns: 1fr; }
+  .composer-actions { min-width: 0; }
   .composer .el-button { width: 100%; height: 38px; }
   .status-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .model-form-grid { grid-template-columns: 1fr; }

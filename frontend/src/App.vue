@@ -9,37 +9,17 @@ import {
 import { buildMemoryCenterQuery } from './features/memory'
 import { normalizeTab, pathForTab, resolveRoute } from './features/navigation'
 import { LatestRequestGate } from './features/requestGate'
-import { API, api, streamChat } from './services/api'
+import { API, api } from './services/api'
 import type { AdminRow, HealthData, NapcatStatus } from './types/management'
 import type { Confirmation, TaskRow } from './types/tasks'
+import type { ModelProfile, ReasoningEffort } from './types/chat'
 
 const AdminPage = defineAsyncComponent(() => import('./pages/AdminPage.vue'))
 const StatusPage = defineAsyncComponent(() => import('./pages/StatusPage.vue'))
 const TasksPage = defineAsyncComponent(() => import('./pages/TasksPage.vue'))
 const McpPage = defineAsyncComponent(() => import('./pages/McpPage.vue'))
-
-type Conversation = { id: string; title: string; platform: string; model_alias: string; persona_id?: string | null }
-type ReasoningEffort = 'low' | 'medium' | 'high' | null
-type ModelProfile = {
-  alias: string
-  model: string
-  base_url: string
-  configured: boolean
-  has_api_key: boolean
-  in_use: boolean
-  can_delete: boolean
-  is_default: boolean
-  reasoning_effort: ReasoningEffort
-  streaming: boolean
-  temperature: number | null
-  context_window: number
-  input_soft_limit: number
-  max_output_tokens: number
-  timeout_seconds: number
-  supports_vision: boolean
-}
+const ChatPage = defineAsyncComponent(() => import('./pages/ChatPage.vue'))
 type ModelProfileDraft = Omit<ModelProfile, 'configured' | 'has_api_key' | 'in_use' | 'can_delete' | 'is_default'> & { api_key: string }
-type Message = { id?: string; role: string; content: string }
 type KnowledgeBase = { id: string; name: string; embedding_profile: string }
 type DocumentRow = { id: string; knowledge_base_id: string; filename: string; status: string; error?: string }
 type MemoryCenterFact = {
@@ -160,18 +140,11 @@ type ActiveLogResponse = { session_id: string; operations: LogEvent[]; napcat: N
 type ThemeName = 'light' | 'dark'
 
 const activeTab = ref('chat')
-const conversations = ref<Conversation[]>([])
 const models = ref<ModelProfile[]>([])
 const modelForm = ref<ModelProfileDraft>(newModelDraft())
 const editingModelAlias = ref('')
 const modelSaving = ref(false)
 const modelTesting = ref(false)
-const currentConversationId = ref('')
-const messages = ref<Message[]>([])
-const messagesContainer = ref<HTMLElement | null>(null)
-const messagesAutoFollow = ref(true)
-const input = ref('')
-const sending = ref(false)
 const health = ref<HealthData>({})
 const knowledgeBases = ref<KnowledgeBase[]>([])
 const documents = ref<DocumentRow[]>([])
@@ -239,13 +212,11 @@ const memoryRelationshipDraft = ref<RelationshipRow | null>(null)
 const memoryRelationshipBoundaryText = ref('{}')
 const memoryRelationshipDialog = ref(false)
 const memoryRelationshipSaving = ref(false)
-const messagesLoading = ref(false)
 const documentsLoading = ref(false)
 const strategyGuideRevisionsLoading = ref(false)
 const sidebarCollapsed = ref(false)
 const mobileSidebarOpen = ref(false)
 const isNarrow = ref(window.innerWidth < 1024)
-const conversationListOpen = ref(true)
 const extensionExpanded = ref(true)
 const systemExpanded = ref(true)
 const logTab = ref<'operation' | 'napcat'>('operation')
@@ -266,7 +237,6 @@ const qqReplySettings = ref<QQReplySettings>({ chunked_output_enabled: true, chu
 const persistedQQReplySettings = ref<QQReplySettings>({ ...qqReplySettings.value })
 const qqReplySettingsSaving = ref(false)
 let logEventSource: EventSource | null = null
-const messagesRequests = new LatestRequestGate<string>()
 const documentRequests = new LatestRequestGate<string>()
 const memoryCenterRequests = new LatestRequestGate<string>()
 let companionRequestSeq = 0
@@ -275,7 +245,6 @@ const strategyRevisionRequests = new LatestRequestGate<string>()
 const theme = ref<ThemeName>('light')
 let followsSystemTheme = false
 let systemThemeQuery: MediaQueryList | undefined
-const currentConversation = computed(() => conversations.value.find((item) => item.id === currentConversationId.value))
 const qqChunkRange = computed(() => {
   const target = Math.min(100, Math.max(5, Number(qqReplySettings.value.chunk_target_chars) || 20))
   return { min: Math.floor(target * 0.7), max: Math.ceil(target * 1.3) }
@@ -753,26 +722,10 @@ function changeTab(tab: string | number) {
   }
 }
 
-function isMessagesNearBottom(element: HTMLElement) {
-  return element.scrollHeight - element.scrollTop - element.clientHeight < 56
-}
-
-function handleMessagesScroll(event: Event) {
-  messagesAutoFollow.value = isMessagesNearBottom(event.currentTarget as HTMLElement)
-}
-
-async function scrollMessagesToBottom(force = false) {
-  await nextTick()
-  const element = messagesContainer.value
-  if (!element || (!force && !messagesAutoFollow.value)) return
-  element.scrollTop = element.scrollHeight
-}
-
 async function loadBase() {
-  const [healthData, modelData, conversationData, knowledgeData, personaData] = await Promise.all([
+  const [healthData, modelData, knowledgeData, personaData] = await Promise.all([
     api<Record<string, unknown>>('/health'),
     api<ModelProfile[]>('/models'),
-    api<Conversation[]>('/conversations'),
     api<KnowledgeBase[]>('/knowledge-bases'),
     api<PersonaRow[]>('/personas'),
   ])
@@ -781,121 +734,9 @@ async function loadBase() {
   if (activeTab.value === 'models' && !editingModelAlias.value && models.value.length) {
     selectModel(models.value.find((item) => item.is_default) || models.value[0])
   }
-  conversations.value = conversationData
   knowledgeBases.value = knowledgeData
   personas.value = personaData
-  if (!currentConversationId.value && conversations.value.length) {
-    currentConversationId.value = conversations.value[0].id
-    await loadMessages()
-  }
   if (!selectedKb.value && knowledgeBases.value.length) selectedKb.value = knowledgeBases.value[0].id
-}
-
-async function createConversation() {
-  const item = await api<Conversation>('/conversations', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ title: `会话 ${conversations.value.length + 1}` }),
-  })
-  conversations.value.unshift(item)
-  currentConversationId.value = item.id
-  messages.value = []
-  messagesAutoFollow.value = true
-  await scrollMessagesToBottom(true)
-}
-
-async function loadMessages(force = true) {
-  const conversationId = currentConversationId.value
-  const request = messagesRequests.begin(conversationId)
-  if (!conversationId) {
-    messages.value = []
-    messagesLoading.value = false
-    return
-  }
-  messages.value = []
-  messagesLoading.value = true
-  try {
-    const data = await api<Message[]>(`/conversations/${conversationId}/messages`)
-    if (!messagesRequests.isCurrent(request, currentConversationId.value)) return
-    messages.value = data
-    if (force) messagesAutoFollow.value = true
-    await scrollMessagesToBottom(force)
-  } catch (error) {
-    if (messagesRequests.isCurrent(request, currentConversationId.value)) {
-      ElMessage.error(`消息加载失败：${(error as Error).message}`)
-    }
-  } finally {
-    if (messagesRequests.isCurrent(request, currentConversationId.value)) messagesLoading.value = false
-  }
-}
-
-async function selectConversation(conversationId: string) {
-  if (currentConversationId.value === conversationId && messagesLoading.value) return
-  currentConversationId.value = conversationId
-  messages.value = []
-  messagesAutoFollow.value = true
-  await loadMessages()
-}
-
-async function switchModel(alias: string) {
-  if (!currentConversationId.value) return
-  await api(`/conversations/${currentConversationId.value}/model`, {
-    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model_alias: alias }),
-  })
-  await loadBase()
-  ElMessage.success(`已切换为 ${alias}`)
-}
-
-async function switchPersona(personaId: string) {
-  if (!currentConversationId.value) return
-  await api(`/conversations/${currentConversationId.value}/persona`, {
-    method: 'PUT', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ persona_id: personaId || null }),
-  })
-  await loadBase()
-  ElMessage.success(personaId ? '已切换人格' : '已关闭人格')
-}
-
-async function deleteConversation(item: Conversation) {
-  if (item.platform !== 'web' || !window.confirm(`确定删除网页会话“${item.title}”？消息和工作流记录将被删除。`)) return
-  try {
-    await api(`/conversations/${item.id}`, { method: 'DELETE' })
-    const wasCurrent = currentConversationId.value === item.id
-    conversations.value = conversations.value.filter((conversation) => conversation.id !== item.id)
-    if (wasCurrent) {
-      const next = conversations.value[0]
-      currentConversationId.value = next?.id || ''
-      messages.value = []
-      messagesAutoFollow.value = true
-      if (next) await loadMessages()
-    }
-    ElMessage.success('网页会话已删除')
-  } catch (error) {
-    ElMessage.error((error as Error).message)
-  }
-}
-
-async function send() {
-  const text = input.value.trim()
-  if (!text || sending.value) return
-  if (!currentConversationId.value) await createConversation()
-  input.value = ''
-  messages.value.push({ role: 'user', content: text }, { role: 'assistant', content: '' })
-  const target = messages.value[messages.value.length - 1]
-  messagesAutoFollow.value = true
-  await scrollMessagesToBottom(true)
-  sending.value = true
-  try {
-    await streamChat({ conversation_id: currentConversationId.value, message: text }, (event, data) => {
-      if (event === 'token') target.content += String(data.text || '')
-      if (event === 'error') target.content = `错误：${data.message}`
-      if (event === 'token') void scrollMessagesToBottom()
-    })
-    await loadMessages(false)
-  } catch (error) {
-    target.content = `错误：${(error as Error).message}`
-  } finally {
-    sending.value = false
-  }
 }
 
 async function createKb() {
@@ -1763,7 +1604,7 @@ async function searchManga() {
 async function requestDownload(albumId: string) {
   const result = await api<{ task: TaskRow }>('/manga/download', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ album_id: albumId, requester_id: 'local-owner', conversation_id: currentConversationId.value || null }),
+    body: JSON.stringify({ album_id: albumId, requester_id: 'local-owner', conversation_id: null }),
   })
   await loadMemoryTasks()
   ElMessage.success(`已创建下载任务 ${result.task.id}，无需二次确认`)
@@ -1883,34 +1724,7 @@ onUnmounted(() => {
           <div><span class="eyebrow">本地智能工作台</span><h1>{{ currentPage.title }}</h1><p>{{ currentPage.description }}</p></div>
         </div>
 
-        <section v-if="activeTab === 'chat'" class="chat-grid" :class="{ 'conversation-hidden': !conversationListOpen }">
-          <aside class="panel conversation-panel">
-            <div class="panel-heading"><div><span class="section-kicker">会话</span><h2>最近对话</h2></div><el-button type="primary" @click="createConversation">新建</el-button></div>
-            <div class="conversation-list">
-              <div v-for="item in conversations" :key="item.id" class="conversation-row">
-                <button class="conversation" :class="{ active: item.id === currentConversationId }" @click="currentConversationId = item.id; loadMessages()">
-                  <span class="conversation-icon"><el-icon><ChatDotRound /></el-icon></span><span><strong>{{ item.title }}</strong><small>{{ item.model_alias }} · {{ item.platform === 'web' ? '网页' : 'QQ' }}</small></span>
-                </button>
-                <button v-if="item.platform === 'web'" class="conversation-delete" aria-label="删除网页会话" title="删除网页会话" :disabled="sending && item.id === currentConversationId" @click="deleteConversation(item)"><el-icon><Delete /></el-icon></button>
-              </div>
-              <div v-if="!conversations.length" class="empty-copy">还没有会话，点击“新建”开始对话。</div>
-            </div>
-          </aside>
-          <section class="panel chat-panel">
-            <div class="chat-toolbar">
-              <div class="chat-title"><button class="icon-button conversation-toggle" aria-label="显示或隐藏会话列表" @click="conversationListOpen = !conversationListOpen"><el-icon><Menu /></el-icon></button><span><span class="section-kicker">当前会话</span><strong>{{ currentConversation?.title || '未选择会话' }}</strong></span></div>
-              <div class="toolbar-selects">
-                <el-select :model-value="currentConversation?.model_alias" placeholder="选择模型" @change="switchModel"><el-option v-for="model in models" :key="model.alias" :label="`${model.alias}${model.configured ? '' : '（未配置）'}`" :value="model.alias" /></el-select>
-                <el-select :model-value="currentConversation?.persona_id || ''" placeholder="选择人格" @change="switchPersona"><el-option label="关闭人格" value="" /><el-option v-for="item in personas" :key="item.id" :label="`${item.name}${item.status === 'active' ? '' : '（文件无效）'}`" :value="item.id" :disabled="item.status !== 'active'" /></el-select>
-              </div>
-            </div>
-            <div ref="messagesContainer" class="messages" v-loading="messagesLoading" @scroll="handleMessagesScroll">
-              <div v-if="!messages.length && !messagesLoading" class="chat-empty"><span class="empty-orb"><el-icon><ChatDotRound /></el-icon></span><h3>开始一段新对话</h3><p>选择模型和人格，然后输入你的问题。</p></div>
-              <article v-for="(message, index) in messages" :key="message.id || index" :class="['message', message.role]"><span>{{ message.role === 'user' ? '你' : 'M200 Agent' }}</span><p>{{ message.content }}</p></article>
-            </div>
-            <div class="composer"><el-input v-model="input" type="textarea" :rows="3" resize="none" placeholder="输入消息，Ctrl+Enter 发送" @keydown.ctrl.enter.prevent="send" /><el-button type="primary" :loading="sending" @click="send">发送</el-button></div>
-          </section>
-        </section>
+        <ChatPage v-if="activeTab === 'chat'" :models="models" :personas="personas" @changed="loadBase" />
 
         <template v-else-if="activeTab === 'companion'">
           <section v-if="!companionOwners.length" class="panel stack">
