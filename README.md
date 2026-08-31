@@ -1,21 +1,23 @@
 # M200 Agent
 
 M200 Agent 是一个面向个人单用户场景的 AI Agent 原型。它以 FastAPI、LangGraph 和
-Vue 3 为核心，提供 Web 对话、三层记忆、文档混合检索、NapCat/OneBot v11 QQ 接入，以及
-仅 Owner 可创建的 JMComic 持久下载任务。P0 还提供 Owner QQ 私聊情感陪伴闭环：多标签情绪分析、
-支持策略路由、安全边界、用户纠正与反馈、授权关系资料，以及 Web 管理、导出和分类删除。
+Vue 3 为核心，提供 Web 对话、三层记忆、文档混合检索、NapCat/OneBot v11 QQ 接入、
+可选视觉输入，以及仅管理员可创建的 JMComic 持久下载任务。P0 还提供管理员 QQ 私聊
+情感陪伴闭环：多标签情绪分析、支持策略路由、安全边界、用户纠正与反馈、授权关系资料，
+以及 Web 管理、导出和分类删除。
 
 这是面向个人使用的 v0.4 版本，不是生产级多用户系统。项目默认仅接受回环访问，不包含
-Docker、Redis、Celery、完整 RBAC、OCR、语音/视觉模型、生产日志平台或云部署配置。
+Docker、Redis、Celery、完整 RBAC、OCR、语音、图像 RAG、生产日志平台或云部署配置。
 
 ## 当前发布
 
-- 当前版本：`v0.4.4`
+- 当前版本：`v0.4.5`
 - 仓库：<https://github.com/sanhuaz/M200_Agent>
 
 ## 功能
 
 - OpenAI 兼容文本模型，多模型配置并按会话切换；模型管理页可设主默认模型并同步现有会话。
+- 模型配置可显式开启 `supports_vision`；只有确认支持视觉输入的模型才接受图片请求。
 - LangGraph 原生 Function Calling，不使用正则模拟工具调用。
 - SQLite 保存会话、消息、用户事实、确认请求和后台任务。
 - LangGraph 负责单轮工具编排，最终状态直接从流中取得；会话历史与摘要由业务数据库保存。
@@ -25,20 +27,26 @@ Docker、Redis、Celery、完整 RBAC、OCR、语音/视觉模型、生产日志
 - 可选在线 Reranker，失败时明确降级到 RRF，不伪装成重排成功。
 - BGE 或 OpenAI 兼容在线 Embedding；切换配置时使用影子索引重建。
 - NapCat OneBot v11 WebSocket Client 接入、消息去重、群聊触发规则和分组命令帮助。
-- Owner QQ 私聊默认进入情感陪伴流程；支持多标签情绪分析、倾听/梳理/安慰/建议路由、高风险安全转向，
-  以及 `/support`、`/emotion`、`/feedback`、`/companion` 命令。非 Owner 私聊和群聊保持通用 Agent 行为。
+- 管理员 QQ 私聊默认进入情感陪伴流程；支持多标签情绪分析、倾听/梳理/安慰/建议路由、高风险安全转向，
+  以及 `/support`、`/emotion`、`/feedback`、`/companion` 命令。非管理员私聊和群聊保持通用 Agent 行为。
 - 陪伴主模型接收 Top-3 情绪候选、支持需要和最终策略作为不确定辅助信号；七种普通策略攻略可在 Web 编辑、
   查看版本、回滚和恢复默认值，角色语气仍由结构化角色卡优先决定。
-- Owner QQ 私聊支持持久化“你听我说”模式，连续短消息可在 30 秒静默或完成命令后合并处理；标准安全预检仍在缓冲前执行。
+- 管理员 QQ 私聊支持持久化“倾听模式”，连续短消息可在 30 秒静默或完成命令后合并处理；标准安全预检仍在缓冲前执行。
 - QQ 主模型回复在完整生成与复核后按语义自然分批发送，数据库仍保存一条完整助手消息；空白和无文本文件回执在入口直接忽略。
 - 标准安全模式下，高风险消息由受限 LLM 结合原文、近期上下文和人格语气生成安全说明；普通回复触发复核时
-  只重写一次再降级。已启用的 QQ Owner 可通过 `/companion safety unfiltered confirm` 切换为仅审计、不中断普通
+  只重写一次再降级。已启用的 QQ 管理员可通过 `/companion safety unfiltered confirm` 切换为仅审计、不中断普通
   Agent 的无过滤模式，并用 `/companion status` 查看；模型服务商自身规则仍然有效。
-- 关系记忆默认关闭，一次授权后按 Owner、人格隔离保存低敏感事实；Web 长期记忆中心统一管理普通事实与陪伴关系，
+- 关系记忆默认关闭，一次授权后按管理员、人格隔离保存低敏感事实；Web 长期记忆中心统一管理普通事实与陪伴关系，
   `/companion`、`/emotion-records` 和 `/privacy` 支持陪伴设置、纠正、导出与分类删除，旧 `/relationships` 自动跳转到关系筛选。
-- JMComic 搜索、Owner 直接下载、单 Worker、PDF 产物、QQ 私聊发送与显式清理。
+- JMComic 搜索、管理员直接下载、单 Worker、PDF 产物、QQ 私聊发送与显式清理。
 - 动态 Tool Registry：内置 Tool、审核后启用的 Python Tool、文件创建 Tool。
 - Agent Skills：`SKILL.md` 导入、启停、自动/手动加载；包内脚本只展示不执行。
+- MCP：通过官方 Python MCP SDK 接入 stdio、SSE 和 Streamable HTTP Server；工具、资源、资源模板和 Prompt
+  统一进入 Tool Registry，逐项授权后才可调用。第三方 MCP Server 的实际稳定性取决于其自身实现，并非模型本身。
+- Web 和 QQ 支持 JPEG、PNG、GIF、WebP 文图或纯图片消息；每条消息最多 4 张、总大小不超过 32 MiB、
+  图片最多 40MP。图片只保存在私有 `data/chat-images/`，不进入 Chroma、RAG 或公开目录。
+- 图片输入校验失败时不保存；消息/附件持久化失败会回滚并删除图片；已持久化后模型失败则保留用户消息和图片，
+  不写助手消息并允许重试。
 - 文件化结构角色卡存放在本机 `persona/`，JSON 文件是正文唯一权威来源，数据库只保留索引和会话引用；Web 与 QQ 会话可独立选择人格或关闭人格。
 - 长期记忆中心对外统一展示普通事实与陪伴关系，并按全局、QQ 用户、群组和人格筛选；内部仍保留两个独立存储库。
 - 文件产物隔离、SHA-256 记录、Web 下载及 QQ 私聊发送。
@@ -51,12 +59,13 @@ Docker、Redis、Celery、完整 RBAC、OCR、语音/视觉模型、生产日志
 Web / QQ
    ↓
 FastAPI API + OneBot WebSocket
-   ↓
-Owner QQ 私聊：陪伴安全预检 →（标准安全转向 / 无过滤审计）→ 情绪分析 → 策略路由 → 关系资料（需授权）
-   ↓
+   ├─ ChatTurnInput（文本与图片附件）
+   ├─ MCP Manager（stdio / SSE / Streamable HTTP）
+   └─ 管理员 QQ 私聊：陪伴安全预检 →（标准安全转向 / 无过滤审计）→ 情绪分析 → 策略路由 → 关系资料（需授权）
+        ↓
 LangGraph Agent
    ├─ Chat Model / Function Calling
-   ├─ Dynamic Tool Registry / Skills
+   ├─ Unified Tool Registry / Skills / MCP
    ├─ Long-term Memory
    ├─ Knowledge Retrieval
    │    ├─ Chroma Vector Search
@@ -65,30 +74,30 @@ LangGraph Agent
    │    └─ Optional Reranker
    └─ Manga Search / Confirmation / Job Worker
         ↓
-SQLite + Chroma + Generated Artifacts
+SQLite（关系、消息、状态） + Chroma（文档/记忆向量） + 私有图片与生成产物
 ```
 
 ### 公开仓库目录架构
 
-以下是 `v0.4.4` 实际发布到 GitHub 的源码结构；本机测试、评测、运行数据和私有材料不在其中：
+以下是 `v0.4.5` 实际发布源码的目录结构；测试集、评测运行结果、运行数据、第三方本机 Skill 和私有材料不在其中：
 
 ```text
 M200_Agent/
 ├─ backend/
 │  ├─ alembic/
 │  │  ├─ env.py
-│  │  └─ versions/                 # 0001—0009，支持旧数据库逐版升级
+│  │  └─ versions/                 # 0001—0011，支持旧数据库逐版升级
 │  └─ app/
-│     ├─ api/                      # 分域 Router、OneBot 入口/传输/消息/投递
+│     ├─ api/                      # 分域 Router、聊天、多模态附件、OneBot、MCP
 │     ├─ core/                     # 环境配置
 │     ├─ db/                       # SQLAlchemy 模型与 Session
 │     ├─ domain/                   # 与存储无关的领域类型
-│     ├─ services/                 # 聊天、记忆、RAG、陪伴、扩展与任务服务
+│     ├─ services/                 # 聊天、附件、记忆、RAG、陪伴、扩展、MCP 与任务服务
 │     ├─ workflows/                # LangGraph Agent 图
 │     └─ main.py                   # FastAPI 生命周期与应用入口
 ├─ frontend/
 │  ├─ src/
-│  │  ├─ features/                 # 导航、筛选和请求竞态等纯逻辑
+│  │  ├─ features/                 # 聊天、MCP、导航、筛选和请求竞态等纯逻辑
 │  │  ├─ pages/                    # 页面级异步组件
 │  │  ├─ services/                 # API 与 SSE 客户端
 │  │  ├─ types/                    # 前端领域类型
@@ -98,12 +107,13 @@ M200_Agent/
 │  └─ pnpm-lock.yaml
 ├─ scripts/
 │  ├─ start.ps1 / stop.ps1         # 本机启动与安全停止
+│  ├─ python-resolver.ps1          # Python 3.13 自动发现与手动选择
 │  ├─ migrate.ps1                  # 迁移判断、升级前备份和自动保留
 │  ├─ migration_plan.py            # 当前版本与目标 head 比较
 │  ├─ backup_inventory.ps1         # 旧备份只读清单
 │  └─ langgraph_rag_eval.py        # LangGraph 知识库选路评测方法
 ├─ data/                            # 仅发布运行目录占位文件
-├─ persona/ / skills/ / tools/     # 仅发布目录占位文件
+├─ persona/ / skills/ / tools/     # 公开仓库仅保留目录占位文件
 ├─ .env.example                    # 无真实密钥的配置模板
 ├─ alembic.ini
 ├─ pyproject.toml
@@ -113,12 +123,13 @@ M200_Agent/
 ```
 
 `backend/alembic/versions/` 中的历史迁移不是重复文件。Alembic 需要按修订链将旧版本数据库逐步升级到
-`0009_remove_legacy_persona_payload`，因此公开发行必须保留 `0001`—`0009`。
+`0011_message_attachments`，因此公开发行必须保留 `0001`—`0011`。
 
 ## 技术栈
 
 - Python 3.13、FastAPI、SQLAlchemy、Alembic、Uvicorn
 - LangChain 1.2、LangGraph 1.1
+- MCP Python SDK 2.1.1、Pillow 12.3.0
 - SQLite FTS5、ChromaDB、Sentence Transformers、jieba
 - Vue 3、TypeScript、Vite、Element Plus
 - NapCat OneBot v11、JMComic-Crawler-Python
@@ -156,7 +167,7 @@ Copy-Item ".env.example" ".env"
 可在 Web 管理端 `/models` 的“模型管理”页面快捷调整模型名称、`base_url`、思考强度、流式输出、温度和请求限制：
 
 ```env
-MODEL_PROFILES_JSON=[{"alias":"default","model":"your-tool-capable-model","base_url":"https://provider.example/v1","api_key_env":"PERSONAL_AGENT_LLM_API_KEY","reasoning_effort":null,"streaming":true,"temperature":null,"context_window":1000000,"input_soft_limit":131072,"max_output_tokens":16384,"timeout_seconds":120}]
+MODEL_PROFILES_JSON=[{"alias":"default","model":"your-tool-capable-model","base_url":"https://provider.example/v1","api_key_env":"PERSONAL_AGENT_LLM_API_KEY","reasoning_effort":null,"streaming":true,"temperature":null,"context_window":1000000,"input_soft_limit":131072,"max_output_tokens":16384,"timeout_seconds":120,"supports_vision":false}]
 PERSONAL_AGENT_LLM_API_KEY=<provider-api-key>
 ```
 
@@ -192,7 +203,7 @@ RERANK_MODEL=BAAI/bge-reranker-v2-m3
 RERANK_API_KEY=<reranker-api-key>
 ```
 
-QQ 高成本命令需要配置 Owner。Owner 应是给机器人发送消息的个人 QQ，而不是机器人自身账号：
+QQ 管理命令需要配置管理员。管理员应是给机器人发送消息的个人 QQ，而不是机器人自身账号：
 
 ```env
 ONEBOT_TOKEN=<onebot-token>
@@ -211,9 +222,26 @@ NAPCAT_WEBUI_TOKEN=<napcat-webui-token>
 推荐直接在 `/logs` 页面填写地址和 Token，后端使用 NapCat 官方 WebUI 登录并订阅实时 SSE 日志。地址必须是
 回环地址；Token 只写入被版本控制忽略的 `.env` 并同步当前进程环境，接口、页面、运行日志和归档日志都不会返回或记录 Token。NapCat 启用 2FA 时，页面会提示不支持自动续期。
 
+## MCP 外部工具与服务
+
+在 Web 的 `/mcp` 设置页管理 MCP Server。每个 Server 默认停用、授权为空、访问策略为 `owner_only`，
+管理员确认后才会把目录中的项目加入统一 Tool Registry：
+
+- `stdio` 适合本机进程；`SSE` 和 `Streamable HTTP` 适合本机或受控网络服务。
+- 支持发现和按需调用 Tools、Resources、Resource Templates、Prompts。Resources 和 Prompts 不会自动注入系统提示词，
+  由桥接工具按需读取，文本返回模型，二进制内容保存为本机 Artifact。
+- Server 配置只保存非敏感参数；密钥写入 `.env`，SQLite 和 API 只保留环境变量引用及“已配置”状态。
+- 可逐项设置 Tool、Resource、Template 和 Prompt 白名单；MCP 名称使用 `mcp__<server_slug>__<item_name>`，不会覆盖内置工具。
+- 单个第三方 Server 的连接、目录或调用失败只标记该 Server，不阻断应用启动、普通聊天或其他 Server。
+- 固定风险说明：第三方 MCP Server 的实际稳定性取决于其自身实现，并非模型本身。
+
+管理端对应接口为 `GET/POST /api/v1/mcp/servers`、`PUT/DELETE /api/v1/mcp/servers/{id}`、
+`PUT /api/v1/mcp/servers/{id}/enabled`、`POST .../test`、`POST .../refresh`、`GET .../catalog` 和
+`PUT .../grants/{kind}`。本项目不实施 OAuth 交互登录、Sampling、Elicitation、Roots 或订阅。
+
 ## 启动
 
-分别启动后端和前端：
+分别启动后端和前端时，先确保当前终端可找到 Python 3.13：
 
 ```powershell
 Set-Location backend
@@ -230,6 +258,19 @@ pnpm run dev
 ```powershell
 .\scripts\start.ps1
 ```
+
+启动脚本按以下顺序寻找解释器，并逐一验证 `sys.executable` 和 Python 版本：
+`-PythonExe` 参数、`PERSONAL_AGENT_PYTHON`、项目 `.venv\Scripts\python.exe`、`py -3.13`、`PATH` 中的 `python`，
+最后才在交互终端中要求手动输入完整路径。例如：
+
+```powershell
+.\scripts\start.ps1 -PythonExe "C:\Python313\python.exe"
+# 或
+$env:PERSONAL_AGENT_PYTHON = "C:\Python313\python.exe"
+.\scripts\start.ps1
+```
+
+依赖安装也应使用同一解释器。维护者检查使用 `requirements-dev.txt`，普通用户只需安装 `requirements.txt`。
 
 停止由项目脚本启动的前后端：
 
@@ -271,16 +312,19 @@ Token: 与 .env 中 ONEBOT_TOKEN 完全一致
 - 群聊仅响应 `@机器人` 或 `/ai` 前缀。
 - `/help` 按会话与模型、知识库与记忆、人格、Tools 与 Skills、漫画、确认分组显示完整命令。
 - `/new`、`/reset-context`、`/context`、`/model list`、`/kb`、`/memory`、`/jm` 可用于查询或管理会话。
-- Owner 私聊可使用 `/support auto|listen|reflect|advice`、`/emotion`、`/emotion correct <情绪标签>`、
+- 管理员私聊可使用 `/support auto|listen|reflect|advice`、`/emotion`、`/emotion correct <情绪标签>`、
   `/feedback helpful|unhelpful|no-advice`、`/companion pause|resume` 和 `/companion memory on|off`；
   还可使用 `/companion safety standard`、`/companion safety unfiltered confirm` 和 `/companion status`；
   合法情绪标签会在无效输入时提示，纠正不会覆盖原始分析。
-- 陪伴流程只对已启用 Owner 的私聊生效；暂停后回到通用 Agent，群聊和非 Owner 不创建陪伴数据。
+- 陪伴流程只对已启用管理员的私聊生效；暂停后回到通用 Agent，群聊和非管理员不创建陪伴数据。
 - 记忆授权关闭时陪伴私聊不召回或新增普通长期记忆/关系资料；标准模式高风险内容停止普通角色扮演和工具调用，
   无过滤模式只记录风险并继续普通 Agent 全链路，但仍保留权限、Tool 确认、文件隔离和密钥脱敏。
 - 会话上下文采用增量摘要和 Token 预算；`/new` 只归档短期对话，不删除长期记忆。群聊共享群上下文，但不会召回成员私聊记忆。
 - `/tools`、`/skills`、`/skill <name> <request>` 可查看和手动触发已启用扩展。
-- `/model use`、漫画下载/删除和管理操作仅 Owner 可用。Tool/Skill 管理仍使用 `/confirm` 二次确认。
+- `/model use`、漫画下载/删除和管理操作仅管理员可用。Tool/Skill 管理仍使用 `/confirm` 二次确认。
+- 管理员私聊的 `/listening` 命令继续兼容“你听我说”自然语言触发，产品显示统一为“倾听模式”；图片和文字会共同缓冲，
+  完成或静默后合并为一个多模态轮次。
+- QQ 图片支持文图、纯图片和最多 4 张多图；模型未启用 `supports_vision` 或图片校验失败时，在写入前返回错误。
 - `/jm download <漫画ID>` 立即创建下载任务；QQ 发送成功后可用 `/jm delete <任务ID>` 删除产物。
 - 健康检查中的 OneBot 状态分为 `connected`、`configured_disconnected`、
   `needs_configuration`。
@@ -288,6 +332,16 @@ Token: 与 .env 中 ONEBOT_TOKEN 完全一致
 - 日志接口：`GET /api/v1/logs`、`GET /api/v1/logs/active`、`GET /api/v1/logs/stream`；NapCat 配置使用
   `GET/PUT /api/v1/logs/config`，草稿连接测试使用 `POST /api/v1/logs/test-connection`，停止脚本使用
   `POST /api/v1/logs/finalize`，这些管理接口仅接受回环请求。
+
+## Web 识图
+
+聊天页 `/chat` 支持选择、预览、发送和删除 JPEG、PNG、GIF、WebP。文本为空但有图片时可以发送，
+每条消息最多 4 张、总大小不超过 32 MiB、总像素不超过 40MP；服务器会再次使用 Pillow 检查真实格式和像素。
+含图片请求使用 `multipart/form-data` 的 `/api/v1/chat/stream/multimodal`，旧的 JSON `/api/v1/chat/stream` 保持兼容。
+
+图片保存在私有 `data/chat-images/`，数据库只保存附件元数据和相对路径，不进入文档索引、Chroma 或 RAG。
+消息和附件持久化成功后，如果模型或 Agent 超时，用户消息和图片会保留，不写助手消息，页面通过 SSE 返回失败并可直接重试。
+删除附件时先原子移动到同目录临时回收名，再删除数据库记录；数据库提交失败会恢复原路径，提交成功后才彻底删除文件。
 
 ## 文档检索
 
@@ -308,20 +362,21 @@ Chroma 语义召回 20 条
 ## 漫画任务边界
 
 - 搜索不会自动下载。
-- 只有 Owner 可以下载；Owner 发起后立即创建任务，不再要求二次确认。
+- 只有管理员可以下载；管理员发起后立即创建任务，不再要求二次确认。
 - Worker 单并发，瞬时失败最多重试两次，默认只生成 PDF。
-- QQ 仅向 Owner 私聊自动发送；超过阈值或发送失败时返回产物位置。
-- 成功发送后，Owner 可通过 QQ 命令或 Web 任务页显式删除该任务的产物；任务审计记录保留。
+- QQ 仅向管理员私聊自动发送；超过阈值或发送失败时返回产物位置。
+- 成功发送后，管理员可通过 QQ 命令或 Web 任务页显式删除该任务的产物；任务审计记录保留。
 - 用户应确保对下载内容拥有合法保存权利。
 
 ## 扩展边界
 
 - Tool ZIP 必须包含 `tool.json` 和 `plugin.py:create_tools`，导入后默认停用，不自动安装依赖。
 - Skill ZIP 必须包含与目录同名的 `SKILL.md`；启动只读取名称/描述，完整内容按需加载。
+- MCP Server 默认停用，使用 `owner_only` 访问策略和逐项白名单；连接由 MCP Manager 管理，调用通过统一 Tool Registry。
 - 人格使用结构化角色卡并以 `persona/` 中的 JSON 文件为正文唯一来源；数据库只保留索引、状态和会话引用，
   角色卡不能修改系统规则、工具、权限、记忆范围、密钥或文件根目录。
 - 文件只能写入受控的生成目录，不自动执行；多文件自动 ZIP。
-- `local-owner` 永久存在不可删除，QQ Owner 由数据库实时管理；`.env` Owner 仅首次迁移导入。
+- `local-owner` 永久存在不可删除，QQ 管理员由数据库实时管理；`.env` 中的 `OWNER_QQ_IDS` 仅首次迁移导入。
 
 ## 验证
 
@@ -351,9 +406,9 @@ Top-3 87.65%、Micro-F1 0.7024，报告保存在被版本控制忽略的评测�
 合并 Top-1 70.59%、Top-3 88.82%、Micro-F1 0.6890，报告保存在被版本控制忽略的评测目录。
 两套题集均为场景设计金标，不代表真实用户的客观情绪；结果不覆盖既有题集和历史报告。
 
-当前前端仍由 `App.vue` 维护顶层状态和主要工作区，但导航、请求竞态、记忆筛选、SSE 解析已拆为 feature 模块，
-管理员、系统状态和任务中心使用异步页面组件形成独立 chunk。项目暂未引入 Vue Router 或 Pinia；其余页面与
-Element Plus 仍使主包约为 1.11 MB，后续可继续按页面拆分。
+当前前端仍由 `App.vue` 维护顶层导航和部分管理工作区；聊天与 MCP 已分别由 `ChatPage.vue`、`McpPage.vue` 接管，
+并通过异步组件形成页面级 chunk。导航、请求竞态、记忆筛选、聊天/MCP API 与 SSE 解析已拆为 feature/type 模块。
+项目暂未引入 Vue Router 或 Pinia；Element Plus 仍使主包约为 1.11 MB，后续可继续按页面拆分。
 
 ## 安全与发布边界
 
@@ -371,16 +426,27 @@ Element Plus 仍使主包约为 1.11 MB，后续可继续按页面拆分。
 
 ## 未完成内容
 
-- `start.ps1`、本机 `check.ps1` 与 `stop.ps1` 仍包含维护者机器的 Python 回退路径
-  `D:\miniconda\envs\langchain1.2\python.exe`。其他机器当前应显式配置 `PERSONAL_AGENT_PYTHON`；
-  后续需要改为项目 `.venv`、Python Launcher 或 `PATH` 自动发现。本版本只记录该问题，不改变脚本行为。
-- 前端仍由 `App.vue` 维护顶层状态和多数工作区；目前仅管理员、系统状态和任务中心形成页面级异步分包，
-  尚未完成全页面组件拆分，主包体积仍需继续治理。
+- 真实 NapCat/OneBot QQ 环境尚未在本机运行，QQ 私聊、群聊和倾听模式的真实图片请求需在有 QQ 测试环境时复验。
+- 真实视觉模型正向验收依赖目标服务可用，并需要在模型管理页显式开启 `supports_vision`；本版本已用合成提示验证文本模型，
+  不把未发送用户图片的本地回归写成真实视觉成功。
+- 前端仍有部分管理工作区集中在 `App.vue`，Element Plus 主包约 1.11 MB；后续可继续页面级拆分，但不影响当前功能。
 - 当前定位仍是 Windows 本机单用户原型，不包含公网认证、多用户并发、云部署或安装器。
 
 ## 版本更新记录
 
-### v0.4.4（当前已发布）
+### v0.4.5（本地完成，等待另行发布授权）
+
+- 统一产品文案：用户可见的“你听我说模式”改为“倾听模式”，`Owner` 显示为“管理员”或“QQ 管理员”，内部权限字段保持兼容。
+- 三个启动脚本共用 Python 3.13 解析器，按显式参数、`PERSONAL_AGENT_PYTHON`、项目 `.venv`、`py -3.13`、`PATH` 和手动输入发现，
+  删除维护者机器绝对路径回退。
+- 增加 MCP Server 管理与统一工具注册，支持 stdio、SSE、Streamable HTTP、目录发现、逐项授权和故障隔离；不引入 OAuth、Sampling、Elicitation、Roots 或订阅。
+- 增加 Web、QQ 和倾听模式的图片输入，支持 JPEG、PNG、GIF、WebP、4 张/32 MiB/40MP 限制、视觉能力开关、私有附件存储和删除补偿，
+  不把图片写入 RAG 或 Chroma。模型失败时保留已持久化的用户消息和图片，允许重试。
+- 前端新增独立 `ChatPage.vue`、`McpPage.vue`、聊天/MCP feature 与 type 模块，保留旧文本 SSE/API 兼容，并形成页面级分包。
+- 完成 MCP、附件、OneBot、前端请求竞态和 Skill 读取的本机回归；`human-writing` 1.1.0 仅安装在维护者本机，不进入公开源码。
+- FastAPI 与前端包版本同步为 `0.4.5`；完整验收结果和仍有限制以本机实施文档为准，本机文档和测试资产不随发布外发。
+
+### v0.4.4（已发布）
 
 - 修复迁移脚本写死旧版本导致每次启动重复备份的问题：动态比较 `alembic current` 与 `heads`，只在确需升级时备份，自动迁移备份默认保留最近 3 份；人工快照和 NapCat 原始备份不自动删除。
 - 统一长期记忆、Tool/Skill 扩展和 QQ 命令的领域服务路径，消除 Web 与 QQ 删除记忆时 SQLite/Chroma 行为不一致，以及启停、删除扩展的重复实现。
