@@ -311,7 +311,7 @@ const pageDetails: Record<string, { title: string; description: string }> = {
   models: { title: '模型管理', description: '配置主聊天 LLM，并在会话中快捷切换' },
   knowledge: { title: '知识库', description: '管理文档、Embedding 配置和索引状态' },
   memory: { title: '长期记忆', description: '查看和维护全局、用户与群组记忆' },
-  companion: { title: '陪伴设置', description: '为已启用的 QQ Owner 管理陪伴流程与记忆授权' },
+  companion: { title: '陪伴设置', description: '为已启用的 QQ 管理员管理陪伴流程与记忆授权' },
   strategyGuides: { title: '策略攻略', description: '编辑七种普通陪伴策略的方向性回复攻略和版本历史' },
   emotionRecords: { title: '情绪记录', description: '查看陪伴分析、支持需求、策略与用户纠正' },
   privacy: { title: '陪伴隐私', description: '导出或按分类删除陪伴数据' },
@@ -319,7 +319,7 @@ const pageDetails: Record<string, { title: string; description: string }> = {
   tools: { title: '工具管理', description: '管理工具扩展并发起漫画搜索与下载' },
   skills: { title: '技能管理', description: '导入、启用和维护 Agent Skills' },
   tasks: { title: '任务中心', description: '处理待确认操作并跟踪后台任务' },
-  admin: { title: '管理员', description: '维护拥有高权限操作能力的 QQ Owner' },
+  admin: { title: '管理员', description: '维护拥有高权限操作能力的 QQ 管理员' },
   status: { title: '系统状态', description: '查看本地服务、模型和检索组件状态' },
   logs: { title: '实时日志', description: '查看 M200 操作事件与 NapCat 原生日志流' },
 }
@@ -1529,7 +1529,7 @@ async function addAdmin() {
 }
 
 async function removeAdmin(item: AdminRow) {
-  if (item.external_id === 'local-owner' || !window.confirm(`确定移除 ${item.external_id} 的 Owner 权限？`)) return
+  if (item.external_id === 'local-owner' || !window.confirm(`确定移除 ${item.external_id} 的管理员权限？`)) return
   await api(`/admins/${item.external_id}`, { method: 'DELETE' }); await loadManagement()
 }
 
@@ -1603,7 +1603,7 @@ function newMemoryRelationship() {
     ? memoryScopeId.value.trim()
     : companionOwnerId.value || companionOwners.value[0]?.external_id || ''
   if (!ownerId) {
-    ElMessage.warning('请先在“管理员”中启用 QQ Owner')
+    ElMessage.warning('请先在“管理员”中启用 QQ 管理员')
     return
   }
   const selectedPersona = memoryPersonaKey.value || companionPersonaKey.value || 'default'
@@ -1907,22 +1907,22 @@ onUnmounted(() => {
 
         <template v-else-if="activeTab === 'companion'">
           <section v-if="!companionOwners.length" class="panel stack">
-            <div class="panel-heading"><div><span class="section-kicker">Owner</span><h2>暂无可用 QQ Owner</h2></div></div>
-            <p class="hint">请先在“管理员”中添加并启用 QQ Owner；陪伴设置不接受任意输入的 QQ 号。</p>
+            <div class="panel-heading"><div><span class="section-kicker">管理员</span><h2>暂无可用 QQ 管理员</h2></div></div>
+            <p class="hint">请先在“管理员”中添加并启用 QQ 管理员；陪伴设置不接受任意输入的 QQ 号。</p>
             <el-button type="primary" @click="changeTab('admin')">前往管理员</el-button>
           </section>
           <div v-else class="two-column" v-loading="companionLoading">
             <section class="panel stack">
-              <div class="panel-heading"><div><span class="section-kicker">身份范围</span><h2>QQ Owner 陪伴</h2></div><div class="form-row"><el-tag :type="companionPreferences?.companion_enabled ? 'success' : 'warning'">{{ companionPreferences?.companion_enabled ? '已启用' : '已暂停' }}</el-tag><el-tag v-if="companionPreferences?.safety_mode === 'unfiltered'" type="danger">无过滤模式</el-tag></div></div>
-              <label class="field-control"><span>选择已启用 QQ Owner</span><el-select v-model="companionOwnerId" @change="loadCompanionData"><el-option v-for="item in companionOwners" :key="item.external_id" :label="`${item.display_name || 'QQ Owner'} · ${item.external_id}`" :value="item.external_id" /></el-select></label>
-              <el-alert title="仅 Owner 私聊进入陪伴流程；非 Owner 私聊和所有群聊仍使用通用 Agent。" type="info" :closable="false" />
+              <div class="panel-heading"><div><span class="section-kicker">身份范围</span><h2>QQ 管理员陪伴</h2></div><div class="form-row"><el-tag :type="companionPreferences?.companion_enabled ? 'success' : 'warning'">{{ companionPreferences?.companion_enabled ? '已启用' : '已暂停' }}</el-tag><el-tag v-if="companionPreferences?.safety_mode === 'unfiltered'" type="danger">无过滤模式</el-tag></div></div>
+              <label class="field-control"><span>选择已启用 QQ 管理员</span><el-select v-model="companionOwnerId" @change="loadCompanionData"><el-option v-for="item in companionOwners" :key="item.external_id" :label="`${item.display_name || 'QQ 管理员'} · ${item.external_id}`" :value="item.external_id" /></el-select></label>
+              <el-alert title="仅 QQ 管理员私聊进入陪伴流程；非 QQ 管理员私聊和所有群聊仍使用通用 Agent。" type="info" :closable="false" />
               <div v-if="companionPreferences" class="stack companion-settings">
                 <div class="form-row"><span class="setting-label">陪伴流程</span><el-switch v-model="companionPreferences.companion_enabled" active-text="启用" inactive-text="暂停" /></div>
                 <label class="field-control"><span>默认支持方式</span><el-select v-model="companionPreferences.support_mode"><el-option label="自动判断" value="auto" /><el-option label="倾听" value="listen" /><el-option label="一起梳理" value="reflect" /><el-option label="建议" value="advice" /></el-select></label>
-                <div class="form-row"><span class="setting-label">你听我说模式</span><el-switch v-model="companionPreferences.listening_enabled" active-text="已开启" inactive-text="关闭" /><small class="hint-inline">仅 Owner QQ 私聊生效；{{ companionPreferences.listening_silence_seconds }} 秒无新片段后合并回复。</small></div>
+                <div class="form-row"><span class="setting-label">倾听模式</span><el-switch v-model="companionPreferences.listening_enabled" active-text="已开启" inactive-text="关闭" /><small class="hint-inline">仅 QQ 管理员私聊生效；{{ companionPreferences.listening_silence_seconds }} 秒无新片段后合并回复。</small></div>
                 <div class="result listening-buffer-status"><span><strong>当前缓冲</strong><small>{{ companionListeningBuffer.fragment_count }} 条片段；重启后不会自动发送，继续输入或使用完成命令即可处理。</small></span><el-button size="small" :disabled="!companionListeningBuffer.fragment_count" @click="clearCompanionListeningBuffer">清空</el-button></div>
                 <label class="field-control"><span>安全模式</span><el-select v-model="companionPreferences.safety_mode"><el-option label="标准防护" value="standard" /><el-option label="无过滤模式（仅本机拦截关闭）" value="unfiltered" /></el-select></label>
-                <el-alert v-if="companionPreferences.safety_mode === 'unfiltered'" type="error" :closable="false" title="无过滤模式已选择" description="仅关闭本机陪伴内容拦截；Owner 权限、Tool 确认、文件隔离、密钥脱敏和模型服务商自身规则仍然有效。保存时需要输入确认文本。" />
+                <el-alert v-if="companionPreferences.safety_mode === 'unfiltered'" type="error" :closable="false" title="无过滤模式已选择" description="仅关闭本机陪伴内容拦截；管理员权限、Tool 确认、文件隔离、密钥脱敏和模型服务商自身规则仍然有效。保存时需要输入确认文本。" />
                 <label class="field-control"><span>情绪分析模型 alias</span><el-select v-model="companionPreferences.analyzer_model_alias" clearable placeholder="跟随当前会话主模型"><el-option v-for="item in models" :key="item.alias" :label="`${item.alias}${item.configured ? '' : '（不可用）'}`" :value="item.alias" /></el-select><small v-if="companionAnalyzerFallbackAlias" class="hint-inline">所选 alias 不可用，当前请求会回退到：{{ companionAnalyzerFallbackAlias }}</small></label>
                 <div class="form-row"><span class="setting-label">关系记忆授权</span><el-switch v-model="companionPreferences.memory_enabled" active-text="已授权" inactive-text="关闭" /><small class="hint-inline">关闭时不召回、不新增关系资料。</small></div>
                 <label class="field-control"><span>沟通边界（JSON）</span><el-input v-model="companionBoundaryText" type="textarea" :rows="5" placeholder='例如：{"items":["不想被催着给建议"]}' /></label>
@@ -1964,10 +1964,10 @@ onUnmounted(() => {
         </template>
 
         <template v-else-if="activeTab === 'emotionRecords'">
-          <section v-if="!companionOwners.length" class="panel stack"><h2>暂无可用 QQ Owner</h2><p class="hint">请先启用 QQ Owner。</p></section>
+          <section v-if="!companionOwners.length" class="panel stack"><h2>暂无可用 QQ 管理员</h2><p class="hint">请先启用 QQ 管理员。</p></section>
           <section v-else class="panel stack">
             <div class="panel-heading"><div><span class="section-kicker">可纠正分类</span><h2>情绪分析记录</h2></div><span class="count-badge">{{ companionAssessments.length }}</span></div>
-            <div class="form-row"><el-select v-model="companionOwnerId" @change="loadCompanionData"><el-option v-for="item in companionOwners" :key="item.external_id" :label="`${item.display_name || 'QQ Owner'} · ${item.external_id}`" :value="item.external_id" /></el-select><el-button @click="loadCompanionData" :loading="companionLoading">刷新</el-button></div>
+            <div class="form-row"><el-select v-model="companionOwnerId" @change="loadCompanionData"><el-option v-for="item in companionOwners" :key="item.external_id" :label="`${item.display_name || 'QQ 管理员'} · ${item.external_id}`" :value="item.external_id" /></el-select><el-button @click="loadCompanionData" :loading="companionLoading">刷新</el-button></div>
             <el-alert title="页面不展示用户消息原文；候选标签仅用于回顾和纠正。高风险记录只显示风险级别和已执行动作。" type="warning" :closable="false" />
             <p class="hint">安全转向记录会显示“安全转向，未执行情绪分类”，不把中性占位值当作真实情绪。</p>
             <div class="table-wrap"><el-table :data="companionAssessments" empty-text="还没有陪伴分析记录"><el-table-column label="状态" width="110"><template #default="scope"><el-tag :type="companionAnalysisStatusType(scope.row.analysis_status)">{{ companionAnalysisStatusLabel(scope.row.analysis_status) }}</el-tag><small v-if="scope.row.analysis_status !== 'valid'">不展示占位分类</small></template></el-table-column><el-table-column label="情绪候选" min-width="190"><template #default="scope"><template v-if="scope.row.effective_candidate_emotions_display?.length || scope.row.analysis_status === 'valid'"><el-tag v-for="emotion in (scope.row.effective_candidate_emotions_display?.length ? scope.row.effective_candidate_emotions_display : scope.row.candidate_emotions_display)" :key="emotion" size="small" class="tag-gap">{{ emotion }}</el-tag><small v-if="scope.row.effective_primary_emotion_display || scope.row.primary_emotion_display">主：{{ scope.row.effective_primary_emotion_display || scope.row.primary_emotion_display }}</small></template><span v-else>—</span></template></el-table-column><el-table-column label="支持需要" width="120"><template #default="scope">{{ scope.row.effective_support_need_display || (scope.row.analysis_status === 'valid' ? scope.row.support_need_display : '—') }}</template></el-table-column><el-table-column label="置信度" width="100"><template #default="scope">{{ scope.row.confidence == null ? '—' : `${Math.round(scope.row.confidence * 100)}%` }}</template></el-table-column><el-table-column prop="next_action_display" label="策略" width="120" /><el-table-column label="风险" width="100"><template #default="scope"><el-tag :type="scope.row.risk_level === 'low' ? 'success' : scope.row.risk_level === 'medium' ? 'warning' : 'danger'">{{ scope.row.risk_level }}</el-tag></template></el-table-column><el-table-column label="纠正" min-width="340"><template #default="scope"><div v-if="companionCorrectionDrafts[scope.row.user_message_id]" class="correction-cell"><el-select v-model="companionCorrectionDrafts[scope.row.user_message_id].emotions" multiple collapse-tags placeholder="选择 1-3 个情绪"><el-option v-for="emotion in companionEmotionOptions" :key="emotion.value" :label="emotion.label" :value="emotion.value" /></el-select><el-select v-model="companionCorrectionDrafts[scope.row.user_message_id].support_need" placeholder="支持需要"><el-option v-for="(label, value) in companionSupportNeedLabels" :key="value" :label="label" :value="value" /></el-select><el-button size="small" type="primary" @click="submitCompanionCorrection(scope.row)">保存纠正</el-button></div></template></el-table-column></el-table></div>
@@ -1976,9 +1976,9 @@ onUnmounted(() => {
         </template>
 
         <template v-else-if="activeTab === 'privacy'">
-          <section v-if="!companionOwners.length" class="panel stack"><h2>暂无可用 QQ Owner</h2><p class="hint">请先启用 QQ Owner。</p></section>
+          <section v-if="!companionOwners.length" class="panel stack"><h2>暂无可用 QQ 管理员</h2><p class="hint">请先启用 QQ 管理员。</p></section>
           <div v-else class="two-column">
-            <section class="panel stack"><div class="panel-heading"><div><span class="section-kicker">数据可携带</span><h2>导出陪伴数据</h2></div><el-icon><DataAnalysis /></el-icon></div><div class="form-row"><el-select v-model="companionOwnerId" @change="loadCompanionData"><el-option v-for="item in companionOwners" :key="item.external_id" :label="`${item.display_name || 'QQ Owner'} · ${item.external_id}`" :value="item.external_id" /></el-select><el-button type="primary" @click="exportCompanionData">导出 JSON</el-button></div><p class="hint">导出包含偏好、关系资料、情绪元数据、反馈和脱敏安全事件，不包含聊天正文、系统提示词、模型推理、密钥或日志凭据。</p><div class="card-list"><div class="result"><span><strong>关系资料</strong><small>{{ companionRelationships.length }} 条</small></span><el-tag type="info">可管理</el-tag></div><div class="result"><span><strong>情绪记录</strong><small>{{ companionAssessments.length }} 条</small></span><el-tag type="info">可纠正</el-tag></div><div class="result"><span><strong>反馈记录</strong><small>{{ companionFeedback.length }} 条</small></span><el-tag type="info">可更新</el-tag></div></div></section>
+            <section class="panel stack"><div class="panel-heading"><div><span class="section-kicker">数据可携带</span><h2>导出陪伴数据</h2></div><el-icon><DataAnalysis /></el-icon></div><div class="form-row"><el-select v-model="companionOwnerId" @change="loadCompanionData"><el-option v-for="item in companionOwners" :key="item.external_id" :label="`${item.display_name || 'QQ 管理员'} · ${item.external_id}`" :value="item.external_id" /></el-select><el-button type="primary" @click="exportCompanionData">导出 JSON</el-button></div><p class="hint">导出包含偏好、关系资料、情绪元数据、反馈和脱敏安全事件，不包含聊天正文、系统提示词、模型推理、密钥或日志凭据。</p><div class="card-list"><div class="result"><span><strong>关系资料</strong><small>{{ companionRelationships.length }} 条</small></span><el-tag type="info">可管理</el-tag></div><div class="result"><span><strong>情绪记录</strong><small>{{ companionAssessments.length }} 条</small></span><el-tag type="info">可纠正</el-tag></div><div class="result"><span><strong>反馈记录</strong><small>{{ companionFeedback.length }} 条</small></span><el-tag type="info">可更新</el-tag></div></div></section>
             <section class="panel stack"><div class="panel-heading"><div><span class="section-kicker">不可逆操作</span><h2>分类删除</h2></div><el-icon><Warning /></el-icon></div><el-checkbox-group v-model="companionDeleteCategories"><el-checkbox label="relationships">关系资料</el-checkbox><el-checkbox label="assessments">情绪分析</el-checkbox><el-checkbox label="feedback">回复反馈</el-checkbox><el-checkbox label="safety">安全记录</el-checkbox><el-checkbox label="preferences">陪伴偏好</el-checkbox></el-checkbox-group><el-input v-model="companionDeleteConfirm" placeholder="输入：删除陪伴数据" /><el-button type="danger" :loading="companionPrivacyDeleting" :disabled="!companionDeleteCategories.length" @click="deleteCompanionData">确认分类删除</el-button><p class="hint">删除接口幂等，并逐项返回成功/失败结果；删除关系资料后立即停止上下文注入。</p></section>
           </div>
         </template>
@@ -2075,7 +2075,7 @@ onUnmounted(() => {
           <el-dialog v-model="memoryRelationshipDialog" title="编辑陪伴关系资料" width="620px">
             <div v-if="memoryRelationshipDraft" class="stack">
               <div class="model-form-grid">
-                <label class="field-control"><span>QQ Owner</span><el-select v-model="memoryRelationshipDraft.scope_id" :disabled="Boolean(memoryRelationshipDraft.id)"><el-option v-for="item in companionOwners" :key="item.external_id" :label="`${item.display_name || 'QQ Owner'} · ${item.external_id}`" :value="item.external_id" /></el-select></label>
+                <label class="field-control"><span>QQ 管理员</span><el-select v-model="memoryRelationshipDraft.scope_id" :disabled="Boolean(memoryRelationshipDraft.id)"><el-option v-for="item in companionOwners" :key="item.external_id" :label="`${item.display_name || 'QQ 管理员'} · ${item.external_id}`" :value="item.external_id" /></el-select></label>
                 <label class="field-control"><span>人格</span><el-select v-model="memoryRelationshipDraft.persona_key" :disabled="Boolean(memoryRelationshipDraft.id)"><el-option v-for="item in companionPersonas" :key="item.id" :label="item.name" :value="item.id" /></el-select></label>
               </div>
               <label class="field-control"><span>称呼</span><el-input v-model="memoryRelationshipDraft.nickname" placeholder="用户希望的称呼" /></label>
@@ -2113,7 +2113,7 @@ onUnmounted(() => {
         </template>
 
         <template v-else-if="activeTab === 'tools'">
-          <div class="two-column tools-layout"><section class="panel stack"><div class="panel-heading"><div><span class="section-kicker">扩展</span><h2>工具管理</h2></div><span class="count-badge">{{ tools.length }}</span></div><p class="hint">导入的 Python Tool 在后端进程内执行，拥有本机代码权限；默认停用且不会自动安装依赖。</p><label class="file-picker"><input type="file" accept=".zip" @change="importExtension('tools', $event)" /><span>导入工具 ZIP</span></label><div class="form-row"><el-input v-model="githubUrl" placeholder="公开 GitHub 仓库地址" /><el-button @click="importGithub('tools')">导入 GitHub 工具</el-button></div><div class="table-wrap"><el-table :data="tools"><el-table-column label="工具" min-width="220"><template #default="scope"><div class="table-primary"><strong>{{ scope.row.name }}</strong><small>{{ scope.row.description }}</small></div></template></el-table-column><el-table-column prop="status" label="状态" width="90" /><el-table-column label="操作" width="160"><template #default="scope"><el-button size="small" @click="setExtension('tools', scope.row, !scope.row.enabled)">{{ scope.row.enabled ? '停用' : '启用' }}</el-button><el-button size="small" type="danger" plain :disabled="scope.row.builtin" @click="deleteExtension('tools', scope.row)">删除</el-button></template></el-table-column></el-table></div></section><section class="panel stack manga-panel"><div class="panel-heading"><div><span class="section-kicker">内置工具</span><h2>漫画搜索</h2></div><span class="manga-mark">JM</span></div><p class="hint">Owner 点击后立即创建下载任务，无需二次确认。</p><div class="form-row"><el-input v-model="mangaQuery" placeholder="输入漫画关键词" /><el-button type="primary" @click="searchManga">搜索</el-button></div><div class="card-list"><div v-for="item in mangaResults" :key="item.album_id" class="result"><span><small>JM{{ item.album_id }}</small><strong>{{ item.title }}</strong></span><el-button size="small" @click="requestDownload(item.album_id)">立即下载</el-button></div><div v-if="!mangaResults.length" class="empty-copy">搜索结果会显示在这里。</div></div></section></div>
+          <div class="two-column tools-layout"><section class="panel stack"><div class="panel-heading"><div><span class="section-kicker">扩展</span><h2>工具管理</h2></div><span class="count-badge">{{ tools.length }}</span></div><p class="hint">导入的 Python Tool 在后端进程内执行，拥有本机代码权限；默认停用且不会自动安装依赖。</p><label class="file-picker"><input type="file" accept=".zip" @change="importExtension('tools', $event)" /><span>导入工具 ZIP</span></label><div class="form-row"><el-input v-model="githubUrl" placeholder="公开 GitHub 仓库地址" /><el-button @click="importGithub('tools')">导入 GitHub 工具</el-button></div><div class="table-wrap"><el-table :data="tools"><el-table-column label="工具" min-width="220"><template #default="scope"><div class="table-primary"><strong>{{ scope.row.name }}</strong><small>{{ scope.row.description }}</small></div></template></el-table-column><el-table-column prop="status" label="状态" width="90" /><el-table-column label="操作" width="160"><template #default="scope"><el-button size="small" @click="setExtension('tools', scope.row, !scope.row.enabled)">{{ scope.row.enabled ? '停用' : '启用' }}</el-button><el-button size="small" type="danger" plain :disabled="scope.row.builtin" @click="deleteExtension('tools', scope.row)">删除</el-button></template></el-table-column></el-table></div></section><section class="panel stack manga-panel"><div class="panel-heading"><div><span class="section-kicker">内置工具</span><h2>漫画搜索</h2></div><span class="manga-mark">JM</span></div><p class="hint">管理员点击后立即创建下载任务，无需二次确认。</p><div class="form-row"><el-input v-model="mangaQuery" placeholder="输入漫画关键词" /><el-button type="primary" @click="searchManga">搜索</el-button></div><div class="card-list"><div v-for="item in mangaResults" :key="item.album_id" class="result"><span><small>JM{{ item.album_id }}</small><strong>{{ item.title }}</strong></span><el-button size="small" @click="requestDownload(item.album_id)">立即下载</el-button></div><div v-if="!mangaResults.length" class="empty-copy">搜索结果会显示在这里。</div></div></section></div>
         </template>
 
         <template v-else-if="activeTab === 'skills'">

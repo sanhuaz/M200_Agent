@@ -13,18 +13,22 @@ const emit = defineEmits<{
 <template>
   <section class="panel stack">
     <div class="panel-heading">
-      <div><span class="section-kicker">权限</span><h2>QQ Owner</h2></div>
+      <div><span class="section-kicker">权限</span><h2>QQ 管理员</h2></div>
       <span class="count-badge">{{ admins.length }}</span>
     </div>
-    <p class="hint">local-owner 永久存在且不可删除；这里的变更会立即生效。</p>
+    <p class="hint">本机管理员（内部标识 local-owner）永久存在且不可删除；这里的变更会立即生效。</p>
     <div class="form-row">
       <el-input :model-value="qq" placeholder="QQ 号" @update:model-value="emit('update:qq', String($event))" />
       <el-input :model-value="name" placeholder="备注（可选）" @update:model-value="emit('update:name', String($event))" />
-      <el-button type="primary" @click="emit('add')">添加 Owner</el-button>
+      <el-button type="primary" @click="emit('add')">添加管理员</el-button>
     </div>
     <div class="table-wrap">
       <el-table :data="admins">
-        <el-table-column prop="external_id" label="身份" min-width="180" />
+        <el-table-column label="身份" min-width="180">
+          <template #default="scope">
+            {{ scope.row.external_id === 'local-owner' ? '本机管理员（内部标识 local-owner）' : scope.row.external_id }}
+          </template>
+        </el-table-column>
         <el-table-column prop="display_name" label="备注" min-width="180" />
         <el-table-column prop="platform" label="平台" width="130" />
         <el-table-column label="操作" width="120">

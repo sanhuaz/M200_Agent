@@ -645,7 +645,7 @@ class OneBotManager:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("你听我说模式自动处理失败：conversation=%s", conversation_id)
+                logger.exception("倾听模式自动处理失败：conversation=%s", conversation_id)
             finally:
                 current_task = asyncio.current_task()
                 if self._listening_tasks.get(conversation_id) is current_task:
@@ -760,16 +760,16 @@ class OneBotManager:
         self, command: str, user_id: str, external_id: str
     ) -> str:
         if external_id.startswith("group:"):
-            return "‘你听我说’模式仅支持 QQ Owner 私聊。"
+            return "‘你听我说’触发的倾听模式仅支持 QQ 管理员私聊。"
         if not is_owner(user_id):
-            return "只有 Owner 可以使用‘你听我说’模式。"
+            return "只有 QQ 管理员可以使用倾听模式。"
         action = command.removeprefix("/listening").strip().lower()
         if action == "on":
             with SessionLocal.begin() as session:
                 preference = get_or_create_preference(session, user_id)
                 preference.listening_enabled = True
             return (
-                "已开启‘你听我说’模式。你可以分段发送，30 秒没有新消息或发送 "
+                "已开启倾听模式。你可以分段发送，30 秒没有新消息或发送 "
                 "/listening done 后我再回复。"
             )
         if action == "status":
@@ -791,12 +791,12 @@ class OneBotManager:
                     else None
                 )
                 return (
-                    f"你听我说模式：{'已开启' if preference.listening_enabled else '已关闭'}；"
+                    f"倾听模式：{'已开启' if preference.listening_enabled else '已关闭'}；"
                     f"待处理片段：{self._buffer_count(buffer)}。"
                 )
         if action == "cancel":
             await self._cancel_listening(user_id, external_id)
-            return "已取消当前连续消息，并关闭‘你听我说’模式。"
+            return "已取消当前连续消息，并关闭倾听模式。"
         if action in {"done", "off"}:
             return await self._flush_listening_now(
                 user_id,
