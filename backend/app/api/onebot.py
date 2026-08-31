@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.api.onebot_delivery import send_private_file as deliver_private_file
 from app.api.onebot_delivery import send_text as deliver_text
+from app.api.onebot_media import OneBotMediaError, extract_image_refs, fetch_attachments
 from app.api.onebot_messages import normalize_cq_text, text_from_event
 from app.api.onebot_transport import OneBotTransport
 from app.core.config import get_settings
@@ -33,7 +35,17 @@ from app.db.models import (
     ResponseFeedback,
 )
 from app.db.session import SessionLocal
+from app.domain.chat_inputs import ChatAttachmentInput, ChatTurnInput
 from app.services.chat import chat_service
+from app.services.chat_attachments import (
+    MAX_ATTACHMENTS,
+    MAX_TOTAL_BYTES,
+    AttachmentValidationError,
+    delete_pending_attachments,
+    pending_attachment_inputs,
+    stage_pending_attachments,
+    validate_inputs,
+)
 from app.services.companion import (
     COMPANION_ANALYSIS_RETRY_JOB_TYPE,
     EMOTION_LABEL_ZH,
@@ -77,6 +89,15 @@ settings = get_settings()
 QQ_CHUNKED_OUTPUT_SETTING_KEY = "qq_chunked_output_enabled"
 QQ_CHUNK_TARGET_SETTING_KEY = "qq_chunk_target_chars"
 DEFAULT_QQ_CHUNKED_OUTPUT_ENABLED = True
+
+
+@dataclass(frozen=True, slots=True)
+class ListeningBatch:
+    text: str
+    message_id: str
+    scope_id: str
+    fragments: tuple[dict[str, object], ...]
+    attachment_metadata: tuple[dict[str, object], ...]
 
 
 def qq_chunked_output_enabled(session: Session) -> bool:
@@ -160,6 +181,7 @@ class OneBotManager:
         self._listening_processing: set[str] = set()
         self._listening_processing_done: dict[str, asyncio.Event] = {}
         self._chat_locks: dict[str, asyncio.Lock] = {}
+        self._restore_listening_task: asyncio.Task[None] | None = None
 
     @property
     def websocket(self) -> WebSocket | None:
@@ -176,6 +198,10 @@ class OneBotManager:
     def start_monitor(self) -> None:
         if self._monitor_task is None or self._monitor_task.done():
             self._monitor_task = asyncio.create_task(self._monitor_login(), name="onebot-login-monitor")
+        if self._restore_listening_task is None or self._restore_listening_task.done():
+            self._restore_listening_task = asyncio.create_task(
+                self._restore_listening_buffers(), name="onebot-listening-restore"
+            )
 
     async def stop_monitor(self) -> None:
         task, self._monitor_task = self._monitor_task, None
@@ -185,11 +211,58 @@ class OneBotManager:
                 await task
             except asyncio.CancelledError:
                 pass
+        restore_task, self._restore_listening_task = self._restore_listening_task, None
+        if restore_task is not None:
+            restore_task.cancel()
+            try:
+                await restore_task
+            except asyncio.CancelledError:
+                pass
         tasks, self._listening_tasks = list(self._listening_tasks.values()), {}
         for listening_task in tasks:
             listening_task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _restore_listening_buffers(self) -> None:
+        """Re-arm persisted listening buffers after an application restart."""
+
+        await asyncio.sleep(0)
+        with SessionLocal() as session:
+            rows = session.scalars(select(CompanionListeningBuffer)).all()
+            pending: list[tuple[str, str, str, int]] = []
+            cleanup: list[tuple[str, list[dict[str, object]]]] = []
+            now = datetime.now(UTC).replace(tzinfo=None)
+            for buffer in rows:
+                conversation = session.get(Conversation, buffer.conversation_id)
+                preference = get_or_create_preference(session, buffer.scope_id)
+                if (
+                    conversation is None
+                    or not preference.listening_enabled
+                    or not preference.companion_enabled
+                ):
+                    cleanup.append((buffer.id, self._buffer_attachment_metadata(buffer)))
+                    continue
+                elapsed = max(0.0, (now - (buffer.updated_at or buffer.created_at)).total_seconds())
+                silence = max(5, min(120, int(preference.listening_silence_seconds or 30)))
+                pending.append(
+                    (
+                        buffer.conversation_id,
+                        buffer.scope_id,
+                        conversation.external_id or f"private:{buffer.scope_id}",
+                        max(0, int(silence - elapsed)),
+                    )
+                )
+            if cleanup:
+                cleanup_ids = {buffer_id for buffer_id, _metadata in cleanup}
+                for buffer in rows:
+                    if buffer.id in cleanup_ids:
+                        session.delete(buffer)
+                session.commit()
+        for _buffer_id, metadata in cleanup:
+            delete_pending_attachments(metadata)
+        for conversation_id, user_id, external_id, seconds in pending:
+            self._schedule_listening_flush(conversation_id, user_id, external_id, seconds)
 
     def _listening_lock(self, conversation_id: str) -> asyncio.Lock:
         lock = self._listening_locks.get(conversation_id)
@@ -285,8 +358,19 @@ class OneBotManager:
         group_id = str(event.get("group_id", "")) if message_type == "group" else None
         raw = self._text_from_event(event)
         text = self._extract_triggered_text(raw, message_type)
-        if text is None or not text.strip() or not user_id:
-            if user_id and not text:
+        image_refs: tuple[object, ...] = ()
+        try:
+            image_refs = extract_image_refs(event)
+        except OneBotMediaError as error:
+            if user_id and text is not None:
+                try:
+                    await self.send_text(user_id, f"图片处理失败：{error}", group_id)
+                except Exception:
+                    logger.exception("发送 QQ 图片错误回复失败")
+            return
+        has_images = bool(image_refs)
+        if text is None or (not text.strip() and not has_images) or not user_id:
+            if user_id and not text and not has_images:
                 operation_logs.emit(
                     source="onebot",
                     kind="ignored",
@@ -298,9 +382,16 @@ class OneBotManager:
         text = self._expand_manual_extension_request(text)
         external_id = f"group:{group_id}" if group_id else f"private:{user_id}"
         try:
+            attachments = await fetch_attachments(event, self.action) if has_images else ()
+            if attachments:
+                try:
+                    validate_inputs(attachments)
+                except AttachmentValidationError as error:
+                    await self.send_text(user_id, f"图片处理失败：{error}", group_id)
+                    return
             if group_id is None and is_owner(user_id):
                 listening_result = await self._handle_listening_input(
-                    text, user_id, external_id, message_id
+                    text, user_id, external_id, message_id, attachments
                 )
                 if listening_result is not None:
                     if listening_result:
@@ -323,8 +414,13 @@ class OneBotManager:
                         raise
                     return
                 await self._run_chat_response_unlocked(
-                    user_id, text, message_id, group_id, external_id
+                    user_id, text, message_id, group_id, external_id, attachments
                 )
+        except OneBotMediaError as error:
+            try:
+                await self.send_text(user_id, f"图片处理失败：{error}", group_id)
+            except Exception:
+                logger.exception("发送 QQ 图片错误回复失败")
         except Exception as error:
             logger.exception("处理 QQ 消息失败")
             try:
@@ -339,10 +435,11 @@ class OneBotManager:
         message_id: str | None,
         group_id: str | None,
         external_id: str,
+        attachments: tuple[ChatAttachmentInput, ...] = (),
     ) -> None:
         async with self._chat_lock(external_id):
             await self._run_chat_response_unlocked(
-                user_id, text, message_id, group_id, external_id
+                user_id, text, message_id, group_id, external_id, attachments
             )
 
     async def _run_chat_response_unlocked(
@@ -352,6 +449,7 @@ class OneBotManager:
         message_id: str | None,
         group_id: str | None,
         external_id: str,
+        attachments: tuple[ChatAttachmentInput, ...] = (),
     ) -> None:
         with SessionLocal() as session:
             conversation = session.scalar(
@@ -359,6 +457,19 @@ class OneBotManager:
                     Conversation.platform == "qq", Conversation.external_id == external_id
                 )
             )
+            if attachments:
+                selected_alias = (
+                    conversation.model_alias
+                    if conversation is not None
+                    else model_registry.default_alias()
+                )
+                if not model_registry.profile(selected_alias).supports_vision:
+                    await self.send_text(
+                        user_id,
+                        "图片处理失败：当前模型未启用识图能力，请在模型管理中开启后重试。",
+                        group_id,
+                    )
+                    return
             if conversation is None:
                 conversation = Conversation(
                     platform="qq",
@@ -387,11 +498,24 @@ class OneBotManager:
             error_text = ""
             safety_intercepted = False
             artifact_ids: list[str] = []
+            stream_input: str | ChatTurnInput = text
+            if attachments:
+                stream_input = ChatTurnInput(
+                    text=text,
+                    attachments=tuple(attachments),
+                    conversation_id=conversation.id,
+                    sender_id=user_id,
+                    platform_message_id=message_id,
+                    platform="qq",
+                    is_group=bool(group_id),
+                    group_id=group_id,
+                    trigger="onebot",
+                )
             async for item in chat_service.stream(
                 session,
                 conversation,
                 user_id,
-                text,
+                stream_input,
                 message_id,
                 platform="qq",
                 is_group=bool(group_id),
@@ -510,20 +634,36 @@ class OneBotManager:
             return conversation.id
 
     @staticmethod
-    def _buffer_text(buffer: CompanionListeningBuffer | None) -> str:
+    def _buffer_fragments(buffer: CompanionListeningBuffer | None) -> list[dict[str, object]]:
         if buffer is None:
-            return ""
+            return []
         try:
             values = json.loads(buffer.fragments or "[]")
         except json.JSONDecodeError:
-            return ""
+            return []
         if not isinstance(values, list):
-            return ""
+            return []
+        return [item for item in values if isinstance(item, dict)]
+
+    @classmethod
+    def _buffer_text(cls, buffer: CompanionListeningBuffer | None) -> str:
         return "\n".join(
             str(item.get("text", "")).strip()
-            for item in values
-            if isinstance(item, dict) and str(item.get("text", "")).strip()
+            for item in cls._buffer_fragments(buffer)
+            if str(item.get("text", "")).strip()
         ).strip()
+
+    @classmethod
+    def _buffer_attachment_metadata(
+        cls, buffer: CompanionListeningBuffer | None
+    ) -> list[dict[str, object]]:
+        attachments: list[dict[str, object]] = []
+        for fragment in cls._buffer_fragments(buffer):
+            values = fragment.get("attachments")
+            if not isinstance(values, list):
+                continue
+            attachments.extend(item for item in values if isinstance(item, dict))
+        return attachments
 
     @staticmethod
     def _buffer_count(buffer: CompanionListeningBuffer | None) -> int:
@@ -535,22 +675,7 @@ class OneBotManager:
             return 0
         return len(values) if isinstance(values, list) else 0
 
-    async def _pop_listening_buffer(self, conversation_id: str) -> tuple[str, str | None]:
-        lock = self._listening_lock(conversation_id)
-        async with lock:
-            with SessionLocal.begin() as session:
-                buffer = session.scalar(
-                    select(CompanionListeningBuffer).where(
-                        CompanionListeningBuffer.conversation_id == conversation_id
-                    )
-                )
-                if buffer is None:
-                    return "", None
-                text = self._buffer_text(buffer)
-                session.delete(buffer)
-                return text, f"listening-{uuid.uuid4().hex}"
-
-    async def _claim_listening_batch(self, conversation_id: str) -> tuple[str, str | None]:
+    async def _claim_listening_batch(self, conversation_id: str) -> ListeningBatch | None:
         """Atomically claim one batch and mark the session as processing.
 
         A completion command may arrive at the same time as the silence timer.
@@ -576,17 +701,53 @@ class OneBotManager:
                             )
                         )
                         if buffer is None:
-                            return "", None
+                            return None
+                        fragments = tuple(self._buffer_fragments(buffer))
                         text = self._buffer_text(buffer)
+                        attachment_metadata = tuple(self._buffer_attachment_metadata(buffer))
                         session.delete(buffer)
-                    if not text:
-                        return "", None
+                    if not text and not attachment_metadata:
+                        return None
                     self._listening_processing.add(conversation_id)
                     self._listening_processing_done[conversation_id] = asyncio.Event()
-                    return text, f"listening-{uuid.uuid4().hex}"
+                    return ListeningBatch(
+                        text=text,
+                        message_id=f"listening-{uuid.uuid4().hex}",
+                        scope_id=buffer.scope_id,
+                        fragments=fragments,
+                        attachment_metadata=attachment_metadata,
+                    )
             if wait_event is None:
-                return "", None
+                return None
             await wait_event.wait()
+
+    @staticmethod
+    def _restore_listening_batch(conversation_id: str, batch: ListeningBatch) -> None:
+        with SessionLocal.begin() as session:
+            buffer = session.scalar(
+                select(CompanionListeningBuffer).where(
+                    CompanionListeningBuffer.conversation_id == conversation_id
+                )
+            )
+            current = OneBotManager._buffer_fragments(buffer)
+            merged = [*batch.fragments, *current]
+            if buffer is None:
+                session.add(
+                    CompanionListeningBuffer(
+                        conversation_id=conversation_id,
+                        scope_id=batch.scope_id,
+                        fragments=json.dumps(merged, ensure_ascii=False),
+                    )
+                )
+            else:
+                buffer.fragments = json.dumps(merged, ensure_ascii=False)
+
+    @staticmethod
+    def _message_was_persisted(message_id: str) -> bool:
+        with SessionLocal() as session:
+            return session.scalar(
+                select(Message.id).where(Message.platform_message_id == message_id)
+            ) is not None
 
     async def _finish_listening_batch(self, conversation_id: str) -> None:
         lock = self._listening_lock(conversation_id)
@@ -615,6 +776,7 @@ class OneBotManager:
             current_task = asyncio.current_task()
             if pending is not None and pending is not current_task:
                 pending.cancel()
+            attachment_metadata: list[dict[str, object]] = []
             with SessionLocal.begin() as session:
                 preference = get_or_create_preference(session, user_id)
                 preference.listening_enabled = False
@@ -624,7 +786,9 @@ class OneBotManager:
                     )
                 )
                 if buffer is not None:
+                    attachment_metadata = self._buffer_attachment_metadata(buffer)
                     session.delete(buffer)
+            delete_pending_attachments(attachment_metadata)
 
     def _schedule_listening_flush(
         self, conversation_id: str, user_id: str, external_id: str, seconds: int
@@ -636,10 +800,12 @@ class OneBotManager:
         async def delayed_flush() -> None:
             try:
                 await asyncio.sleep(seconds)
-                text, message_id = await self._claim_listening_batch(conversation_id)
-                if text and message_id:
+                batch = await self._claim_listening_batch(conversation_id)
+                if batch is not None:
                     try:
-                        await self._run_chat_response(user_id, text, message_id, None, external_id)
+                        await self._process_listening_batch(
+                            user_id, external_id, conversation_id, batch
+                        )
                     finally:
                         await self._finish_listening_batch(conversation_id)
             except asyncio.CancelledError:
@@ -672,20 +838,61 @@ class OneBotManager:
                 preference = get_or_create_preference(session, user_id)
                 preference.listening_enabled = False
         if conversation_id:
-            text, message_id = await self._claim_listening_batch(conversation_id)
+            batch = await self._claim_listening_batch(conversation_id)
         else:
-            text, message_id = "", None
-        if text and message_id:
+            batch = None
+        if batch is not None:
             assert conversation_id is not None
             try:
-                await self._run_chat_response(user_id, text, message_id, None, external_id)
+                await self._process_listening_batch(user_id, external_id, conversation_id, batch)
             finally:
                 await self._finish_listening_batch(conversation_id)
             return ""
         return "当前没有待处理的连续消息。"
 
+    async def _process_listening_batch(
+        self,
+        user_id: str,
+        external_id: str,
+        conversation_id: str,
+        batch: ListeningBatch,
+    ) -> None:
+        try:
+            attachments = pending_attachment_inputs(batch.attachment_metadata)
+        except Exception as error:
+            logger.warning("倾听模式图片读取失败：%s", type(error).__name__)
+            self._restore_listening_batch(conversation_id, batch)
+            try:
+                await self.send_text(user_id, "图片处理失败：倾听模式中的图片暂时不可读取。")
+            except Exception:
+                logger.exception("发送 QQ 倾听模式图片错误回复失败")
+            return
+        try:
+            await self._run_chat_response(
+                user_id,
+                batch.text,
+                batch.message_id,
+                None,
+                external_id,
+                attachments,
+            )
+        except Exception as error:
+            logger.exception("倾听模式批次处理失败：%s", type(error).__name__)
+            if batch.attachment_metadata:
+                self._restore_listening_batch(conversation_id, batch)
+            return
+        if not batch.attachment_metadata or self._message_was_persisted(batch.message_id):
+            delete_pending_attachments(batch.attachment_metadata)
+        else:
+            self._restore_listening_batch(conversation_id, batch)
+
     async def _handle_listening_input(
-        self, text: str, user_id: str, external_id: str, message_id: str
+        self,
+        text: str,
+        user_id: str,
+        external_id: str,
+        message_id: str,
+        attachments: tuple[ChatAttachmentInput, ...] = (),
     ) -> str | None:
         command = text.lower()
         natural_enable = any(
@@ -712,40 +919,81 @@ class OneBotManager:
         if natural_done:
             return await self._flush_listening_now(user_id, external_id)
         # Safety remains immediate even when normal conversational fragments are buffered.
-        if safety_precheck(text).risk_level in {"high", "critical"}:
+        if text and safety_precheck(text).risk_level in {"high", "critical"}:
             return None
         conversation_id = self._ensure_qq_conversation(external_id, user_id)
-        async with self._listening_lock(conversation_id):
-            with SessionLocal.begin() as session:
-                buffer = session.scalar(
-                    select(CompanionListeningBuffer).where(
-                        CompanionListeningBuffer.conversation_id == conversation_id
+        pending_batch = None
+        new_attachment_metadata: list[dict[str, object]] = []
+        if attachments:
+            try:
+                pending_batch = stage_pending_attachments(attachments)
+                with SessionLocal() as session:
+                    existing = session.scalar(
+                        select(CompanionListeningBuffer).where(
+                            CompanionListeningBuffer.conversation_id == conversation_id
+                        )
                     )
+                    existing_metadata = self._buffer_attachment_metadata(existing)
+                if len(existing_metadata) + len(attachments) > MAX_ATTACHMENTS:
+                    raise OneBotMediaError(
+                        f"倾听模式每轮最多处理 {MAX_ATTACHMENTS} 张图片"
+                    )
+                existing_bytes = sum(
+                    int(str(item.get("byte_size") or 0)) for item in existing_metadata
                 )
-                fragments: list[dict[str, object]] = []
-                if buffer is not None:
-                    try:
-                        parsed = json.loads(buffer.fragments or "[]")
-                        if isinstance(parsed, list):
-                            fragments = [item for item in parsed if isinstance(item, dict)]
-                    except json.JSONDecodeError:
-                        fragments = []
-                fragments.append(
-                    {
+                new_bytes = sum(item.byte_size for item in pending_batch.items)
+                if existing_bytes + new_bytes > MAX_TOTAL_BYTES:
+                    raise OneBotMediaError("倾听模式每轮图片总大小不能超过 32 MiB")
+                new_attachment_metadata = pending_batch.persist()
+            except Exception:
+                if pending_batch is not None:
+                    pending_batch.cleanup()
+                raise
+        async with self._listening_lock(conversation_id):
+            try:
+                with SessionLocal.begin() as session:
+                    buffer = session.scalar(
+                        select(CompanionListeningBuffer).where(
+                            CompanionListeningBuffer.conversation_id == conversation_id
+                        )
+                    )
+                    fragments = self._buffer_fragments(buffer)
+                    locked_metadata = self._buffer_attachment_metadata(buffer)
+                    if new_attachment_metadata:
+                        if len(locked_metadata) + len(new_attachment_metadata) > MAX_ATTACHMENTS:
+                            raise OneBotMediaError(
+                                f"倾听模式每轮最多处理 {MAX_ATTACHMENTS} 张图片"
+                            )
+                        locked_bytes = sum(
+                            int(str(item.get("byte_size") or 0)) for item in locked_metadata
+                        )
+                        incoming_bytes = sum(
+                            int(str(item.get("byte_size") or 0))
+                            for item in new_attachment_metadata
+                        )
+                        if locked_bytes + incoming_bytes > MAX_TOTAL_BYTES:
+                            raise OneBotMediaError("倾听模式每轮图片总大小不能超过 32 MiB")
+                    fragment: dict[str, object] = {
                         "message_id": message_id,
                         "text": text,
                         "created_at": datetime.now(UTC).isoformat(),
                     }
-                )
-                if buffer is None:
-                    buffer = CompanionListeningBuffer(
-                        conversation_id=conversation_id,
-                        scope_id=user_id,
-                        fragments=json.dumps(fragments, ensure_ascii=False),
-                    )
-                    session.add(buffer)
-                else:
-                    buffer.fragments = json.dumps(fragments, ensure_ascii=False)
+                    if new_attachment_metadata:
+                        fragment["attachments"] = new_attachment_metadata
+                    fragments.append(fragment)
+                    if buffer is None:
+                        buffer = CompanionListeningBuffer(
+                            conversation_id=conversation_id,
+                            scope_id=user_id,
+                            fragments=json.dumps(fragments, ensure_ascii=False),
+                        )
+                        session.add(buffer)
+                    else:
+                        buffer.fragments = json.dumps(fragments, ensure_ascii=False)
+            except Exception:
+                if pending_batch is not None:
+                    pending_batch.cleanup()
+                raise
         self._schedule_listening_flush(conversation_id, user_id, external_id, silence_seconds)
         operation_logs.emit(
             source="companion",

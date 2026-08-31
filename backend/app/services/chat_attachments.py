@@ -106,6 +106,109 @@ class PreparedAttachmentBatch:
 
 
 @dataclass(slots=True)
+class PendingAttachmentBatch:
+    """Validated files held by the persistent QQ listening buffer."""
+
+    root: Path
+    items: tuple[ValidatedAttachment, ...]
+    temporary_paths: list[Path] = field(default_factory=list)
+    pending_paths: list[Path] = field(default_factory=list)
+
+    def persist(self) -> list[dict[str, object]]:
+        if len(self.temporary_paths) != len(self.items):
+            raise RuntimeError("附件暂存批次不完整")
+        metadata: list[dict[str, object]] = []
+        for item, temporary in zip(self.items, self.temporary_paths, strict=True):
+            attachment_id = new_id()
+            relative_path = f"listening/{attachment_id}{item.extension}"
+            final_path = _safe_path(self.root, relative_path)
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(temporary, final_path)
+            self.pending_paths.append(final_path)
+            metadata.append(
+                {
+                    "relative_path": relative_path,
+                    "original_filename": item.original_filename,
+                    "mime_type": item.mime_type,
+                    "byte_size": item.byte_size,
+                    "width": item.width,
+                    "height": item.height,
+                    "source": item.source,
+                }
+            )
+        self.temporary_paths.clear()
+        return metadata
+
+    def cleanup(self) -> None:
+        for path in [*self.temporary_paths, *self.pending_paths]:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("清理倾听模式附件失败: attachment_path=%s", path.name)
+        self.temporary_paths.clear()
+        self.pending_paths.clear()
+
+
+def stage_pending_attachments(
+    items: Iterable[ChatAttachmentInput], *, root: Path | None = None
+) -> PendingAttachmentBatch:
+    """Validate and stage files that belong to a listening buffer, not a message."""
+
+    validated = validate_inputs(items)
+    batch = PendingAttachmentBatch(root=_root(root), items=validated)
+    try:
+        for item in validated:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=batch.root, prefix=".chat-image-", suffix=".tmp", delete=False
+            ) as handle:
+                temporary = Path(handle.name)
+                handle.write(item.content)
+            batch.temporary_paths.append(temporary)
+    except Exception:
+        batch.cleanup()
+        raise
+    return batch
+
+
+def pending_attachment_inputs(
+    metadata: Iterable[dict[str, object]], *, root: Path | None = None
+) -> tuple[ChatAttachmentInput, ...]:
+    """Read persisted listening files without trusting paths from the JSON buffer."""
+
+    result: list[ChatAttachmentInput] = []
+    for item in metadata:
+        relative_path = str(item.get("relative_path") or "")
+        path = _safe_path(_root(root), relative_path)
+        try:
+            content = path.read_bytes()
+        except OSError as error:
+            raise AttachmentValidationError("倾听模式中的图片文件已不可读取") from error
+        result.append(
+            ChatAttachmentInput(
+                content=content,
+                original_filename=str(item.get("original_filename") or "image"),
+                source="onebot",
+                content_type=str(item.get("mime_type") or "") or None,
+            )
+        )
+    return tuple(result)
+
+
+def delete_pending_attachments(
+    metadata: Iterable[dict[str, object]], *, root: Path | None = None
+) -> None:
+    """Remove files referenced by a listening buffer after completion/cancel."""
+
+    for item in metadata:
+        relative_path = str(item.get("relative_path") or "")
+        try:
+            path = _safe_path(_root(root), relative_path)
+            path.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            logger.warning("清理倾听模式附件失败: attachment_id=%s", item.get("relative_path"))
+
+
+@dataclass(slots=True)
 class AttachmentDeletionBatch:
     """Filesystem side of an attachment deletion with database compensation."""
 
