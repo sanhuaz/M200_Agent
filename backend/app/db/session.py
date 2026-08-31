@@ -66,6 +66,8 @@ def verify_schema() -> None:
         "tool_runs",
         "processed_events",
         "extension_packages",
+        "mcp_servers",
+        "mcp_grants",
         "personas",
         "admin_identities",
         "artifacts",

@@ -17,6 +17,7 @@ from app.api.conversation_routes import router as conversation_router
 from app.api.dependencies import require_loopback
 from app.api.extension_routes import router as extension_router
 from app.api.knowledge_routes import router as knowledge_router
+from app.api.mcp_routes import router as mcp_router
 from app.api.memory_routes import router as memory_router
 from app.api.model_routes import router as model_router
 from app.api.monitoring_routes import router as monitoring_router
@@ -78,6 +79,7 @@ router.include_router(extension_router)
 router.include_router(task_router)
 router.include_router(knowledge_router)
 router.include_router(memory_router)
+router.include_router(mcp_router)
 settings = get_settings()
 
 

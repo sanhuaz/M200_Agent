@@ -173,6 +173,54 @@ class ExtensionPackage(Base):
     __table_args__ = (UniqueConstraint("kind", "name", name="uq_extension_kind_name"),)
 
 
+class McpServer(Base):
+    """Persisted MCP connection configuration and the last safe snapshot."""
+
+    __tablename__ = "mcp_servers"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    name: Mapped[str] = mapped_column(String(160))
+    slug: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    transport: Mapped[str] = mapped_column(String(30))
+    config_json: Mapped[str] = mapped_column(Text, default="{}")
+    secret_refs_json: Mapped[str] = mapped_column(Text, default="{}")
+    access_policy: Mapped[str] = mapped_column(String(30), default="owner_only")
+    private_users_json: Mapped[str] = mapped_column(Text, default="[]")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    status: Mapped[str] = mapped_column(String(30), default="disabled", index=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    server_info_json: Mapped[str] = mapped_column(Text, default="{}")
+    catalog_json: Mapped[str] = mapped_column(Text, default="{}")
+    last_connected_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+    grants: Mapped[list[McpGrant]] = relationship(
+        back_populates="server", cascade="all, delete-orphan"
+    )
+
+
+class McpGrant(Base):
+    """Per-directory-item grant; new discoveries are denied by default."""
+
+    __tablename__ = "mcp_grants"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    server_id: Mapped[str] = mapped_column(
+        ForeignKey("mcp_servers.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(20))
+    item_key: Mapped[str] = mapped_column(String(500))
+    allowed: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+    server: Mapped[McpServer] = relationship(back_populates="grants")
+
+    __table_args__ = (
+        UniqueConstraint("server_id", "kind", "item_key", name="uq_mcp_grant_item"),
+    )
+
+
 class Persona(Base):
     __tablename__ = "personas"
 

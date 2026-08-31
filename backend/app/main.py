@@ -15,6 +15,7 @@ from app.api.routes import router
 from app.core.config import get_settings
 from app.db.session import initialize_database, verify_schema
 from app.services.jobs import job_worker
+from app.services.mcp_servers import mcp_manager
 from app.services.napcat_logs import napcat_connector
 from app.services.operation_logs import operation_logs
 from app.services.persona_store import get_persona_store
@@ -42,6 +43,12 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
             get_persona_store().sync_db(session)
             session.commit()
             bootstrap_runtime(session)
+        try:
+            await mcp_manager.startup()
+        except Exception:
+            # A broken third-party MCP Server must not prevent the application
+            # and the remaining configured services from starting.
+            logging.getLogger(__name__).exception("MCP Server 恢复失败，应用继续启动")
         operation_logs.emit(
             source="startup", kind="succeeded", title="数据库", message="数据库和运行时配置已就绪"
         )
@@ -60,6 +67,10 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
         operation_logs.emit(
             source="shutdown", kind="started", title="项目停止", message="后端生命周期开始收尾"
         )
+        try:
+            await mcp_manager.shutdown()
+        except Exception:
+            logging.getLogger(__name__).exception("MCP Server 关闭时出现错误")
         await napcat_connector.stop()
         await onebot_manager.stop_monitor()
         await job_worker.stop()

@@ -81,6 +81,11 @@ class Settings(BaseSettings):
     qq_upload_limit_mb: int = 100
     group_command_prefix: str = "/ai"
 
+    # MCP 连接默认值；单个 Server 的失败由 Manager 隔离，不阻断应用启动。
+    mcp_connect_timeout_seconds: float = Field(default=15.0, gt=0, le=300)
+    mcp_read_timeout_seconds: float = Field(default=120.0, gt=0, le=900)
+    mcp_catalog_item_limit: int = Field(default=200, gt=0, le=2_000)
+
     @field_validator("owner_qq_ids", mode="before")
     @classmethod
     def parse_owner_ids(cls, value: object) -> object:

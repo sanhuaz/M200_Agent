@@ -16,3 +16,4 @@ beautifulsoup4==4.15.0
 jieba==0.42.1
 httpx==0.28.1
 python-multipart==0.0.32
+mcp==2.1.1
