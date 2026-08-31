@@ -9,7 +9,6 @@ import shutil
 import tempfile
 import uuid
 import zipfile
-from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
@@ -19,21 +18,12 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.db.models import ExtensionPackage
+from app.domain.tool_types import ToolContext
 
 NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 MAX_PACKAGE_BYTES = 20 * 1024 * 1024
 MAX_PACKAGE_FILES = 500
 MAX_SKILL_CHARS = 20_000
-
-
-@dataclass(frozen=True, slots=True)
-class ToolContext:
-    requester_id: str
-    conversation_id: str | None
-    platform: str
-    is_group: bool
-    workspace_path: Path
-    is_owner: bool = False
 
 
 class ExtensionError(ValueError):

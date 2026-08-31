@@ -398,6 +398,36 @@ class McpServerManager:
         except Exception as error:
             raise McpClientError(safe_error(error)) from error
 
+    async def _connection(self, server_id: str) -> McpConnection:
+        async with self._lock:
+            connection = self._connections.get(server_id)
+        if connection is None:
+            raise McpServerError("MCP Server 未启用或连接已断开")
+        return connection
+
+    async def call_tool(self, server_id: str, name: str, arguments: dict[str, Any]) -> Any:
+        connection = await self._connection(server_id)
+        try:
+            return await connection.call_tool(name, arguments)
+        except Exception as error:
+            raise McpClientError(safe_error(error)) from error
+
+    async def read_resource(self, server_id: str, uri: str) -> Any:
+        connection = await self._connection(server_id)
+        try:
+            return await connection.read_resource(uri)
+        except Exception as error:
+            raise McpClientError(safe_error(error)) from error
+
+    async def get_prompt(
+        self, server_id: str, name: str, arguments: dict[str, Any] | None = None
+    ) -> Any:
+        connection = await self._connection(server_id)
+        try:
+            return await connection.get_prompt(name, arguments)
+        except Exception as error:
+            raise McpClientError(safe_error(error)) from error
+
     async def disconnect(self, server_id: str) -> None:
         async with self._lock:
             connection = self._connections.pop(server_id, None)

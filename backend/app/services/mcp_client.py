@@ -144,7 +144,7 @@ class McpConnection:
 
     server_id: str
     server_info: dict[str, Any] = field(default_factory=dict, init=False)
-    _commands: asyncio.Queue[tuple[str, asyncio.Future[Any]]] | None = field(
+    _commands: asyncio.Queue[tuple[str, dict[str, Any], asyncio.Future[Any]]] | None = field(
         default=None, init=False
     )
     _owner_task: asyncio.Task[None] | None = field(default=None, init=False)
@@ -210,7 +210,7 @@ class McpConnection:
                 ready.set_result(self.server_info)
 
             while True:
-                operation, future = await self._commands.get()  # type: ignore[union-attr]
+                operation, payload, future = await self._commands.get()  # type: ignore[union-attr]
                 if operation == "close":
                     if not future.done():
                         future.set_result(None)
@@ -218,6 +218,21 @@ class McpConnection:
                 try:
                     if operation == "discover":
                         result = await self._discover_session(session, read_timeout)
+                    elif operation == "call_tool":
+                        result = await session.call_tool(
+                            str(payload.get("name") or ""),
+                            arguments=payload.get("arguments")
+                            if isinstance(payload.get("arguments"), dict)
+                            else {},
+                        )
+                    elif operation == "read_resource":
+                        result = await session.read_resource(str(payload.get("uri") or ""))
+                    elif operation == "get_prompt":
+                        arguments = payload.get("arguments")
+                        result = await session.get_prompt(
+                            str(payload.get("name") or ""),
+                            arguments=arguments if isinstance(arguments, dict) else None,
+                        )
                     else:  # pragma: no cover - guarded by _request
                         raise McpClientError(f"未知 MCP 操作：{operation}")
                 except Exception as error:
@@ -236,7 +251,7 @@ class McpConnection:
                 ready.set_exception(wrapped)
             if self._commands is not None:
                 while not self._commands.empty():
-                    _, future = self._commands.get_nowait()
+                    _, _, future = self._commands.get_nowait()
                     if not future.done():
                         future.set_exception(wrapped)
         finally:
@@ -246,11 +261,11 @@ class McpConnection:
                 logger.debug("MCP 连接关闭异常：%s", safe_error(error))
             self.server_info = {}
 
-    async def _request(self, operation: str) -> Any:
+    async def _request(self, operation: str, payload: dict[str, Any] | None = None) -> Any:
         if self._owner_task is None or self._commands is None or self._owner_task.done():
             raise McpClientError("MCP Server 尚未连接")
         future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
-        await self._commands.put((operation, future))
+        await self._commands.put((operation, payload or {}, future))
         return await future
 
     async def _discover_session(
@@ -288,6 +303,15 @@ class McpConnection:
     async def discover(self) -> dict[str, list[dict[str, Any]]]:
         return await self._request("discover")
 
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        return await self._request("call_tool", {"name": name, "arguments": arguments})
+
+    async def read_resource(self, uri: str) -> Any:
+        return await self._request("read_resource", {"uri": uri})
+
+    async def get_prompt(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+        return await self._request("get_prompt", {"name": name, "arguments": arguments or {}})
+
     async def close(self) -> None:
         task = self._owner_task
         if task is None:
@@ -300,7 +324,7 @@ class McpConnection:
         )
         if not task.done() and not ready_failed and self._commands is not None:
             future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
-            await self._commands.put(("close", future))
+            await self._commands.put(("close", {}, future))
             try:
                 await asyncio.wait_for(future, timeout=5)
             except Exception:
