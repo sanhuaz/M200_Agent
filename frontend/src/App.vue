@@ -16,6 +16,7 @@ import type { Confirmation, TaskRow } from './types/tasks'
 const AdminPage = defineAsyncComponent(() => import('./pages/AdminPage.vue'))
 const StatusPage = defineAsyncComponent(() => import('./pages/StatusPage.vue'))
 const TasksPage = defineAsyncComponent(() => import('./pages/TasksPage.vue'))
+const McpPage = defineAsyncComponent(() => import('./pages/McpPage.vue'))
 
 type Conversation = { id: string; title: string; platform: string; model_alias: string; persona_id?: string | null }
 type ReasoningEffort = 'low' | 'medium' | 'high' | null
@@ -318,6 +319,7 @@ const pageDetails: Record<string, { title: string; description: string }> = {
   personas: { title: '人格管理', description: '通过结构化角色卡创建可按会话切换的人格' },
   tools: { title: '工具管理', description: '管理工具扩展并发起漫画搜索与下载' },
   skills: { title: '技能管理', description: '导入、启用和维护 Agent Skills' },
+  mcp: { title: 'MCP 设置', description: '管理外部 MCP Server、目录和逐项授权' },
   tasks: { title: '任务中心', description: '处理待确认操作并跟踪后台任务' },
   admin: { title: '管理员', description: '维护拥有高权限操作能力的 QQ 管理员' },
   status: { title: '系统状态', description: '查看本地服务、模型和检索组件状态' },
@@ -1834,6 +1836,7 @@ onUnmounted(() => {
         <div v-show="sidebarCollapsed || extensionExpanded" class="nav-children">
           <button class="nav-item" aria-label="工具管理" title="工具管理" :class="{ active: activeTab === 'tools' }" @click="changeTab('tools')"><el-icon><Tools /></el-icon><span>工具管理</span></button>
           <button class="nav-item" aria-label="技能管理" title="技能管理" :class="{ active: activeTab === 'skills' }" @click="changeTab('skills')"><el-icon><MagicStick /></el-icon><span>技能管理</span></button>
+          <button class="nav-item" aria-label="MCP 设置" title="MCP 设置" :class="{ active: activeTab === 'mcp' }" @click="changeTab('mcp')"><el-icon><Tools /></el-icon><span>MCP 设置</span></button>
         </div>
 
         <button class="nav-item nav-standalone" aria-label="任务中心" title="任务中心" :class="{ active: activeTab === 'tasks' }" @click="changeTab('tasks')"><el-icon><PictureFilled /></el-icon><span>任务中心</span></button>
@@ -2118,6 +2121,10 @@ onUnmounted(() => {
 
         <template v-else-if="activeTab === 'skills'">
           <section class="panel stack"><div class="panel-heading"><div><span class="section-kicker">扩展</span><h2>技能管理</h2></div><span class="count-badge">{{ skills.length }}</span></div><p class="hint">只读取 SKILL.md 和根目录内的 references/assets；scripts 仅展示，不执行。每轮最多加载 3 个。</p><div class="form-row"><label class="file-picker"><input type="file" accept=".zip" @change="importExtension('skills', $event)" /><span>导入技能 ZIP</span></label><el-input v-model="githubUrl" placeholder="公开 GitHub Skill 地址" /><el-button @click="importGithub('skills')">导入 GitHub 技能</el-button></div><div class="table-wrap"><el-table :data="skills"><el-table-column prop="name" label="名称" min-width="160" /><el-table-column prop="description" label="说明" min-width="320" /><el-table-column prop="status" label="状态" width="110" /><el-table-column label="操作" width="190"><template #default="scope"><el-button size="small" @click="setExtension('skills', scope.row, !scope.row.enabled)">{{ scope.row.enabled ? '停用' : '启用' }}</el-button><el-button size="small" type="danger" plain @click="deleteExtension('skills', scope.row)">删除</el-button></template></el-table-column></el-table></div></section>
+        </template>
+
+        <template v-else-if="activeTab === 'mcp'">
+          <McpPage />
         </template>
 
         <template v-else-if="activeTab === 'tasks'">

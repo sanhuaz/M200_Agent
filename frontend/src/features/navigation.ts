@@ -6,6 +6,7 @@ export const routePaths: Record<string, string> = {
   knowledge: '/knowledge',
   tools: '/tools',
   skills: '/skills',
+  mcp: '/mcp',
   personas: '/personas',
   memory: '/memories',
   companion: '/companion',
