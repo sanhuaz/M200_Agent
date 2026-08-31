@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import json
-
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
@@ -16,10 +13,11 @@ from app.db.models import (
     Conversation,
     Job,
     Message,
+    MessageAttachment,
     ToolRun,
 )
 from app.db.session import get_db
-from app.services.chat import chat_service
+from app.services.chat_attachments import attachment_dict, stage_deletions
 from app.services.models import model_registry
 from app.services.persona_store import get_persona_store
 
@@ -37,12 +35,6 @@ class ModelSwitch(BaseModel):
 
 class PersonaSwitch(BaseModel):
     persona_id: str | None = None
-
-
-class ChatRequest(BaseModel):
-    conversation_id: str | None = None
-    message: str = Field(min_length=1, max_length=50_000)
-    sender_id: str = "local-owner"
 
 
 def conversation_dict(item: Conversation) -> dict[str, object]:
@@ -94,6 +86,7 @@ def list_messages(
             "role": item.role,
             "content": item.content,
             "created_at": item.created_at.isoformat(),
+            "attachments": [attachment_dict(attachment) for attachment in item.attachments],
         }
         for item in items
     ]
@@ -125,8 +118,20 @@ def remove_conversation(
         )
     )
     session.execute(delete(ToolRun).where(ToolRun.conversation_id == conversation_id))
+    attachments = session.scalars(
+        select(MessageAttachment)
+        .join(Message, Message.id == MessageAttachment.message_id)
+        .where(Message.conversation_id == conversation_id)
+    ).all()
+    deletion_batch = stage_deletions(attachments)
     session.delete(conversation)
-    session.commit()
+    try:
+        session.commit()
+    except Exception:
+        session.rollback()
+        deletion_batch.restore()
+        raise
+    deletion_batch.finalize()
     return {"deleted": True, "conversation_id": conversation_id}
 
 
@@ -160,31 +165,3 @@ def switch_persona(
     session.commit()
     session.refresh(conversation)
     return conversation_dict(conversation)
-
-
-@router.post("/chat/stream")
-async def chat_stream(
-    payload: ChatRequest, session: Session = Depends(get_db)
-) -> StreamingResponse:
-    conversation = (
-        session.get(Conversation, payload.conversation_id) if payload.conversation_id else None
-    )
-    if conversation is None:
-        conversation = Conversation(
-            owner_id=payload.sender_id,
-            model_alias=model_registry.default_alias(),
-        )
-        session.add(conversation)
-        session.commit()
-        session.refresh(conversation)
-
-    async def events():
-        async for event in chat_service.stream(
-            session, conversation, payload.sender_id, payload.message
-        ):
-            yield (
-                f"event: {event['event']}\n"
-                f"data: {json.dumps(event['data'], ensure_ascii=False)}\n\n"
-            )
-
-    return StreamingResponse(events(), media_type="text/event-stream")

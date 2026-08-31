@@ -13,6 +13,7 @@ from sqlalchemy import delete, desc, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.api.chat_routes import router as chat_router
 from app.api.conversation_routes import router as conversation_router
 from app.api.dependencies import require_loopback
 from app.api.extension_routes import router as extension_router
@@ -75,6 +76,7 @@ router = APIRouter()
 router.include_router(monitoring_router)
 router.include_router(model_router)
 router.include_router(conversation_router)
+router.include_router(chat_router)
 router.include_router(extension_router)
 router.include_router(task_router)
 router.include_router(knowledge_router)

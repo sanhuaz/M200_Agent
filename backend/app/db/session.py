@@ -57,6 +57,7 @@ def verify_schema() -> None:
     required = {
         "conversations",
         "messages",
+        "message_attachments",
         "knowledge_bases",
         "documents",
         "chunks",

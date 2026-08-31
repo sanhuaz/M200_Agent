@@ -36,6 +36,7 @@ type ModelProfile = {
   input_soft_limit: number
   max_output_tokens: number
   timeout_seconds: number
+  supports_vision: boolean
 }
 type ModelProfileDraft = Omit<ModelProfile, 'configured' | 'has_api_key' | 'in_use' | 'can_delete' | 'is_default'> & { api_key: string }
 type Message = { id?: string; role: string; content: string }
@@ -396,6 +397,7 @@ function newModelDraft(): ModelProfileDraft {
     input_soft_limit: 131_072,
     max_output_tokens: 16_384,
     timeout_seconds: 120,
+    supports_vision: false,
     api_key: '',
   }
 }
@@ -589,6 +591,7 @@ function modelDraftFrom(item: ModelProfile): ModelProfileDraft {
     input_soft_limit: item.input_soft_limit,
     max_output_tokens: item.max_output_tokens,
     timeout_seconds: item.timeout_seconds,
+    supports_vision: item.supports_vision,
     api_key: '',
   }
 }
@@ -630,6 +633,7 @@ function modelPayload() {
     input_soft_limit: modelForm.value.input_soft_limit,
     max_output_tokens: modelForm.value.max_output_tokens,
     timeout_seconds: modelForm.value.timeout_seconds,
+    supports_vision: modelForm.value.supports_vision,
   }
 }
 
@@ -2027,6 +2031,7 @@ onUnmounted(() => {
                 <div class="field-control"><span>思考强度</span><el-select v-model="modelForm.reasoning_effort" clearable placeholder="关闭"><el-option label="关闭" :value="null" /><el-option label="低" value="low" /><el-option label="中" value="medium" /><el-option label="高" value="high" /></el-select></div>
                 <div class="field-control"><span>流式输出</span><el-switch v-model="modelForm.streaming" active-text="开启" inactive-text="关闭" /></div>
                 <div class="field-control"><span>温度</span><el-input-number v-model="modelForm.temperature" :min="0" :max="2" :step="0.1" :precision="2" controls-position="right" placeholder="服务默认" /></div>
+                <div class="field-control"><span>识图能力</span><el-switch v-model="modelForm.supports_vision" active-text="开启" inactive-text="关闭" /></div>
               </div>
               <div class="advanced-heading"><span>高级参数</span><small>用于上下文和请求限制</small></div>
               <div class="model-form-grid advanced-fields">
@@ -2035,7 +2040,7 @@ onUnmounted(() => {
                 <label class="field-control"><span>最大输出 Token</span><el-input-number v-model="modelForm.max_output_tokens" :min="1" controls-position="right" /></label>
                 <label class="field-control"><span>超时时间（秒）</span><el-input-number v-model="modelForm.timeout_seconds" :min="1" :step="1" controls-position="right" /></label>
               </div>
-              <p class="model-security-note">保存后配置立即对下一次请求生效。API Key 只写入本机被忽略的 <code>.env</code>，不会返回到页面或写入数据库。</p>
+              <p class="model-security-note">保存后配置立即对下一次请求生效。识图能力只应为确认支持视觉输入的模型开启；API Key 只写入本机被忽略的 <code>.env</code>，不会返回到页面或写入数据库。</p>
               <div class="form-row model-actions"><el-button type="primary" :loading="modelSaving" @click="saveModel">保存配置</el-button><el-button :loading="modelTesting" @click="testModel">测试连接</el-button><el-button v-if="editingModelAlias" :disabled="!editingModel?.has_api_key" @click="clearModelKey">清除密钥</el-button><el-button v-if="editingModelAlias" type="danger" plain :disabled="!editingModel?.can_delete" @click="deleteModel">删除配置</el-button><el-button v-if="!editingModelAlias" @click="startNewModel">重置</el-button></div>
             </section>
           </div>

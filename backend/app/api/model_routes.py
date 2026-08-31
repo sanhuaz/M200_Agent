@@ -33,6 +33,7 @@ class ModelProfileCreate(BaseModel):
     input_soft_limit: int = Field(default=131_072, gt=0)
     max_output_tokens: int = Field(default=16_384, gt=0)
     timeout_seconds: float = Field(default=120, gt=0)
+    supports_vision: bool = False
 
 
 class ModelProfileUpdate(BaseModel):
@@ -47,6 +48,7 @@ class ModelProfileUpdate(BaseModel):
     input_soft_limit: int | None = Field(default=None, gt=0)
     max_output_tokens: int | None = Field(default=None, gt=0)
     timeout_seconds: float | None = Field(default=None, gt=0)
+    supports_vision: bool | None = None
 
 
 class ModelConnectionTest(ModelProfileCreate):

@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Sequence
 from typing import cast
 
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, ToolMessage
@@ -20,6 +20,12 @@ from app.db.models import (
     Message,
     SafetyEvent,
     ToolRun,
+)
+from app.domain.chat_inputs import ChatAttachmentInput, ChatTurnInput
+from app.services.chat_attachments import (
+    AttachmentValidationError,
+    attachment_content_blocks,
+    stage_attachments,
 )
 from app.services.chat_post_turn import PostTurnService
 from app.services.chat_support import (
@@ -168,21 +174,82 @@ class ChatService:
         session: Session,
         conversation: Conversation,
         sender_id: str,
-        text: str,
+        text: str | ChatTurnInput,
         platform_message_id: str | None = None,
         platform: str = "web",
         is_group: bool = False,
+        attachments: Sequence[ChatAttachmentInput] | None = None,
     ) -> AsyncGenerator[dict[str, object]]:
+        if isinstance(text, ChatTurnInput):
+            turn = text
+            platform_message_id = platform_message_id or turn.platform_message_id
+            platform = turn.platform
+            is_group = turn.is_group
+            input_text = turn.text
+            input_attachments = tuple(turn.attachments)
+        else:
+            input_text = text
+            input_attachments = tuple(attachments or ())
+
+        profile = model_registry.profile(conversation.model_alias)
+        if input_attachments and not profile.supports_vision:
+            yield {
+                "event": "error",
+                "data": {
+                    "message": "当前模型未启用识图能力，请在模型管理中开启后重试。",
+                    "code": "vision_not_supported",
+                },
+            }
+            return
+
+        try:
+            attachment_batch = stage_attachments(input_attachments)
+        except AttachmentValidationError as error:
+            yield {
+                "event": "error",
+                "data": {"message": str(error), "code": "invalid_attachment"},
+            }
+            return
+        except Exception as error:
+            logger.exception("附件暂存失败")
+            yield {
+                "event": "error",
+                "data": {
+                    "message": f"图片暂存失败：{type(error).__name__}",
+                    "code": "persistence_failed",
+                },
+            }
+            return
+
+        stored_text = input_text if input_text else ("[图片]" if input_attachments else input_text)
+        model_text = input_text if input_text else ("请描述这张图片。" if input_attachments else input_text)
         user_message = Message(
             conversation_id=conversation.id,
             sender_id=sender_id,
             role="user",
-            content=text,
+            content=stored_text,
             platform_message_id=platform_message_id,
         )
         session.add(user_message)
-        session.commit()
-        session.refresh(user_message)
+        try:
+            session.flush()
+            if attachment_batch.items:
+                attachment_batch.persist(session, user_message)
+            session.commit()
+            attachment_batch.mark_committed()
+        except Exception as error:
+            session.rollback()
+            attachment_batch.cleanup()
+            logger.exception("用户消息或附件持久化失败")
+            yield {
+                "event": "error",
+                "data": {"message": f"消息保存失败：{type(error).__name__}", "code": "persistence_failed"},
+            }
+            return
+
+        # The rest of the orchestration uses the model-facing text.  The
+        # database keeps the explicit [图片] placeholder for image-only turns.
+        text = model_text
 
         started_at = time.perf_counter()
         operation_id = operation_logs.start_operation(
@@ -198,7 +265,6 @@ class ChatService:
             },
         )
 
-        profile = model_registry.profile(conversation.model_alias)
         recent = load_pending_messages(session, conversation)
         prior_recent = [item for item in recent if item.id != user_message.id][-6:]
         companion_preference, companion_enabled = self._companion_scope(
@@ -499,7 +565,13 @@ class ChatService:
             f"{_manga_system_instruction(manga_intent)}"
         )
         try:
-            snapshot = build_context_messages(system, recent, profile)
+            snapshot = build_context_messages(
+                system,
+                recent,
+                profile,
+                attachment_content_blocks(recent),
+                {user_message.id: text} if input_attachments and not input_text else None,
+            )
         except ContextOverflowError as error:
             operation_logs.finish_operation(
                 operation_id,

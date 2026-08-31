@@ -52,7 +52,30 @@ class Message(Base):
     platform_message_id: Mapped[str | None] = mapped_column(String(160), nullable=True, unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     conversation: Mapped[Conversation] = relationship(back_populates="messages")
+    attachments: Mapped[list[MessageAttachment]] = relationship(
+        back_populates="message", cascade="all, delete-orphan"
+    )
     __table_args__ = (Index("ix_messages_conversation_created_at", "conversation_id", "created_at"),)
+
+
+class MessageAttachment(Base):
+    """Private image belonging to a user message."""
+
+    __tablename__ = "message_attachments"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    message_id: Mapped[str] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), index=True
+    )
+    original_filename: Mapped[str] = mapped_column(String(260))
+    mime_type: Mapped[str] = mapped_column(String(120))
+    byte_size: Mapped[int] = mapped_column(Integer)
+    width: Mapped[int] = mapped_column(Integer)
+    height: Mapped[int] = mapped_column(Integer)
+    relative_path: Mapped[str] = mapped_column(Text)
+    source: Mapped[str] = mapped_column(String(20), default="web")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    message: Mapped[Message] = relationship(back_populates="attachments")
 
 
 class KnowledgeBase(Base):

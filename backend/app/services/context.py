@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.messages.utils import count_tokens_approximately
@@ -182,6 +183,8 @@ def build_context_messages(
     system_text: str,
     history: list[Message],
     profile: ModelProfile,
+    attachments_by_message: dict[str, list[dict[str, object]]] | None = None,
+    text_overrides: dict[str, str] | None = None,
 ) -> ContextSnapshot:
     system = SystemMessage(content=system_text)
     system_tokens = estimate_messages_tokens([system])
@@ -192,11 +195,19 @@ def build_context_messages(
     remaining = history[:]
     while remaining:
         candidate = remaining[-1]
-        converted = (
-            HumanMessage(content=candidate.content)
-            if candidate.role == "user"
-            else AIMessage(content=candidate.content)
-        )
+        candidate_text = (text_overrides or {}).get(candidate.id, candidate.content)
+        if candidate.role == "user":
+            image_blocks = (attachments_by_message or {}).get(candidate.id, [])
+            if image_blocks:
+                content: list[Any] = [
+                    {"type": "text", "text": candidate_text},
+                    *image_blocks,
+                ]
+                converted = HumanMessage(content=content)
+            else:
+                converted = HumanMessage(content=candidate_text)
+        else:
+            converted = AIMessage(content=candidate.content)
         if estimate_messages_tokens([system, *selected, converted]) > profile.input_soft_limit:
             break
         selected.insert(0, converted)

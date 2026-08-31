@@ -25,6 +25,7 @@ class ModelProfile(BaseModel):
     input_soft_limit: int = 131_072
     max_output_tokens: int = 16_384
     timeout_seconds: float = 120.0
+    supports_vision: bool = False
 
     @field_validator("context_window", "input_soft_limit", "max_output_tokens")
     @classmethod
@@ -54,6 +55,7 @@ class Settings(BaseSettings):
     chroma_path: Path = PROJECT_ROOT / "data" / "chroma"
     upload_path: Path = PROJECT_ROOT / "data" / "uploads"
     download_path: Path = PROJECT_ROOT / "data" / "downloads"
+    chat_image_path: Path = PROJECT_ROOT / "data" / "chat-images"
     tools_path: Path = PROJECT_ROOT / "tools"
     skills_path: Path = PROJECT_ROOT / "skills"
     workspace_path: Path = PROJECT_ROOT / "workspace"
@@ -63,7 +65,7 @@ class Settings(BaseSettings):
         '[{"alias":"default","model":"unconfigured","base_url":"https://api.example.com/v1",'
         '"api_key_env":"PERSONAL_AGENT_LLM_API_KEY","context_window":1000000,'
         '"input_soft_limit":131072,"max_output_tokens":16384,'
-        '"timeout_seconds":120}]'
+        '"timeout_seconds":120,"supports_vision":false}]'
     )
     default_embedding_profile: str = "local-bge"
     local_embedding_model: str = "BAAI/bge-small-zh-v1.5"
@@ -103,6 +105,7 @@ class Settings(BaseSettings):
         "chroma_path",
         "upload_path",
         "download_path",
+        "chat_image_path",
         "tools_path",
         "skills_path",
         "workspace_path",
@@ -129,6 +132,7 @@ class Settings(BaseSettings):
             self.chroma_path,
             self.upload_path,
             self.download_path,
+            self.chat_image_path,
             self.tools_path,
             self.skills_path,
             self.workspace_path,

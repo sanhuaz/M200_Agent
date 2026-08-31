@@ -26,6 +26,8 @@ data/uploads/*
 !data/chroma/.gitkeep
 !data/downloads/.gitkeep
 !data/uploads/.gitkeep
+data/chat-images/*
+!data/chat-images/.gitkeep
 *.log
 logs/
 .coverage

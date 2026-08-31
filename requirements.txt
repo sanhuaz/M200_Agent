@@ -17,3 +17,4 @@ jieba==0.42.1
 httpx==0.28.1
 python-multipart==0.0.32
 mcp==2.1.1
+Pillow==12.3.0
