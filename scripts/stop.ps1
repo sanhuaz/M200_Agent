@@ -1,3 +1,7 @@
+param(
+    [string]$PythonExe
+)
+
 $ErrorActionPreference = "Stop"
 
 $ProjectRoot = (Resolve-Path -LiteralPath (Split-Path -Parent $PSScriptRoot)).Path
@@ -5,15 +9,10 @@ $TargetPorts = @(8000, 5176)
 $LogRoot = [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot "logs"))
 $CurrentLogRoot = [System.IO.Path]::GetFullPath((Join-Path $LogRoot "current"))
 $ArchiveLogRoot = [System.IO.Path]::GetFullPath((Join-Path $LogRoot "archives"))
-$FixedPython = "D:\miniconda\envs\langchain1.2\python.exe"
-$PythonExe = $env:PERSONAL_AGENT_PYTHON
-
-if (-not $PythonExe) {
-    $PythonExe = $FixedPython
-}
-if (Test-Path -LiteralPath $PythonExe) {
-    $PythonExe = (Resolve-Path -LiteralPath $PythonExe).Path
-}
+$PythonExe = if ($PythonExe) { $PythonExe } else { $env:PERSONAL_AGENT_PYTHON }
+$Resolver = Join-Path $PSScriptRoot "python-resolver.ps1"
+$Interactive = -not [Console]::IsInputRedirected
+$PythonExe = (& $Resolver -RequestedPath $PythonExe -Interactive:$Interactive | Select-Object -Last 1).Trim()
 
 function Get-ProjectListeners {
     $netstatExe = Join-Path $env:WINDIR "System32\netstat.exe"
