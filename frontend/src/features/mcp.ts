@@ -102,4 +102,3 @@ export const policyLabels: Record<McpAccessPolicy, string> = {
   owner_only: '仅管理员私聊',
   private_users: '指定私聊白名单',
 }
-

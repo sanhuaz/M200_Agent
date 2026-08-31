@@ -72,4 +72,3 @@ export type McpTestResponse = {
   catalog: McpCatalog
   catalog_summary: Record<string, number>
 }
-
