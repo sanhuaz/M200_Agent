@@ -57,43 +57,116 @@ function Test-PortArgument {
     return $CommandLine -match $portPattern
 }
 
+function Get-ProjectProcess {
+    param(
+        [Parameter(Mandatory)]
+        [int]$ProcessId
+    )
+
+    try {
+        $process = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop
+        if (-not $process) { return $null }
+        return [pscustomobject]@{
+            Name = [string]$process.Name
+            ExecutablePath = [string]$process.ExecutablePath
+            CommandLine = [string]$process.CommandLine
+            ValidationMode = "cim"
+        }
+    } catch {
+        $fallback = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        if (-not $fallback) { return $null }
+        $executablePath = $null
+        try { $executablePath = [string]$fallback.Path } catch { }
+        Write-Warning "无法读取 PID $ProcessId 的 WMI 命令行，改用端口、可执行路径和项目身份进行受限校验。"
+        return [pscustomobject]@{
+            Name = "$($fallback.ProcessName).exe"
+            ExecutablePath = $executablePath
+            CommandLine = $null
+            ValidationMode = "limited"
+        }
+    }
+}
+
+function Test-BackendEndpointIdentity {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ExpectedPython
+    )
+
+    try {
+        $root = Invoke-RestMethod -UseBasicParsing -Uri "http://127.0.0.1:8000/" -TimeoutSec 3
+        $health = Invoke-RestMethod -UseBasicParsing -Uri "http://127.0.0.1:8000/api/v1/health" -TimeoutSec 3
+        if ($root.service -ne "personal-agent" -or -not $health.python_executable) {
+            return $false
+        }
+        $actualPython = [System.IO.Path]::GetFullPath([string]$health.python_executable)
+        return [string]::Equals(
+            $actualPython,
+            [System.IO.Path]::GetFullPath($ExpectedPython),
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    } catch {
+        return $false
+    }
+}
+
+function Test-FrontendEndpointIdentity {
+    try {
+        $response = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:5176/" -TimeoutSec 3
+        $content = [string]$response.Content
+        return (
+            $content -match '(?i)<title>\s*PersonalAgent\s*</title>' -and
+            $content -match '(?i)<div\s+id=["'']app["'']\s*></div>' -and
+            $content -match '(?i)/src/main\.ts'
+        )
+    } catch {
+        return $false
+    }
+}
+
 function Test-BackendProcess {
     param(
         [Parameter(Mandatory)]
-        [CimInstance]$Process
+        [psobject]$Process
     )
 
-    if (-not $Process.ExecutablePath -or -not $Process.CommandLine -or -not $PythonExe) {
+    if (-not $Process.ExecutablePath -or -not $PythonExe) {
         return $false
     }
 
     $expectedPython = [System.IO.Path]::GetFullPath($PythonExe)
     $actualExecutable = [System.IO.Path]::GetFullPath($Process.ExecutablePath)
-    return (
-        $actualExecutable -eq $expectedPython -and
-        $Process.CommandLine -match "(?i)(?:^|\s)-m\s+uvicorn\s+app\.main:app(?:\s|$)" -and
-        (Test-PortArgument -CommandLine $Process.CommandLine -Port 8000)
-    )
+    if ($actualExecutable -ne $expectedPython) { return $false }
+    if ($Process.CommandLine) {
+        return (
+            $Process.CommandLine -match "(?i)(?:^|\s)-m\s+uvicorn\s+app\.main:app(?:\s|$)" -and
+            (Test-PortArgument -CommandLine $Process.CommandLine -Port 8000)
+        )
+    }
+    return Test-BackendEndpointIdentity -ExpectedPython $expectedPython
 }
 
 function Test-FrontendProcess {
     param(
         [Parameter(Mandatory)]
-        [CimInstance]$Process
+        [psobject]$Process
     )
 
-    if (-not $Process.ExecutablePath -or -not $Process.CommandLine) {
+    if (-not $Process.ExecutablePath) {
         return $false
     }
 
     $frontendPath = [regex]::Escape((Join-Path $ProjectRoot "frontend"))
     $executableName = [System.IO.Path]::GetFileName($Process.ExecutablePath)
-    return (
-        $executableName -ieq "node.exe" -and
-        $Process.CommandLine -match "(?i)$frontendPath[\\/]" -and
-        $Process.CommandLine -match "(?i)(?:^|[\\/])vite(?:\.cmd|\.js|\.mjs)?(?:\s|$|[\\/])" -and
-        (Test-PortArgument -CommandLine $Process.CommandLine -Port 5176)
-    )
+    if ($executableName -ine "node.exe") { return $false }
+    if ($Process.CommandLine) {
+        return (
+            $Process.CommandLine -match "(?i)$frontendPath[\\/]" -and
+            $Process.CommandLine -match "(?i)(?:^|[\\/])vite(?:\.cmd|\.js|\.mjs)?(?:\s|$|[\\/])" -and
+            (Test-PortArgument -CommandLine $Process.CommandLine -Port 5176)
+        )
+    }
+    return Test-FrontendEndpointIdentity
 }
 
 function Archive-CurrentLogs {
@@ -160,7 +233,7 @@ $validationErrors = @()
 
 foreach ($listener in $listeners) {
     $processId = [int]$listener.OwningProcess
-    $process = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $processId"
+    $process = Get-ProjectProcess -ProcessId $processId
     if (-not $process) {
         continue
     }
