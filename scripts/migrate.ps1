@@ -61,6 +61,12 @@ if (-not (Test-Path -LiteralPath $PythonExe)) {
     throw "Python 不存在：$PythonExe"
 }
 
+& $PythonExe -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('alembic') else 1)" 2>$null
+if ($LASTEXITCODE -ne 0) {
+    $requirements = Join-Path $ProjectRoot "requirements.txt"
+    throw "所选 Python 缺少 Alembic：$PythonExe。请改用已安装项目依赖的 Python 3.13，或运行 & `"$PythonExe`" -m pip install -r `"$requirements`"。"
+}
+
 $planJson = & $PythonExe (Join-Path $PSScriptRoot "migration_plan.py") `
     --database $DatabasePath --config (Join-Path $ProjectRoot "alembic.ini")
 if ($LASTEXITCODE -ne 0) { throw "无法读取数据库迁移状态" }

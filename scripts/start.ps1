@@ -18,7 +18,15 @@ Write-Bootstrap "启动会话 $SessionId"
 
 $Interactive = -not [Console]::IsInputRedirected
 $Resolver = Join-Path $PSScriptRoot "python-resolver.ps1"
-$PythonExe = (& $Resolver -RequestedPath $PythonExe -Interactive:$Interactive | Select-Object -Last 1).Trim()
+$RequiredModules = @(
+    "alembic", "bs4", "chromadb", "docx", "fastapi", "httpx", "jieba", "jmcomic",
+    "langchain", "langchain_openai", "langgraph", "mcp", "multipart", "PIL", "pydantic_settings",
+    "pypdf", "sentence_transformers", "sqlalchemy", "uvicorn"
+)
+$PythonExe = (
+    & $Resolver -RequestedPath $PythonExe -Interactive:$Interactive -RequiredModules $RequiredModules |
+        Select-Object -Last 1
+).Trim()
 Write-Bootstrap "解释器检查通过：$PythonExe（Python 3.13）"
 
 & (Join-Path $PSScriptRoot "migrate.ps1") -PythonExe $PythonExe
