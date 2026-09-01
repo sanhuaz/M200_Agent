@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import math
 import re
+from typing import cast
 
-from app.domain.reply_types import ReplyMode, ReplyPart, ReplyPlan
+from app.domain.reply_types import ReplyMode, ReplyPart, ReplyPlan, ReplyPolicyStatus
 
 DEFAULT_CHUNK_TARGET_CHARS = 20
 MIN_CHUNK_TARGET_CHARS = 5
@@ -131,8 +132,14 @@ def split_qq_reply(text: str, target_chars: object = DEFAULT_CHUNK_TARGET_CHARS)
     return restored or [normalized]
 
 
-def plan_delivery_parts(plan: ReplyPlan) -> list[str]:
-    """Return already-reviewed plan parts without any character-based split."""
+def plan_delivery_parts(
+    plan: ReplyPlan,
+    target_chars: object = DEFAULT_CHUNK_TARGET_CHARS,
+) -> list[str]:
+    """Return reviewed parts, or semantically split a preserved original."""
+
+    if plan.policy_status == "original_preserved":
+        return split_qq_reply(plan.text, target_chars=target_chars)
 
     chunks: list[str] = []
     for part in plan.parts:
@@ -156,6 +163,10 @@ def reply_plan_from_event(data: dict[str, object]) -> ReplyPlan | None:
         reply_mode = "long"
     else:
         return None
+    raw_policy_status = data.get("reply_policy_status", "accepted")
+    if raw_policy_status not in {"accepted", "repaired", "original_preserved"}:
+        return None
+    policy_status = cast(ReplyPolicyStatus, raw_policy_status)
     raw_parts = data.get("parts")
     if not isinstance(raw_parts, list):
         return None
@@ -178,13 +189,20 @@ def reply_plan_from_event(data: dict[str, object]) -> ReplyPlan | None:
         isinstance(item, str) for item in atomic_parts
     ):
         return None
+    expected_text = data.get("text")
+    source_text = (
+        expected_text
+        if policy_status == "original_preserved" and isinstance(expected_text, str)
+        else None
+    )
     plan = ReplyPlan(
         reply_mode,
         tuple(segments),
         tuple(atomic_parts),
         tuple(parts),
+        policy_status=policy_status,
+        source_text=source_text,
     )
-    expected_text = data.get("text")
     if isinstance(expected_text, str) and expected_text != plan.text:
         return None
     return plan

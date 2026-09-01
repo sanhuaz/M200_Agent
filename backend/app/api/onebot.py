@@ -543,14 +543,21 @@ class OneBotManager:
                         artifact_ids.append(artifact_id)
             reply_text = final_text or f"处理失败：{error_text}"
             chunkable_response_sources = {"agent", "rewritten", "style_rewritten"}
+            policy_preserved_original = (
+                reply_plan is not None
+                and reply_plan.policy_status == "original_preserved"
+            )
             if (
                 reply_plan is not None
                 and final_text
                 and not error_text
                 and not safety_intercepted
-                and response_source in chunkable_response_sources
+                and (
+                    response_source in chunkable_response_sources
+                    or policy_preserved_original
+                )
             ):
-                chunks = plan_delivery_parts(reply_plan)
+                chunks = plan_delivery_parts(reply_plan, target_chars=chunk_target_chars)
             elif (
                 final_text
                 and not error_text
