@@ -22,6 +22,7 @@ from app.db.models import (
     ToolRun,
 )
 from app.domain.chat_inputs import ChatAttachmentInput, ChatTurnInput
+from app.domain.reply_types import ReplyPlan
 from app.services.chat_attachments import (
     AttachmentValidationError,
     attachment_content_blocks,
@@ -74,6 +75,7 @@ from app.services.mcp_search import search_intent, search_system_instruction
 from app.services.models import model_registry
 from app.services.operation_logs import operation_logs
 from app.services.personas import active_persona, persona_system_prompt
+from app.services.reply_policy import prepare_reply
 from app.services.runtime import is_owner
 from app.services.strategy_guides import NORMAL_STRATEGIES, guide_for_strategy
 from app.workflows.agent import build_agent_graph, final_ai_message, skill_descriptions
@@ -397,6 +399,8 @@ class ChatService:
                 )
                 response_source = "safety_llm" if safety_answer else "template"
                 answer = safety_answer or safety_redirect_text(safety_analysis.risk_level)
+                reply_plan = prepare_reply(answer, text, conversation.model_alias)
+                answer = reply_plan.text
                 session.add(
                     SafetyEvent(
                         message_id=user_message.id,
@@ -446,6 +450,9 @@ class ChatService:
                     "data": {
                         "message_id": assistant_message.id,
                         "text": answer,
+                        "response_mode": reply_plan.mode,
+                        "segments": list(reply_plan.segments),
+                        "atomic_parts": list(reply_plan.atomic_parts),
                         "assessment_id": safety_analysis.assessment_id,
                         "response_source": response_source,
                     },
@@ -586,7 +593,6 @@ class ChatService:
             yield {"event": "error", "data": {"message": str(error)}}
             return
         messages = snapshot.messages
-        emitted = ""
         started_tools: set[str] = set()
         model_operation: str | None = None
         try:
@@ -630,10 +636,6 @@ class ChatService:
                     continue
                 chunk, _metadata = payload
                 if isinstance(chunk, (AIMessage, AIMessageChunk)):
-                    if isinstance(chunk.content, str) and chunk.content:
-                        emitted += chunk.content
-                        if profile.streaming and not companion_enabled:
-                            yield {"event": "token", "data": {"text": chunk.content}}
                     tool_calls = (
                         chunk.tool_call_chunks if isinstance(chunk, AIMessageChunk) else chunk.tool_calls
                     )
@@ -801,10 +803,8 @@ class ChatService:
                                 trace_id=user_message.id,
                                 details={"violation_codes": style_violations},
                             )
-            if (not profile.streaming or companion_enabled) and answer:
-                yield {"event": "token", "data": {"text": answer}}
-            elif not emitted and answer:
-                yield {"event": "token", "data": {"text": answer}}
+            reply_plan: ReplyPlan = prepare_reply(answer, text, conversation.model_alias)
+            answer = reply_plan.text
             assistant_message = Message(
                 conversation_id=conversation.id,
                 sender_id="assistant",
@@ -835,11 +835,16 @@ class ChatService:
                     "tools": len(started_tools),
                 },
             )
+            if answer:
+                yield {"event": "token", "data": {"text": answer}}
             yield {
                 "event": "final",
                 "data": {
                     "message_id": assistant_message.id,
                     "text": answer,
+                    "response_mode": reply_plan.mode,
+                    "segments": list(reply_plan.segments),
+                    "atomic_parts": list(reply_plan.atomic_parts),
                     "assessment_id": companion_analysis.assessment_id
                     if companion_analysis is not None
                     else None,
