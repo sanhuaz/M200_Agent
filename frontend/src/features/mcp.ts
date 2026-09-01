@@ -3,6 +3,7 @@ import type {
   McpAccessPolicy,
   McpCatalogResponse,
   McpGrantKind,
+  McpPreset,
   McpServer,
   McpServerDraft,
   McpTestResponse,
@@ -46,6 +47,19 @@ export function serverToDraft(server: McpServer): McpServerDraft {
 
 export function listMcpServers(): Promise<McpServer[]> {
   return api<McpServer[]>('/mcp/servers')
+}
+
+export function listMcpPresets(): Promise<McpPreset[]> {
+  return api<McpPreset[]>('/mcp/presets')
+}
+
+export function installAnySearch(apiKey?: string): Promise<McpServer> {
+  const normalized = apiKey?.trim()
+  return api<McpServer>('/mcp/presets/anysearch', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(normalized ? { api_key: normalized } : {}),
+  })
 }
 
 export function createMcpServer(draft: McpServerDraft): Promise<McpServer> {

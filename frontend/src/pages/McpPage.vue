@@ -6,6 +6,8 @@ import {
   createMcpServer,
   deleteMcpServer,
   getMcpCatalog,
+  installAnySearch,
+  listMcpPresets,
   listMcpServers,
   policyLabels,
   refreshMcpServer,
@@ -19,6 +21,8 @@ import type {
   McpCatalog,
   McpCatalogEntry,
   McpGrantKind,
+  AnySearchAuthMode,
+  McpPreset,
   McpServer,
   McpServerDraft,
   McpTransport,
@@ -42,6 +46,7 @@ const newDraft = (): McpServerDraft => ({
 })
 
 const servers = ref<McpServer[]>([])
+const presets = ref<McpPreset[]>([])
 const selectedId = ref('')
 const draft = reactive<McpServerDraft>(newDraft())
 const catalog = ref<McpCatalog>(emptyCatalog())
@@ -53,12 +58,17 @@ const refreshing = ref(false)
 const togglingId = ref('')
 const deletingId = ref('')
 const catalogLoading = ref(false)
+const anySearchDialogVisible = ref(false)
+const anySearchMode = ref<AnySearchAuthMode>('anonymous')
+const anySearchApiKey = ref('')
+const anySearchInstalling = ref(false)
 const grantSaving = reactive<Record<McpGrantKind, boolean>>({ tool: false, resource: false, prompt: false })
 const grantSelections = reactive<Record<McpGrantKind, string[]>>({ tool: [], resource: [], prompt: [] })
 let serverRequest = 0
 let catalogRequest = 0
 
 const selectedServer = computed(() => servers.value.find((item) => item.id === selectedId.value) || null)
+const anySearchPreset = computed(() => presets.value.find((item) => item.slug === 'anysearch') || null)
 const isEditing = computed(() => Boolean(selectedId.value))
 const catalogGroups = computed(() => [
   { kind: 'tool' as const, label: 'Tools', items: catalog.value.tools, hint: '可被 Agent 直接调用' },
@@ -125,6 +135,47 @@ async function loadServers() {
     if (request === serverRequest) ElMessage.error((error as Error).message)
   } finally {
     if (request === serverRequest) loading.value = false
+  }
+}
+
+async function loadPresets() {
+  try {
+    presets.value = await listMcpPresets()
+  } catch (error) {
+    ElMessage.error((error as Error).message)
+  }
+}
+
+function openAnySearchDialog() {
+  anySearchMode.value = 'anonymous'
+  anySearchApiKey.value = ''
+  anySearchDialogVisible.value = true
+}
+
+async function installAnySearchPreset() {
+  const apiKey = anySearchApiKey.value.trim()
+  if (anySearchMode.value === 'api_key' && !apiKey) {
+    ElMessage.warning('请输入 AnySearch API Key，或切换为匿名访问')
+    return
+  }
+  anySearchInstalling.value = true
+  try {
+    const item = await installAnySearch(anySearchMode.value === 'api_key' ? apiKey : undefined)
+    updateServerInList(item)
+    selectedId.value = item.id
+    Object.assign(draft, serverToDraft(item))
+    draft.secretValuesText = '{}'
+    catalog.value = emptyCatalog()
+    catalogStatus.value = item.status
+    anySearchDialogVisible.value = false
+    anySearchApiKey.value = ''
+    await loadPresets()
+    await loadCatalog(item.id)
+    ElMessage.success('AnySearch 已添加，当前停用且未授权任何工具')
+  } catch (error) {
+    ElMessage.error((error as Error).message)
+  } finally {
+    anySearchInstalling.value = false
   }
 }
 
@@ -275,7 +326,7 @@ async function saveGrant(kind: McpGrantKind) {
   }
 }
 
-onMounted(() => { void loadServers() })
+onMounted(() => { void loadServers(); void loadPresets() })
 </script>
 
 <template>
@@ -304,7 +355,7 @@ onMounted(() => { void loadServers() })
     </section>
 
     <section class="panel stack mcp-server-list">
-      <div class="panel-heading"><div><span class="section-kicker">已配置</span><h2>MCP Server</h2></div><span class="count-badge">{{ servers.length }}</span></div>
+      <div class="panel-heading"><div><span class="section-kicker">已配置</span><h2>MCP Server</h2></div><div class="form-row"><el-button v-if="anySearchPreset && !anySearchPreset.installed" type="primary" plain @click="openAnySearchDialog"><Plus />添加 AnySearch</el-button><span class="count-badge">{{ servers.length }}</span></div></div>
       <div v-loading="loading" class="card-list">
         <button v-for="item in servers" :key="item.id" class="mcp-server-card" :class="{ active: item.id === selectedId }" @click="selectServer(item)">
           <span class="mcp-server-icon"><Connection /></span>
@@ -343,4 +394,18 @@ onMounted(() => { void loadServers() })
     <p>第三方 MCP Server 的实际稳定性取决于其自身实现，并非模型本身。MCP Server 运行在本机 Agent 进程可访问的环境中；只授权你理解且需要的目录项，停用或断线不会影响其他 Server。</p>
     <p>本版本不实施 OAuth 交互登录、Sampling、Elicitation、Roots 和订阅。密钥只通过本机环境变量引用传递，页面不会回填原始值。</p>
   </section>
+
+  <el-dialog v-model="anySearchDialogVisible" title="添加 AnySearch" width="520px">
+    <p class="hint">AnySearch 使用官方远程 MCP 端点。添加只保存连接配置，不会自动连接、授权或启用。</p>
+    <p class="hint">官方地址：{{ anySearchPreset?.url }}</p>
+    <el-radio-group v-model="anySearchMode">
+      <el-radio value="anonymous">匿名访问</el-radio>
+      <el-radio value="api_key">使用 API Key</el-radio>
+    </el-radio-group>
+    <el-input v-if="anySearchMode === 'api_key'" v-model="anySearchApiKey" class="dialog-field" type="password" show-password autocomplete="new-password" placeholder="只在本次请求中提交，页面不会回填" />
+    <template #footer>
+      <el-button @click="anySearchDialogVisible = false">取消</el-button>
+      <el-button type="primary" :loading="anySearchInstalling" @click="installAnySearchPreset">保存并停用</el-button>
+    </template>
+  </el-dialog>
 </template>

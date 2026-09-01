@@ -76,6 +76,41 @@ class McpServerUpdate(BaseModel):
         return list(dict.fromkeys(normalized))
 
 
+class AnySearchPresetPayload(BaseModel):
+    """Optional one-time API key used when installing the AnySearch preset."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    api_key: str | None = Field(default=None, max_length=2_000)
+
+    @field_validator("api_key")
+    @classmethod
+    def normalize_api_key(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if "\r" in normalized or "\n" in normalized:
+            raise ValueError("AnySearch API Key 不能包含换行")
+        return normalized
+
+
+class McpPreset(BaseModel):
+    """Non-sensitive description of an installable MCP preset."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    slug: str
+    transport: McpTransport
+    url: str
+    supports_anonymous: bool
+    supports_api_key: bool
+    risk_note: str
+    installed: bool = False
+
+
 class McpEnabledPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

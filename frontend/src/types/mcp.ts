@@ -1,6 +1,18 @@
 export type McpTransport = 'stdio' | 'sse' | 'streamable_http'
 export type McpAccessPolicy = 'owner_only' | 'private_users'
 export type McpGrantKind = 'tool' | 'resource' | 'prompt'
+export type AnySearchAuthMode = 'anonymous' | 'api_key'
+
+export type McpPreset = {
+  name: string
+  slug: string
+  transport: McpTransport
+  url: string
+  supports_anonymous: boolean
+  supports_api_key: boolean
+  risk_note: string
+  installed: boolean
+}
 
 export type McpCatalogEntry = {
   key: string

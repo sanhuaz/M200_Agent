@@ -33,6 +33,10 @@ class McpServerError(ValueError):
     """A safe, user-facing configuration or lifecycle error."""
 
 
+class McpServerConflictError(McpServerError):
+    """A create/update operation conflicts with an existing server."""
+
+
 def _json(value: Any, default: Any) -> Any:
     try:
         parsed = json.loads(value or "")
@@ -236,7 +240,7 @@ def server_dict(item: McpServer) -> dict[str, Any]:
 def _unique_slug(session: Session, requested: str | None, name: str) -> str:
     slug = _validate_slug(requested) if requested else _slugify(name)
     if session.scalar(select(McpServer.id).where(McpServer.slug == slug)):
-        raise McpServerError("MCP Server slug 已存在")
+        raise McpServerConflictError("MCP Server slug 已存在")
     return slug
 
 
@@ -261,8 +265,16 @@ def create_server(session: Session, payload: McpServerPayload) -> McpServer:
         session.flush()
     except IntegrityError as error:
         session.rollback()
-        raise McpServerError("MCP Server slug 已存在") from error
-    _write_env_values(values)
+        raise McpServerConflictError("MCP Server slug 已存在") from error
+    try:
+        _write_env_values(values)
+    except Exception as error:
+        # The environment file is replaced only after a complete temporary
+        # file is written. Remove the flushed row as well on local write
+        # failure so no unusable server remains in the transaction.
+        session.delete(item)
+        session.flush()
+        raise McpServerError("本机密钥保存失败，AnySearch Server 未创建") from error
     return item
 
 

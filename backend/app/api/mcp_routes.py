@@ -13,13 +13,16 @@ from app.api.dependencies import require_loopback
 from app.db.models import McpServer
 from app.db.session import get_db
 from app.domain.mcp_types import (
+    AnySearchPresetPayload,
     McpEnabledPayload,
     McpGrantPayload,
     McpServerPayload,
     McpServerUpdate,
 )
 from app.services.mcp_client import McpClientError, safe_error
+from app.services.mcp_presets import anysearch_preset, anysearch_server_payload
 from app.services.mcp_servers import (
+    McpServerConflictError,
     McpServerError,
     catalog_with_grants,
     create_server,
@@ -60,6 +63,29 @@ def list_mcp_servers(session: Session = Depends(get_db)) -> list[dict[str, objec
     return [server_dict(item) for item in session.scalars(select(McpServer).order_by(McpServer.created_at))]
 
 
+@router.get("/presets", dependencies=_MANAGEMENT)
+def list_mcp_presets(session: Session = Depends(get_db)) -> list[dict[str, object]]:
+    installed = session.scalar(select(McpServer.id).where(McpServer.slug == "anysearch")) is not None
+    return [anysearch_preset(installed=installed).model_dump(mode="json")]
+
+
+@router.post("/presets/anysearch", dependencies=_MANAGEMENT)
+def install_anysearch_preset(
+    payload: AnySearchPresetPayload, session: Session = Depends(get_db)
+) -> dict[str, object]:
+    try:
+        item = create_server(session, anysearch_server_payload(payload))
+        session.commit()
+        session.refresh(item)
+        return server_dict(item)
+    except McpServerConflictError as error:
+        session.rollback()
+        raise _safe_http_error(error, 409) from error
+    except McpServerError as error:
+        session.rollback()
+        raise _safe_http_error(error) from error
+
+
 @router.post("/servers", dependencies=_MANAGEMENT)
 def create_mcp_server(
     payload: McpServerPayload, session: Session = Depends(get_db)
@@ -69,6 +95,9 @@ def create_mcp_server(
         session.commit()
         session.refresh(item)
         return server_dict(item)
+    except McpServerConflictError as error:
+        session.rollback()
+        raise _safe_http_error(error, 409) from error
     except McpServerError as error:
         session.rollback()
         raise _safe_http_error(error) from error
