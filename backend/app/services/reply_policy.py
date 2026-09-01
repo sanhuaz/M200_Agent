@@ -186,7 +186,7 @@ def _plan_from_parts(mode: ReplyMode, parts: Iterable[ReplyPart]) -> ReplyPlan:
 
 
 def _balanced(text: str) -> bool:
-    pairs = {"（": ")", "(": ")", "【": "】", "[": "]", "《": "》", "“": "”", "\"": "\""}
+    pairs = {"（": "）", "(": ")", "【": "】", "[": "]", "《": "》", "“": "”", "\"": "\""}
     stack: list[str] = []
     for character in text:
         if character in pairs:
