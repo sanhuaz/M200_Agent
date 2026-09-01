@@ -1,8 +1,8 @@
 # M200 Agent
 
 M200 Agent 是一个面向个人单用户场景的 AI Agent 原型。它以 FastAPI、LangGraph 和
-Vue 3 为核心，提供 Web 对话、三层记忆、文档混合检索、NapCat/OneBot v11 QQ 接入、
-可选视觉输入，以及仅管理员可创建的 JMComic 持久下载任务。P0 还提供管理员 QQ 私聊
+Vue 3 为核心，提供 Web 对话、三层记忆、时间化上下文、文档混合检索、NapCat/OneBot v11 QQ 接入、
+可选视觉输入，以及仅管理员可创建的 JMComic 持久下载任务。v0.4.x 还提供管理员 QQ 私聊
 情感陪伴闭环：多标签情绪分析、支持策略路由、安全边界、用户纠正与反馈、授权关系资料，
 以及 Web 管理、导出和分类删除。
 
@@ -11,7 +11,7 @@ Docker、Redis、Celery、完整 RBAC、OCR、语音、图像 RAG、生产日志
 
 ## 当前发布
 
-- 当前版本：`v0.4.5`
+- 当前版本：`v0.4.6`（本地完成，尚未推送或创建 Release）
 - 仓库：<https://github.com/sanhuaz/M200_Agent>
 
 ## 功能
@@ -19,6 +19,8 @@ Docker、Redis、Celery、完整 RBAC、OCR、语音、图像 RAG、生产日志
 - OpenAI 兼容文本模型，多模型配置并按会话切换；模型管理页可设主默认模型并同步现有会话。
 - 模型配置可显式开启 `supports_vision`；只有确认支持视觉输入的模型才接受图片请求。
 - LangGraph 原生 Function Calling，不使用正则模拟工具调用。
+- AnySearch 通过官方远程 MCP Server 接入；默认停用、逐项授权、管理员确认后才允许 Agent 在明确联网意图下调用，
+  网络失败时明确降级，不伪造实时来源。
 - SQLite 保存会话、消息、用户事实、确认请求和后台任务。
 - LangGraph 负责单轮工具编排，最终状态直接从流中取得；会话历史与摘要由业务数据库保存。
 - 角色规则、结构化用户事实和向量语义记忆组成三层记忆。
@@ -48,7 +50,9 @@ Docker、Redis、Celery、完整 RBAC、OCR、语音、图像 RAG、生产日志
 - 图片输入校验失败时不保存；消息/附件持久化失败会回滚并删除图片；已持久化后模型失败则保留用户消息和图片，
   不写助手消息并允许重试。
 - 文件化结构角色卡存放在本机 `persona/`，JSON 文件是正文唯一权威来源，数据库只保留索引和会话引用；Web 与 QQ 会话可独立选择人格或关闭人格。
-- 长期记忆中心对外统一展示普通事实与陪伴关系，并按全局、QQ 用户、群组和人格筛选；内部仍保留两个独立存储库。
+- 长期记忆中心对外统一展示普通事实、历史事件与陪伴关系，并按全局、QQ 用户、群组和人格筛选；内部仍保留两个独立存储库。
+- 数据库以 UTC 保存时间；聊天、摘要、记忆召回和陪伴上下文使用同一配置时区，Web Chat 页面展示消息本地时间、跨日分隔、
+  完整时区提示，长期记忆中心展示事件日期、首次记录和最近确认/更新。
 - 文件产物隔离、SHA-256 记录、Web 下载及 QQ 私聊发送。
 - Vue 3 管理端：聊天、模型管理、知识库、Tools、Skills、人格、长期记忆、管理员、任务和状态页面；网页会话可删除，任务与确认记录支持批量清理。
 - 实时日志中心：侧栏 `/logs` 提供 M200 结构化操作日志和 NapCat 原生日志双标签，实时显示启动、模型、Tool、记忆、RAG、索引、任务、下载和 OneBot 状态。
@@ -67,6 +71,7 @@ LangGraph Agent
    ├─ Chat Model / Function Calling
    ├─ Unified Tool Registry / Skills / MCP
    ├─ Long-term Memory
+   ├─ UTC 时间存储 → 配置时区上下文与页面展示
    ├─ Knowledge Retrieval
    │    ├─ Chroma Vector Search
    │    ├─ SQLite FTS5 + jieba
@@ -79,14 +84,14 @@ SQLite（关系、消息、状态） + Chroma（文档/记忆向量） + 私有�
 
 ### 公开仓库目录架构
 
-以下是 `v0.4.5` 实际发布源码的目录结构；测试集、评测运行结果、运行数据、第三方本机 Skill 和私有材料不在其中：
+以下是 `v0.4.6` 公开源码的目录结构；测试集、评测运行结果、运行数据、第三方本机 Skill 和私有材料不在其中：
 
 ```text
 M200_Agent/
 ├─ backend/
 │  ├─ alembic/
 │  │  ├─ env.py
-│  │  └─ versions/                 # 0001—0011，支持旧数据库逐版升级
+│  │  └─ versions/                 # 0001—0012，支持旧数据库逐版升级
 │  └─ app/
 │     ├─ api/                      # 分域 Router、聊天、多模态附件、OneBot、MCP
 │     ├─ core/                     # 环境配置
@@ -123,7 +128,7 @@ M200_Agent/
 ```
 
 `backend/alembic/versions/` 中的历史迁移不是重复文件。Alembic 需要按修订链将旧版本数据库逐步升级到
-`0011_message_attachments`，因此公开发行必须保留 `0001`—`0011`。
+`0012_temporal_context`，因此公开发行必须保留 `0001`—`0012`。
 
 ## 技术栈
 
@@ -165,6 +170,13 @@ Copy-Item ".env.example" ".env"
 
 至少需要配置一个支持原生 Tool Calls 的 OpenAI 兼容模型。下面的 JSON 只在首次启动时导入；项目初始化后，
 可在 Web 管理端 `/models` 的“模型管理”页面快捷调整模型名称、`base_url`、思考强度、流式输出、温度和请求限制：
+
+```env
+PERSONAL_AGENT_TIMEZONE=Asia/Shanghai
+```
+
+数据库和公开 API 以 UTC 为基准；该配置用于模型时间上下文和 Web 页面本地时间展示。健康接口会返回当前配置的时区，
+前端据此显示消息时间、跨日分隔和完整时区提示。
 
 ```env
 MODEL_PROFILES_JSON=[{"alias":"default","model":"your-tool-capable-model","base_url":"https://provider.example/v1","api_key_env":"PERSONAL_AGENT_LLM_API_KEY","reasoning_effort":null,"streaming":true,"temperature":null,"context_window":1000000,"input_soft_limit":131072,"max_output_tokens":16384,"timeout_seconds":120,"supports_vision":false}]
@@ -239,6 +251,13 @@ NAPCAT_WEBUI_TOKEN=<napcat-webui-token>
 `PUT /api/v1/mcp/servers/{id}/enabled`、`POST .../test`、`POST .../refresh`、`GET .../catalog` 和
 `PUT .../grants/{kind}`。本项目不实施 OAuth 交互登录、Sampling、Elicitation、Roots 或订阅。
 
+### AnySearch 联网搜索
+
+MCP 设置页提供 AnySearch 预设，使用官方远程 Streamable HTTP 服务（`https://api.anysearch.com/mcp`）。预设默认停用、
+访问策略为 `owner_only` 且不授予任何工具；可选择匿名访问，或在安装时将 API Key 写入本机 `.env`，SQLite、API、页面和日志
+只显示环境变量引用或已配置状态。Agent 只有在用户明确要求搜索、当前信息或事实核查时才会调用；垂直搜索先发现合法
+`sub_domain`，联网失败、超时或异常结果时明确降级，不把旧知识或猜测伪装成实时结果。
+
 ## 启动
 
 分别启动后端和前端时，先确保当前终端可找到 Python 3.13：
@@ -264,9 +283,10 @@ pnpm run dev
 最后才在交互终端中要求手动输入完整路径。例如：
 
 ```powershell
-.\scripts\start.ps1 -PythonExe "C:\Python313\python.exe"
+$PythonExe = (Get-Command python -CommandType Application).Source
+.\scripts\start.ps1 -PythonExe $PythonExe
 # 或
-$env:PERSONAL_AGENT_PYTHON = "C:\Python313\python.exe"
+$env:PERSONAL_AGENT_PYTHON = (Get-Command python -CommandType Application).Source
 .\scripts\start.ps1
 ```
 
@@ -433,6 +453,21 @@ Top-3 87.65%、Micro-F1 0.7024，报告保存在被版本控制忽略的评测�
 - 当前定位仍是 Windows 本机单用户原型，不包含公网认证、多用户并发、云部署或安装器。
 
 ## 版本更新记录
+
+### v0.4.6（本地完成，尚未发布）
+
+- 增加 AnySearch 官方远程 MCP 预设，支持匿名或 API Key 安装；默认停用、零授权、管理员确认后启用，Agent 按明确联网意图调用，
+  垂直搜索先发现合法 domain，搜索失败时明确降级并保留来源边界。
+- 增加短回复预算和语义完整性校验：普通 Web/QQ 回复默认控制为 1–3 个完整短段，URL、代码、命令、路径和完整内容保持原子性；
+  长文、教程、报告和完整代码仍进入长模式。
+- 增加统一时间上下文：数据库继续保存 UTC，API 输出带 `Z` 的 UTC ISO 8601；模型上下文、摘要、陪伴、安全和记忆提取使用配置时区，
+  默认 `Asia/Shanghai`。
+- 增加 `0012_temporal_context` 迁移、摘要格式版本、`fact/event` 记忆类型和明确事件日期；旧摘要标记为版本 1，旧记忆保守默认为
+  `fact/null`，不在迁移中猜测历史日期，事件召回按历史背景处理。
+- Web Chat 展示消息本地时间、跨日分隔线和完整时区提示；长期记忆中心展示事件日期、首次记录和最近确认/更新，并兼容缺失的旧事件日期。
+- 后端与前端包版本同步为 `0.4.6`；本版本已在本机完成代码、迁移、前端和运行验收，仍保留真实 QQ/NapCat 环境依赖，未执行推送、标签或 Release。
+- 本机验收记录：后端 `206 passed, 1 skipped`，前端 Vitest `20 passed`，Pyright `0 errors`、Ruff、`pip check`、编译检查、
+  空库/旧库迁移和 AnySearch 匿名真实探针通过；未将测试源码、评测原文、日志、数据库或私有配置纳入公开树。
 
 ### v0.4.5（已发布）
 
