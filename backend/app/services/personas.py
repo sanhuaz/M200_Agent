@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Persona
 from app.domain.persona_types import PersonaCard, PersonaDocument, validate_persona_card
+from app.services.time_context import utc_isoformat
 
 
 def _loaded_document(persona: Persona | PersonaDocument | None) -> PersonaDocument | None:
@@ -24,7 +25,7 @@ def parse_persona_card(item: Persona | PersonaDocument | None) -> PersonaCard | 
 
 
 def _iso_or_none(value: object) -> str | None:
-    return value.isoformat() if isinstance(value, datetime) else None
+    return utc_isoformat(value) if isinstance(value, datetime) else None
 
 
 def persona_dict(

@@ -19,6 +19,7 @@ from app.services.extensions import (
     package_dict,
     set_package_state,
 )
+from app.services.time_context import utc_isoformat
 
 router = APIRouter()
 
@@ -46,7 +47,7 @@ def list_tools(session: Session = Depends(get_db)) -> list[dict[str, object]]:
                 "id": run.id,
                 "conversation_id": run.conversation_id,
                 "status": run.status,
-                "created_at": run.created_at.isoformat(),
+                "created_at": utc_isoformat(run.created_at),
             }
             for run in session.scalars(
                 select(ToolRun)

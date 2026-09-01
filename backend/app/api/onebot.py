@@ -85,6 +85,7 @@ from app.services.qq_delivery import (
     reply_plan_from_event,
     split_qq_reply,
 )
+from app.services.time_context import utc_isoformat
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -991,7 +992,7 @@ class OneBotManager:
                     fragment: dict[str, object] = {
                         "message_id": message_id,
                         "text": text,
-                        "created_at": datetime.now(UTC).isoformat(),
+                        "created_at": utc_isoformat(datetime.now(UTC)),
                     }
                     if new_attachment_metadata:
                         fragment["attachments"] = new_attachment_metadata
@@ -1181,7 +1182,7 @@ class OneBotManager:
                     return "还没有可查看的情绪分析记录。"
                 if correcting:
                     assessment.correction = json.dumps(
-                        {"emotions": labels, "corrected_at": datetime.now(UTC).isoformat()},
+                        {"emotions": labels, "corrected_at": utc_isoformat(datetime.now(UTC))},
                         ensure_ascii=False,
                     )
                     return "已记录你的情绪纠正：" + "、".join(

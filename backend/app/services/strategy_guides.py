@@ -6,6 +6,7 @@ from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app.db.models import StrategyGuide, StrategyGuideRevision
+from app.services.time_context import utc_isoformat
 
 NORMAL_STRATEGIES = ("listen", "validate", "clarify", "comfort", "reflect", "advise", "celebrate")
 
@@ -92,7 +93,7 @@ def strategy_guide_dict(item: StrategyGuide) -> dict[str, object]:
         "prompt_text": item.prompt_text,
         "version": item.version,
         "is_default": item.prompt_text == DEFAULT_STRATEGY_GUIDES.get(item.strategy),
-        "updated_at": item.updated_at.isoformat(),
+        "updated_at": utc_isoformat(item.updated_at),
     }
 
 

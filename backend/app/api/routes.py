@@ -71,6 +71,7 @@ from app.services.strategy_guides import (
     strategy_guide_dict,
     update_strategy_guide,
 )
+from app.services.time_context import utc_isoformat
 
 router = APIRouter()
 router.include_router(monitoring_router)
@@ -373,7 +374,7 @@ def get_strategy_guide_revisions(
             "version": item.version,
             "prompt_text": item.prompt_text,
             "source": item.source,
-            "created_at": item.created_at.isoformat(),
+            "created_at": utc_isoformat(item.created_at),
         }
         for item in revisions
     ]
@@ -876,7 +877,7 @@ def list_artifacts(
             "filename": item.filename,
             "size": item.size,
             "sha256": item.sha256,
-            "created_at": item.created_at.isoformat(),
+        "created_at": utc_isoformat(item.created_at),
         }
         for item in session.scalars(query)
     ]

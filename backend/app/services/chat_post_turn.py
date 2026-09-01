@@ -22,6 +22,7 @@ from app.services.context import (
 from app.services.memories import MemoryService
 from app.services.models import model_registry
 from app.services.operation_logs import operation_logs
+from app.services.time_context import current_time_context, format_messages_for_model
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +55,8 @@ class PostTurnService:
             if conversation is None:
                 return
             context_rows = load_pending_messages(session, conversation, limit=8)
-            turn_context = "\n".join(f"{item.role}: {item.content}" for item in context_rows[:-1])
+            time_context = current_time_context()
+            turn_context = format_messages_for_model(context_rows[:-1])
             memory_scope_type = "group" if is_group else "user"
             memory_scope_id = conversation.external_id if is_group else sender_id
             memory_operation: str | None = None
@@ -77,6 +79,7 @@ class PostTurnService:
                         user_text,
                         turn_context,
                         model_alias,
+                        time_context=time_context,
                     )
                 else:
                     MemoryService(session).extract_from_turn(
@@ -87,6 +90,7 @@ class PostTurnService:
                         scope_type=memory_scope_type,
                         scope_id=memory_scope_id,
                         context=turn_context,
+                        time_context=time_context,
                     )
                 operation_logs.finish_operation(
                     memory_operation,
@@ -131,8 +135,13 @@ class PostTurnService:
         )
         if not batch:
             return
-        new_material = "\n".join(f"{item.role}: {item.content}" for item in batch)
-        summary_source = f"已有摘要：\n{existing_summary or '无'}\n\n新增历史：\n{new_material}"
+        time_context = current_time_context()
+        new_material = format_messages_for_model(batch)
+        summary_source = (
+            f"当前时间上下文：\n{time_context}\n\n"
+            f"已有摘要：\n{existing_summary or '无'}\n\n"
+            f"新增历史（按每条消息前缀的原始时间解释相对日期）：\n{new_material}"
+        )
         summary_operation: str | None = None
         try:
             summary_operation = operation_logs.start_operation(
@@ -149,6 +158,8 @@ class PostTurnService:
                         (
                             "将已有摘要和新增历史合并为准确、简短的中文摘要。"
                             "保留用户明确事实、未完成任务和重要决定，不添加新事实。"
+                            "必须依据消息时间前缀将今天、昨天、昨晚、刚才等相对时间还原为绝对日期；"
+                            "前阵子、以前等模糊表达保留原文并保留记录时间锚点。"
                         ),
                     ),
                     ("human", summary_source),

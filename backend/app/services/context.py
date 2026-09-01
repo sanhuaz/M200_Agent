@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import ModelProfile
 from app.db.models import Conversation, Message
+from app.services.time_context import format_message_for_model
 
 # DeepSeek 的精确 tokenizer 不是 LangChain 的通用依赖。这里使用偏保守的估算，
 # 只负责本地预算和裁剪；真正请求仍由服务端按官方 tokenizer 计量。
@@ -196,18 +197,23 @@ def build_context_messages(
     while remaining:
         candidate = remaining[-1]
         candidate_text = (text_overrides or {}).get(candidate.id, candidate.content)
+        timed_text = format_message_for_model(
+            candidate.role,
+            candidate_text,
+            candidate.created_at,
+        )
         if candidate.role == "user":
             image_blocks = (attachments_by_message or {}).get(candidate.id, [])
             if image_blocks:
                 content: list[Any] = [
-                    {"type": "text", "text": candidate_text},
+                    {"type": "text", "text": timed_text},
                     *image_blocks,
                 ]
                 converted = HumanMessage(content=content)
             else:
-                converted = HumanMessage(content=candidate_text)
+                converted = HumanMessage(content=timed_text)
         else:
-            converted = AIMessage(content=candidate.content)
+            converted = AIMessage(content=timed_text)
         if estimate_messages_tokens([system, *selected, converted]) > profile.input_soft_limit:
             break
         selected.insert(0, converted)

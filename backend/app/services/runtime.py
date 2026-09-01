@@ -9,6 +9,7 @@ from app.db.session import SessionLocal
 from app.services.extensions import ensure_builtin_packages
 from app.services.model_profiles import bootstrap_model_profiles
 from app.services.strategy_guides import ensure_strategy_guides
+from app.services.time_context import utc_isoformat
 
 OWNER_BOOTSTRAP_KEY = "owner_qq_ids_bootstrapped"
 
@@ -68,5 +69,5 @@ def admin_dict(item: AdminIdentity) -> dict[str, object]:
         "display_name": item.display_name,
         "enabled": item.enabled,
         "created_by": item.created_by,
-        "created_at": item.created_at.isoformat(),
+        "created_at": utc_isoformat(item.created_at),
     }

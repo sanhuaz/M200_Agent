@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.db.models import Message, MessageAttachment, new_id
 from app.domain.chat_inputs import ChatAttachmentInput
+from app.services.time_context import utc_isoformat
 
 logger = logging.getLogger(__name__)
 
@@ -362,7 +363,7 @@ def attachment_dict(item: MessageAttachment) -> dict[str, object]:
         "width": item.width,
         "height": item.height,
         "source": item.source,
-        "created_at": item.created_at.isoformat(),
+        "created_at": utc_isoformat(item.created_at),
         "download_url": f"/api/v1/messages/{item.message_id}/attachments/{item.id}",
     }
 

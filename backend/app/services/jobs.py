@@ -34,6 +34,7 @@ from app.services.documents import index_document, reindex_knowledge_base
 from app.services.manga import manga_service
 from app.services.operation_logs import operation_logs
 from app.services.runtime import is_owner
+from app.services.time_context import current_time_context, format_messages_for_model
 
 logger = logging.getLogger(__name__)
 JobNotifier = Callable[[Job], Awaitable[None]]
@@ -65,7 +66,7 @@ def _companion_retry_context(session, message: Message) -> str:
         )
     )
     messages.reverse()
-    return "\n".join(f"{item.role}: {item.content}" for item in messages)
+    return format_messages_for_model(messages)
 
 
 class JobWorker:
@@ -163,6 +164,7 @@ class JobWorker:
         safety_mode: SafetyMode = cast(
             SafetyMode, safety_value if safety_value in {"standard", "unfiltered"} else "standard"
         )
+        time_context = current_time_context()
         analysis = await asyncio.to_thread(
             analyze_message,
             message.content,
@@ -171,6 +173,7 @@ class JobWorker:
             forced_mode=forced_mode,
             safety_mode=safety_mode,
             allow_repair=False,
+            time_context=time_context,
         )
         if not analysis.schema_valid:
             raise ValueError("companion_retry_schema_invalid")

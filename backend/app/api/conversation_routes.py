@@ -20,6 +20,7 @@ from app.db.session import get_db
 from app.services.chat_attachments import attachment_dict, stage_deletions
 from app.services.models import model_registry
 from app.services.persona_store import get_persona_store
+from app.services.time_context import utc_isoformat
 
 router = APIRouter()
 
@@ -48,8 +49,8 @@ def conversation_dict(item: Conversation) -> dict[str, object]:
         "persona_id": item.persona_id,
         "owner_id": item.owner_id,
         "summary": item.summary,
-        "created_at": item.created_at.isoformat(),
-        "updated_at": item.updated_at.isoformat(),
+        "created_at": utc_isoformat(item.created_at),
+        "updated_at": utc_isoformat(item.updated_at),
     }
 
 
@@ -85,7 +86,7 @@ def list_messages(
             "sender_id": item.sender_id,
             "role": item.role,
             "content": item.content,
-            "created_at": item.created_at.isoformat(),
+            "created_at": utc_isoformat(item.created_at),
             "attachments": [attachment_dict(attachment) for attachment in item.attachments],
         }
         for item in items

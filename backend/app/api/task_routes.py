@@ -14,13 +14,14 @@ from app.api.dependencies import require_loopback
 from app.core.config import get_settings
 from app.db.models import Confirmation, Job
 from app.db.session import get_db
-from app.services.confirmations import resolve_confirmation, utc_isoformat
+from app.services.confirmations import resolve_confirmation
 from app.services.jobs import (
     COMPANION_ANALYSIS_RETRY_JOB_TYPE,
     create_manga_download_job,
     delete_manga_artifact,
 )
 from app.services.manga import manga_service
+from app.services.time_context import utc_isoformat
 
 router = APIRouter()
 settings = get_settings()
@@ -61,8 +62,8 @@ def job_dict(item: Job) -> dict[str, object]:
         "error": item.error,
         "retry_count": item.retry_count,
         "cancel_requested": item.cancel_requested,
-        "created_at": item.created_at.isoformat(),
-        "updated_at": item.updated_at.isoformat(),
+        "created_at": utc_isoformat(item.created_at),
+        "updated_at": utc_isoformat(item.updated_at),
     }
 
 

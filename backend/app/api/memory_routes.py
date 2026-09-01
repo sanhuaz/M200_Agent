@@ -14,6 +14,7 @@ from app.db.session import get_db
 from app.services.companion import relationship_content_items
 from app.services.memories import MemoryService
 from app.services.persona_store import get_persona_store
+from app.services.time_context import utc_isoformat
 
 router = APIRouter()
 
@@ -59,8 +60,8 @@ def list_memories(
             "content": item.content,
             "status": item.status,
             "source_message_id": item.source_message_id,
-            "created_at": item.created_at.isoformat(),
-            "last_seen_at": item.last_seen_at.isoformat(),
+            "created_at": utc_isoformat(item.created_at),
+            "last_seen_at": utc_isoformat(item.last_seen_at),
         }
         for item in session.scalars(query)
     ]
@@ -107,7 +108,7 @@ def list_memory_center(
                 )
             )
         for item in session.scalars(fact_query):
-            updated_at = item.last_seen_at.isoformat()
+            updated_at = utc_isoformat(item.last_seen_at)
             rows.append(
                 {
                     "memory_type": "fact",
@@ -119,7 +120,7 @@ def list_memory_center(
                     "content": item.content,
                     "status": item.status,
                     "source_message_id": item.source_message_id,
-                    "created_at": item.created_at.isoformat(),
+                    "created_at": utc_isoformat(item.created_at),
                     "last_seen_at": updated_at,
                     "updated_at": updated_at,
                 }
@@ -183,7 +184,7 @@ def list_memory_center(
                     ).casefold()
                     if normalized_keyword not in searchable:
                         continue
-                updated_at = item.updated_at.isoformat()
+                updated_at = utc_isoformat(item.updated_at)
                 rows.append(
                     {
                         "memory_type": "relationship",
@@ -200,7 +201,7 @@ def list_memory_center(
                         "content_items": content_items,
                         "version": item.version,
                         "status": "active",
-                        "created_at": item.created_at.isoformat(),
+                        "created_at": utc_isoformat(item.created_at),
                         "last_seen_at": None,
                         "updated_at": updated_at,
                     }

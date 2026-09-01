@@ -21,6 +21,7 @@ from app.db.models import McpGrant, McpServer
 from app.db.session import SessionLocal
 from app.domain.mcp_types import McpServerPayload, McpServerUpdate
 from app.services.mcp_client import McpClientError, McpConnection, safe_error
+from app.services.time_context import utc_isoformat
 
 SECRET_PREFIX = "PERSONAL_AGENT_MCP_"
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,78}[a-z0-9]$|^[a-z0-9]$")
@@ -230,10 +231,10 @@ def server_dict(item: McpServer) -> dict[str, Any]:
             else 0,
             "prompts": len(catalog.get("prompts", [])) if isinstance(catalog.get("prompts"), list) else 0,
         },
-        "last_connected_at": item.last_connected_at.isoformat() if item.last_connected_at else None,
-        "last_refreshed_at": item.last_refreshed_at.isoformat() if item.last_refreshed_at else None,
-        "created_at": item.created_at.isoformat(),
-        "updated_at": item.updated_at.isoformat(),
+        "last_connected_at": utc_isoformat(item.last_connected_at),
+        "last_refreshed_at": utc_isoformat(item.last_refreshed_at),
+        "created_at": utc_isoformat(item.created_at),
+        "updated_at": utc_isoformat(item.updated_at),
     }
 
 

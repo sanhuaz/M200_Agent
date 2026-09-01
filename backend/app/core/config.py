@@ -4,6 +4,7 @@ import json
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator
@@ -60,6 +61,7 @@ class Settings(BaseSettings):
     skills_path: Path = PROJECT_ROOT / "skills"
     workspace_path: Path = PROJECT_ROOT / "workspace"
     persona_path: Path = PROJECT_ROOT / "persona"
+    personal_agent_timezone: str = "Asia/Shanghai"
 
     model_profiles_json: str = (
         '[{"alias":"default","model":"unconfigured","base_url":"https://api.example.com/v1",'
@@ -99,6 +101,18 @@ class Settings(BaseSettings):
                 return [str(item) for item in json.loads(stripped)]
             return [item.strip() for item in stripped.split(",") if item.strip()]
         return value
+
+    @field_validator("personal_agent_timezone")
+    @classmethod
+    def validate_personal_agent_timezone(cls, value: str) -> str:
+        timezone_name = value.strip()
+        if not timezone_name:
+            raise ValueError("PERSONAL_AGENT_TIMEZONE 无效：不能为空")
+        try:
+            ZoneInfo(timezone_name)
+        except (ZoneInfoNotFoundError, ValueError) as error:
+            raise ValueError(f"PERSONAL_AGENT_TIMEZONE 无效：{timezone_name}") from error
+        return timezone_name
 
     @field_validator(
         "database_path",

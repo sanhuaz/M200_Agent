@@ -301,6 +301,7 @@ class MemoryService:
         scope_type: str = "user",
         scope_id: str | None = None,
         context: str = "",
+        time_context: str = "",
     ) -> list[Memory]:
         if SENSITIVE_PATTERN.search(user_text):
             return []
@@ -321,6 +322,7 @@ class MemoryService:
                     (
                         "从用户消息中提取稳定事实、长期偏好或明确长期事件。"
                         "不要提取临时请求、猜测、第三方隐私或任何凭证。没有则返回空列表。"
+                        "必须依据消息时间上下文理解今天、昨天、昨晚和刚才；不要把历史事件改写为当前状态。"
                         + (
                             "当前是QQ群作用域，只提取群共同决定、项目事实或群级偏好，"
                             "不要提取发言者个人信息。"
@@ -332,6 +334,7 @@ class MemoryService:
                 (
                     "human",
                     (
+                        f"当前时间上下文：\n{time_context or '未提供'}\n\n"
                         f"相关近期对话（仅用于指代消解，不得把助手猜测写入记忆）：\n{context}\n\n"
                         f"本轮用户消息：\n{user_text}"
                     ),

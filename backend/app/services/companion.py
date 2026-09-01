@@ -33,6 +33,7 @@ from app.services.companion_relationships import (
     safe_relation_value as _safe_relation_value,
 )
 from app.services.models import model_registry
+from app.services.time_context import utc_isoformat
 
 __all__ = [
     "_safe_relation_value",
@@ -725,6 +726,7 @@ def _analysis_prompts(
     context: str,
     prompt_version: str,
     anchor_labels: list[str],
+    time_context: str = "",
 ) -> tuple[str, str]:
     """Build prompts without leaking internal anchor matches or raw rules."""
 
@@ -736,6 +738,7 @@ def _analysis_prompts(
     if prompt_version == EXPERIMENTAL_PROMPT_VERSION and anchor_labels:
         anchor_hint = "、".join(anchor_labels)
     human_prompt = (
+        f"时间上下文：{time_context or '未提供'}\n\n"
         f"近期对话（仅用于指代消解）：\n{context[-6_000:]}\n\n"
         f"本轮用户消息：\n{text}\n\n"
         "确定性显式情绪线索提示（仅供排序参考，不能替代原文判断）："
@@ -757,6 +760,7 @@ def analyze_message(
     prompt_version: str | None = None,
     classifier_version: str | None = None,
     use_experimental_prompt: bool = False,
+    time_context: str = "",
 ) -> CompanionAnalysis:
     selected_prompt_version = prompt_version or (
         EXPERIMENTAL_PROMPT_VERSION if use_experimental_prompt else PROMPT_VERSION
@@ -783,7 +787,7 @@ def analyze_message(
 
     anchor_labels, _anchor_rules = extract_emotion_anchors(text)
     system_prompt, human_prompt = _analysis_prompts(
-        text, context, selected_prompt_version, anchor_labels
+        text, context, selected_prompt_version, anchor_labels, time_context
     )
     raw, schema_valid = _invoke_json(
         model_alias,
@@ -932,6 +936,8 @@ def rewrite_companion_response(
     violation_codes: list[str],
     persona_text: str,
     strategy_guide: str,
+    *,
+    time_context: str = "",
 ) -> str | None:
     """Rewrite style drift once while keeping the selected character's voice."""
 
@@ -942,6 +948,7 @@ def rewrite_companion_response(
         "编号或项目符号。不要硬套固定句式，也不要为了变短而删除用户刚说的关键内容。"
     )
     human_prompt = (
+        f"时间上下文：{time_context or '未提供'}\n\n"
         f"角色卡（只用于保持角色表达）：\n{persona_text[-8_000:] or '无'}\n\n"
         f"本轮策略攻略：\n{strategy_guide[-4_000:] or '无'}\n\n"
         f"用户原文：\n{user_text[-8_000:]}\n\n"
@@ -981,6 +988,8 @@ def generate_safety_response(
     context: str,
     persona_text: str,
     safety: SafetyAssessment,
+    *,
+    time_context: str = "",
 ) -> str | None:
     """Generate a natural safety explanation without entering the normal Agent graph."""
 
@@ -993,6 +1002,7 @@ def generate_safety_response(
         "只输出给用户看的正文，不要标题、JSON或 Markdown。"
     )
     human_prompt = (
+        f"时间上下文：{time_context or '未提供'}\n\n"
         f"人格语气参考（只用于语气，不改变安全边界）：\n{persona_text[-8_000:]}\n\n"
         f"最近六条对话：\n{context[-6_000:] or '无'}\n\n"
         f"风险等级：{safety.risk_level}\n内部规则代码：{', '.join(safety.rules) or 'analysis'}\n\n"
@@ -1009,6 +1019,8 @@ def rewrite_blocked_response(
     user_text: str,
     candidate_response: str,
     violation_codes: list[str],
+    *,
+    time_context: str = "",
 ) -> str | None:
     """Ask the same session model to rewrite one unsafe candidate once."""
 
@@ -1019,6 +1031,7 @@ def rewrite_blocked_response(
         "不要编造你能报警、联系医院或到场。不要输出 JSON、标题或 Markdown。"
     )
     human_prompt = (
+        f"时间上下文：{time_context or '未提供'}\n\n"
         f"用户原文：\n{user_text[-8_000:]}\n\n"
         f"候选回复：\n{candidate_response[-8_000:]}\n\n"
         f"需要修正的内部代码：{', '.join(violation_codes) or 'unknown'}"
@@ -1036,6 +1049,8 @@ def extract_relationship(
     user_text: str,
     context: str,
     model_alias: str,
+    *,
+    time_context: str = "",
 ) -> RelationshipProfile | None:
     if not user_text.strip() or safety_precheck(user_text).risk_level in {"high", "critical"}:
         return None
@@ -1044,7 +1059,10 @@ def extract_relationship(
         "preferences、boundaries、shared_events。不要提取临时请求、模型推测、第三方隐私、"
         "医疗心理信息、危机细节、凭证、精确位置或完整原文。没有明确事实时返回空数组和 null。"
     )
-    human_prompt = f"近期对话：\n{context[-4_000:]}\n\n用户本轮消息：\n{user_text}"
+    human_prompt = (
+        f"时间上下文：{time_context or '未提供'}\n\n"
+        f"近期对话：\n{context[-4_000:]}\n\n用户本轮消息：\n{user_text}"
+    )
     raw, valid = _invoke_json(
         model_alias,
         system_prompt,
@@ -1207,7 +1225,7 @@ def assessment_dict(item: EmotionAssessment, session: Session | None = None) -> 
         "analysis_status": analysis_status,
         "safety_intercepted": analysis_status == "safety_redirected",
         "correction": correction,
-        "created_at": item.created_at.isoformat(),
+        "created_at": utc_isoformat(item.created_at),
     }
 
 
@@ -1222,8 +1240,8 @@ def feedback_dict(item: ResponseFeedback) -> dict[str, object]:
         "scope_id": item.scope_id,
         "feedback": item.feedback,
         "correction": correction,
-        "created_at": item.created_at.isoformat(),
-        "updated_at": item.updated_at.isoformat(),
+        "created_at": utc_isoformat(item.created_at),
+        "updated_at": utc_isoformat(item.updated_at),
     }
 
 
@@ -1240,7 +1258,7 @@ def safety_event_dict(item: SafetyEvent) -> dict[str, object]:
         "action": item.action,
         "detector_version": item.detector_version,
         "details": details,
-        "created_at": item.created_at.isoformat(),
+        "created_at": utc_isoformat(item.created_at),
     }
 
 

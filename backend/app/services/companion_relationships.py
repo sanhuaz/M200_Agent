@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.models import CompanionPreference, RelationshipProfile
+from app.services.time_context import utc_isoformat
 
 
 def get_or_create_preference(session: Session, scope_id: str) -> CompanionPreference:
@@ -41,8 +42,8 @@ def preference_dict(item: CompanionPreference) -> dict[str, object]:
         "listening_silence_seconds": getattr(item, "listening_silence_seconds", 30),
         "analyzer_model_alias": item.analyzer_model_alias,
         "boundaries": boundaries,
-        "created_at": item.created_at.isoformat(),
-        "updated_at": item.updated_at.isoformat(),
+        "created_at": utc_isoformat(item.created_at),
+        "updated_at": utc_isoformat(item.updated_at),
     }
 
 
@@ -137,8 +138,8 @@ def relationship_dict(
         "boundaries": boundaries,
         "content_items": relationship_content_items(item.nickname, item.shared_summary, boundaries),
         "version": item.version,
-        "created_at": item.created_at.isoformat(),
-        "updated_at": item.updated_at.isoformat(),
+        "created_at": utc_isoformat(item.created_at),
+        "updated_at": utc_isoformat(item.updated_at),
     }
 
 

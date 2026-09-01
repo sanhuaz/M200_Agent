@@ -298,11 +298,13 @@ def _repair_reply(
     *,
     mode: ReplyMode,
     max_segments: int,
+    time_context: str,
 ) -> ReplyPlan | None:
     system_prompt = (
         "你是 PersonalAgent 的回复结构化修订器。只输出一个 JSON 对象，不要解释、Markdown 或代码围栏。"
         "JSON 必须包含 segments 数组和 atomic_parts 数组。"
         "segments 只放给用户看的自然语言完整段落，atomic_parts 只放必须整体复制的 URL、代码、命令或路径。"
+        f"当前时间上下文：{time_context or '未提供'}。"
     )
     if mode == "short":
         system_prompt += (
@@ -344,6 +346,7 @@ def prepare_reply(
     model_alias: str,
     *,
     max_segments: int = SHORT_MAX_SEGMENTS,
+    time_context: str = "",
 ) -> ReplyPlan:
     """Validate a candidate, repair it once, then return a safe plan."""
 
@@ -361,6 +364,7 @@ def prepare_reply(
         violations,
         mode=mode,
         max_segments=max_segments,
+        time_context=time_context,
     )
     return repaired or _fallback_plan()
 

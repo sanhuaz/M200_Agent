@@ -78,6 +78,11 @@ from app.services.personas import active_persona, persona_system_prompt
 from app.services.reply_policy import prepare_reply
 from app.services.runtime import is_owner
 from app.services.strategy_guides import NORMAL_STRATEGIES, guide_for_strategy
+from app.services.time_context import (
+    current_time_context,
+    format_memory_for_model,
+    format_messages_for_model,
+)
 from app.workflows.agent import build_agent_graph, final_ai_message, skill_descriptions
 
 logger = logging.getLogger(__name__)
@@ -255,6 +260,7 @@ class ChatService:
         # The rest of the orchestration uses the model-facing text.  The
         # database keeps the explicit [图片] placeholder for image-only turns.
         text = model_text
+        time_context = current_time_context()
 
         started_at = time.perf_counter()
         operation_id = operation_logs.start_operation(
@@ -295,11 +301,12 @@ class ChatService:
             companion_analysis = await asyncio.to_thread(
                 analyze_message,
                 text,
-                "\n".join(f"{item.role}: {item.content}" for item in prior_recent),
+                format_messages_for_model(prior_recent),
                 analyzer_alias,
                 forced_mode=forced_mode,
                 safety=companion_safety,
                 safety_mode=companion_safety_mode,
+                time_context=time_context,
             )
             assessment = self._save_companion_assessment(
                 session, user_message.id, sender_id, companion_analysis
@@ -383,7 +390,7 @@ class ChatService:
             )
             if standard_safety_redirect:
                 safety_analysis = companion_analysis
-                context_text = "\n".join(f"{item.role}: {item.content}" for item in prior_recent)
+                context_text = format_messages_for_model(prior_recent)
                 persona_text = clip_text(
                     persona_system_prompt(active_persona(session, conversation.persona_id)),
                     8_192,
@@ -398,6 +405,7 @@ class ChatService:
                         safety_analysis.risk_level,
                         companion_safety.rules if companion_safety is not None else (),
                     ),
+                    time_context=time_context,
                 )
                 response_source = "safety_llm" if safety_answer else "template"
                 answer = safety_answer or safety_redirect_text(safety_analysis.risk_level)
@@ -406,6 +414,7 @@ class ChatService:
                     text,
                     conversation.model_alias,
                     max_segments=max_reply_segments,
+                    time_context=time_context,
                 )
                 answer = reply_plan.text
                 session.add(
@@ -529,7 +538,7 @@ class ChatService:
                 memories = []
         if memory_allowed:
             memory_text = clip_text(
-                "\n".join(f"- {item.content}" for item in memories) or "- 无",
+                "\n".join(format_memory_for_model(item) for item in memories) or "- 无",
                 4_096,
             )
         else:
@@ -574,7 +583,7 @@ class ChatService:
                 "先回应用户明确表达，不要为了展示能力主动调用工具。"
             )
         system = (
-            f"{SYSTEM_PROMPT}\n\n当前用户画像和长期记忆：\n{memory_text}"
+            f"{SYSTEM_PROMPT}\n\n{time_context}\n\n当前用户画像和长期记忆：\n{memory_text}"
             f"\n\n可用知识库：\n{knowledge_text}"
             f"\n\n可按需加载的 Skill（只提供名称和描述）：\n{skills_text}"
             f"\n\n历史摘要：\n{clip_text(conversation.summary or '无', SUMMARY_MAX_TOKENS)}"
@@ -731,6 +740,7 @@ class ChatService:
                         text,
                         answer,
                         violations,
+                        time_context=time_context,
                     )
                     response_source = "rewritten" if rewritten else "template"
                     answer = rewritten or safety_redirect_text("medium")
@@ -776,6 +786,7 @@ class ChatService:
                             style_violations,
                             persona_for_rewrite,
                             strategy_guide,
+                            time_context=time_context,
                         )
                         if rewritten:
                             answer = rewritten
@@ -818,6 +829,7 @@ class ChatService:
                 text,
                 conversation.model_alias,
                 max_segments=max_reply_segments,
+                time_context=time_context,
             )
             answer = reply_plan.text
             assistant_message = Message(
