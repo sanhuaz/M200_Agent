@@ -6,6 +6,14 @@ from dataclasses import dataclass
 from typing import Literal
 
 ReplyMode = Literal["short", "long"]
+ReplyPolicyStatus = Literal["accepted", "repaired", "original_preserved"]
+ReplyRepairFailure = Literal[
+    "invalid_json",
+    "invalid_structure",
+    "validation_failed",
+    "atomic_changed",
+    "model_error",
+]
 _BOUNDARY_PUNCTUATION = frozenset("。！？!?；;")
 
 
@@ -21,9 +29,15 @@ class ReplyPlan:
     segments: tuple[str, ...]
     atomic_parts: tuple[str, ...]
     parts: tuple[ReplyPart, ...]
+    policy_status: ReplyPolicyStatus = "accepted"
+    policy_violations: tuple[str, ...] = ()
+    repair_failure_code: ReplyRepairFailure | None = None
+    source_text: str | None = None
 
     @property
     def text(self) -> str:
+        if self.source_text is not None:
+            return self.source_text
         rendered: list[str] = []
         for part in self.parts:
             if not part.text:
@@ -41,7 +55,14 @@ class ReplyPlan:
             "segments": list(self.segments),
             "atomic_parts": list(self.atomic_parts),
             "parts": [{"kind": part.kind, "text": part.text} for part in self.parts],
+            "reply_policy_status": self.policy_status,
         }
 
 
-__all__ = ["ReplyMode", "ReplyPart", "ReplyPlan"]
+__all__ = [
+    "ReplyMode",
+    "ReplyPart",
+    "ReplyPlan",
+    "ReplyPolicyStatus",
+    "ReplyRepairFailure",
+]

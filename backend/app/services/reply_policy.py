@@ -10,14 +10,19 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from app.domain.reply_types import ReplyMode, ReplyPart, ReplyPlan
+from app.domain.reply_types import (
+    ReplyMode,
+    ReplyPart,
+    ReplyPlan,
+    ReplyPolicyStatus,
+    ReplyRepairFailure,
+)
 from app.services.models import model_registry
 
 logger = logging.getLogger(__name__)
 
 SHORT_MAX_CHARS = 30
 SHORT_MAX_SEGMENTS = 3
-SHORT_FAILURE_MESSAGE = "我先整理一下，再继续回复。"
 
 _LONG_REQUEST_RE = re.compile(
     r"小说|长文|长篇|详细展开|详细说明|完整代码|代码全文|写一篇|报告|教程|逐步|一步一步|"
@@ -172,6 +177,18 @@ def _parts_from_candidate(candidate: str) -> tuple[ReplyPart, ...]:
 
 
 def _plan_from_parts(mode: ReplyMode, parts: Iterable[ReplyPart]) -> ReplyPlan:
+    return _build_plan(mode, parts)
+
+
+def _build_plan(
+    mode: ReplyMode,
+    parts: Iterable[ReplyPart],
+    *,
+    policy_status: ReplyPolicyStatus = "accepted",
+    policy_violations: tuple[str, ...] = (),
+    repair_failure_code: ReplyRepairFailure | None = None,
+    source_text: str | None = None,
+) -> ReplyPlan:
     normalized = tuple(part for part in parts if part.text.strip())
     return ReplyPlan(
         mode=mode,
@@ -182,6 +199,10 @@ def _plan_from_parts(mode: ReplyMode, parts: Iterable[ReplyPart]) -> ReplyPlan:
         ),
         atomic_parts=tuple(part.text for part in normalized if part.kind == "atomic"),
         parts=normalized,
+        policy_status=policy_status,
+        policy_violations=policy_violations,
+        repair_failure_code=repair_failure_code,
+        source_text=source_text,
     )
 
 
@@ -201,12 +222,17 @@ def _balanced(text: str) -> bool:
     return not stack
 
 
-def validate_reply_plan(plan: ReplyPlan, *, max_segments: int = SHORT_MAX_SEGMENTS) -> tuple[str, ...]:
+def _validate_reply_plan(
+    plan: ReplyPlan,
+    *,
+    max_segments: int = SHORT_MAX_SEGMENTS,
+    include_budget: bool,
+) -> tuple[str, ...]:
     violations: list[str] = []
     if not plan.parts or (not plan.segments and not plan.atomic_parts):
         violations.append("empty")
         return tuple(violations)
-    if plan.mode == "short":
+    if include_budget and plan.mode == "short":
         if plan.segments and not 1 <= len(plan.segments) <= max_segments:
             violations.append("segment_count")
         if any(
@@ -233,6 +259,22 @@ def validate_reply_plan(plan: ReplyPlan, *, max_segments: int = SHORT_MAX_SEGMEN
     if any(not _looks_atomic(item) for item in plan.atomic_parts):
         violations.append("invalid_atomic")
     return tuple(dict.fromkeys(violations))
+
+
+def validate_reply_plan(plan: ReplyPlan, *, max_segments: int = SHORT_MAX_SEGMENTS) -> tuple[str, ...]:
+    """Validate structural sendability; short-output budgets remain soft goals."""
+
+    return _validate_reply_plan(plan, max_segments=max_segments, include_budget=False)
+
+
+def _reply_policy_violations(
+    plan: ReplyPlan,
+    *,
+    max_segments: int,
+) -> tuple[str, ...]:
+    """Return all issues that can trigger the single optional repair pass."""
+
+    return _validate_reply_plan(plan, max_segments=max_segments, include_budget=True)
 
 
 def _looks_atomic(value: str) -> bool:
@@ -276,18 +318,8 @@ def _json_object(text: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def _plan_from_structured(value: dict[str, Any], mode: ReplyMode) -> ReplyPlan | None:
-    raw_segments = value.get("segments")
-    raw_atoms = value.get("atomic_parts", [])
-    if not isinstance(raw_segments, list) or not all(isinstance(item, str) for item in raw_segments):
-        return None
-    if not isinstance(raw_atoms, list) or not all(isinstance(item, str) for item in raw_atoms):
-        return None
-    parts = tuple(
-        [ReplyPart("segment", item.strip()) for item in raw_segments if item.strip()]
-        + [ReplyPart("atomic", item.strip()) for item in raw_atoms if item.strip()]
-    )
-    return _plan_from_parts(mode, parts)
+def _normalize_reply_text(value: object) -> str:
+    return str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
 def _repair_reply(
@@ -299,16 +331,16 @@ def _repair_reply(
     mode: ReplyMode,
     max_segments: int,
     time_context: str,
-) -> ReplyPlan | None:
+) -> tuple[ReplyPlan | None, ReplyRepairFailure | None]:
     system_prompt = (
         "你是 PersonalAgent 的回复结构化修订器。只输出一个 JSON 对象，不要解释、Markdown 或代码围栏。"
-        "JSON 必须包含 segments 数组和 atomic_parts 数组。"
-        "segments 只放给用户看的自然语言完整段落，atomic_parts 只放必须整体复制的 URL、代码、命令或路径。"
+        "JSON 必须只包含 text 字符串，text 是完整的修订后回复。"
+        "不要改写、删除或重新排序原回复中的 URL、代码、命令或路径。"
         f"当前时间上下文：{time_context or '未提供'}。"
     )
     if mode == "short":
         system_prompt += (
-            f"segments 必须有 1-{max_segments} 项，每项 1-{SHORT_MAX_CHARS} 个 Unicode 字符；"
+            f"尽量将自然语言控制在 1-{max_segments} 个完整段落、每段 1-{SHORT_MAX_CHARS} 个 Unicode 字符；"
             "不得在逗号、冒号或承接词处结束，不得拆英文短语、数字单位或原子内容。"
         )
     else:
@@ -317,7 +349,7 @@ def _repair_reply(
         f"用户请求：\n{user_text[-8_000:]}\n\n"
         f"候选回复：\n{candidate[-12_000:]}\n\n"
         f"需要修正的内部问题：{', '.join(violations) or 'format'}\n"
-        '输出示例结构：{"segments":["完整句子。"],"atomic_parts":[]}'
+        '输出示例结构：{"text":"完整句子。"}'
     )
     try:
         profile = model_registry.profile(model_alias)
@@ -327,17 +359,32 @@ def _repair_reply(
         response = model.bind(max_tokens=1_200).invoke(
             [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
         )
-        plan = _plan_from_structured(_json_object(_content_text(response)) or {}, mode)
-        if plan is None or validate_reply_plan(plan, max_segments=max_segments):
-            return None
-        return plan
+        value = _json_object(_content_text(response))
+        if value is None:
+            logger.warning("回复策略修订失败: invalid_json")
+            return None, "invalid_json"
+        raw_text = value.get("text")
+        if not isinstance(raw_text, str) or not _normalize_reply_text(raw_text):
+            logger.warning("回复策略修订失败: invalid_structure")
+            return None, "invalid_structure"
+        repaired_text = _normalize_reply_text(raw_text)
+        original_atoms = extract_atomic_parts(candidate)[1]
+        repaired_atoms = extract_atomic_parts(repaired_text)[1]
+        if repaired_atoms != original_atoms:
+            logger.warning("回复策略修订失败: atomic_changed")
+            return None, "atomic_changed"
+        plan = _plan_from_parts(mode, _parts_from_candidate(repaired_text))
+        if validate_reply_plan(plan, max_segments=max_segments):
+            logger.warning("回复策略修订失败: validation_failed")
+            return None, "validation_failed"
+        return plan, None
     except Exception as error:
         logger.warning("回复策略修订失败: %s", type(error).__name__)
-        return None
+        return None, "model_error"
 
 
-def _fallback_plan() -> ReplyPlan:
-    return _plan_from_parts("short", (ReplyPart("segment", SHORT_FAILURE_MESSAGE),))
+class EmptyModelReplyError(ValueError):
+    """Raised when the model returns no usable text at all."""
 
 
 def prepare_reply(
@@ -348,31 +395,50 @@ def prepare_reply(
     max_segments: int = SHORT_MAX_SEGMENTS,
     time_context: str = "",
 ) -> ReplyPlan:
-    """Validate a candidate, repair it once, then return a safe plan."""
+    """Validate a candidate, repair it once, then preserve any non-empty original."""
 
     mode: ReplyMode = "long" if is_long_output_request(user_text) else "short"
     max_segments = max(1, min(int(max_segments), SHORT_MAX_SEGMENTS))
-    parts = _parts_from_candidate(candidate)
+    normalized_candidate = _normalize_reply_text(candidate)
+    if not normalized_candidate:
+        raise EmptyModelReplyError("模型未返回有效内容，请重试")
+    parts = _parts_from_candidate(normalized_candidate)
     plan = _plan_from_parts(mode, parts)
-    violations = validate_reply_plan(plan, max_segments=max_segments)
+    violations = _reply_policy_violations(plan, max_segments=max_segments)
     if not violations:
         return plan
-    repaired = _repair_reply(
+    repaired, failure_code = _repair_reply(
         model_alias,
         user_text,
-        candidate,
+        normalized_candidate,
         violations,
         mode=mode,
         max_segments=max_segments,
         time_context=time_context,
     )
-    return repaired or _fallback_plan()
+    if repaired is not None:
+        return ReplyPlan(
+            mode=repaired.mode,
+            segments=repaired.segments,
+            atomic_parts=repaired.atomic_parts,
+            parts=repaired.parts,
+            policy_status="repaired",
+            policy_violations=violations,
+        )
+    return _build_plan(
+        mode,
+        parts,
+        policy_status="original_preserved",
+        policy_violations=violations,
+        repair_failure_code=failure_code,
+        source_text=normalized_candidate,
+    )
 
 
 __all__ = [
-    "SHORT_FAILURE_MESSAGE",
     "SHORT_MAX_CHARS",
     "SHORT_MAX_SEGMENTS",
+    "EmptyModelReplyError",
     "extract_atomic_parts",
     "is_long_output_request",
     "prepare_reply",
