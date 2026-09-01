@@ -245,10 +245,6 @@ const strategyRevisionRequests = new LatestRequestGate<string>()
 const theme = ref<ThemeName>('light')
 let followsSystemTheme = false
 let systemThemeQuery: MediaQueryList | undefined
-const qqChunkRange = computed(() => {
-  const target = Math.min(100, Math.max(5, Number(qqReplySettings.value.chunk_target_chars) || 20))
-  return { min: Math.floor(target * 0.7), max: Math.ceil(target * 1.3) }
-})
 const hasIndexingDocuments = computed(() => documents.value.some((item) => ['queued', 'indexing'].includes(item.status)))
 const companionOwners = computed(() => admins.value.filter((item) => item.platform === 'qq' && item.enabled && /^\d{5,20}$/.test(item.external_id)))
 const companionPersonas = computed(() => [{ id: 'default', name: '默认人格' }, ...personas.value.filter((item) => item.status === 'active').map((item) => ({ id: item.id, name: item.name }))])
@@ -1972,7 +1968,7 @@ onUnmounted(() => {
           <section class="panel stack log-config-panel">
             <div class="panel-heading"><div><span class="section-kicker">QQ 回复</span><h2>自然分批输出</h2></div><el-switch v-model="qqReplySettings.chunked_output_enabled" :loading="qqReplySettingsSaving" :disabled="qqReplySettingsSaving" active-text="已开启" inactive-text="单条发送" @change="saveQQReplySettings" /></div>
             <p class="hint">全局作用于 QQ 的模型聊天回复。回复会在安全与角色复核完成后，按语义分成几条自然发送；命令、错误、任务通知和文件说明保持单条。</p>
-            <div class="form-row qq-reply-settings-row"><label class="field-control"><span>分段目标字数</span><el-input-number v-model="qqReplySettings.chunk_target_chars" :min="5" :max="100" :step="1" :disabled="qqReplySettingsSaving" @change="saveQQReplySettings" /></label><span class="hint-inline">目标 {{ qqReplySettings.chunk_target_chars }} 字，实际约 {{ qqChunkRange.min }}–{{ qqChunkRange.max }} 字</span></div>
+            <div class="form-row qq-reply-settings-row"><label class="field-control"><span>兼容预算值</span><el-input-number v-model="qqReplySettings.chunk_target_chars" :min="5" :max="30" :step="1" :disabled="qqReplySettingsSaving" @change="saveQQReplySettings" /></label><span class="hint-inline">单段最多 30 字，每次最多 3 段；这是回复预算，不是机械切割目标。</span></div>
           </section>
 
           <section class="panel stack log-config-panel">

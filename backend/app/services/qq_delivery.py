@@ -3,20 +3,31 @@ from __future__ import annotations
 import math
 import re
 
+from app.domain.reply_types import ReplyMode, ReplyPart, ReplyPlan
+
 DEFAULT_CHUNK_TARGET_CHARS = 20
 MIN_CHUNK_TARGET_CHARS = 5
-MAX_CHUNK_TARGET_CHARS = 100
+MAX_CHUNK_TARGET_CHARS = 30
 MAX_REPLY_CHUNKS = 12
 MIN_DELAY_SECONDS = 0.3
 MAX_DELAY_SECONDS = 0.8
 
 _END_PUNCTUATION = frozenset("。！？!?；;….")
-_SECONDARY_PUNCTUATION = frozenset("，,、：:")
 _CLOSING_PUNCTUATION = frozenset("”’\"'）)]】》』」")
 _PROTECTED_PATTERN = re.compile(
-    r"```[\s\S]*?(?:```|$)|https?://[^\s<>\u3000`。！？；，、：]+|www\.[^\s<>\u3000`。！？；，、：]+"
+    r"```[\s\S]*?(?:```|\Z)|`[^`\r\n]+`|"
+    r"(?<!\S)(?:PS>\s*|(?:python(?:\.exe)?|pip|pnpm|npm|git|curl|"
+    r"(?:cmd|powershell)(?:\.exe)?\s+/c\s+|(?:Get|Set|New|Remove|Start|Stop|"
+    r"Test|Join|Resolve|Write|Read|Copy|Move|Select|ForEach|Where|Convert|"
+    r"Invoke)-[A-Za-z-]+\s+))[^\r\n]+|"
+    r"https?://[^\s<>\u3000`，。！？；：、（）【】《》]+|"
+    r"www\.[^\s<>\u3000`，。！？；：、（）【】《》]+|"
+    r"(?<![\w])[A-Za-z]:[\\/][^\s<>\u3000`，。！？；：:、]+|"
+    r"(?<![\w])(?:\\\\|\.{1,2}[\\/])[^\s<>\u3000`，。！？；：:、]+",
+    re.IGNORECASE | re.MULTILINE,
 )
 _MASK_PATTERN = re.compile("\\ue000\\d+\\ue001")
+_PLAN_BOUNDARY_PUNCTUATION = frozenset("。！？!?；;")
 
 
 def normalize_chunk_target(value: object) -> int:
@@ -66,10 +77,6 @@ def _atoms(text: str) -> list[tuple[str, bool]]:
     return atoms
 
 
-def _visible_length(masked: str, protected: list[str]) -> int:
-    return len(_restore(masked, protected))
-
-
 def _split_sentences(masked: str) -> list[str]:
     atoms = _atoms(masked)
     pieces: list[str] = []
@@ -98,60 +105,7 @@ def _split_sentences(masked: str) -> list[str]:
     return [piece for piece in pieces if piece.strip()]
 
 
-def _split_secondary(masked: str, protected: list[str], minimum: int) -> list[str]:
-    pieces: list[str] = []
-    current: list[str] = []
-    for atom, is_protected in _atoms(masked):
-        current.append(atom)
-        if not is_protected and (atom in _SECONDARY_PUNCTUATION or atom.isspace()):
-            if _visible_length("".join(current), protected) >= minimum:
-                pieces.append("".join(current))
-                current = []
-    if current:
-        pieces.append("".join(current))
-    return pieces or [masked]
-
-
-def _hard_split(masked: str, protected: list[str], maximum: int) -> list[str]:
-    pieces: list[str] = []
-    current: list[str] = []
-    for atom, is_protected in _atoms(masked):
-        if is_protected and _visible_length(atom, protected) > maximum:
-            if current:
-                pieces.append("".join(current))
-                current = []
-            pieces.append(atom)
-            continue
-        candidate = "".join(current) + atom
-        if current and _visible_length(candidate, protected) > maximum:
-            pieces.append("".join(current))
-            current = [atom]
-        else:
-            current.append(atom)
-    if current:
-        pieces.append("".join(current))
-    return pieces
-
-
-def _merge_short_pieces(
-    pieces: list[str], protected: list[str], minimum: int, maximum: int
-) -> list[str]:
-    merged: list[str] = []
-    for piece in pieces:
-        if not piece.strip():
-            continue
-        if merged and _visible_length(merged[-1] + piece, protected) <= maximum:
-            merged[-1] += piece
-        else:
-            merged.append(piece)
-    if len(merged) > 1 and _visible_length(merged[0], protected) < minimum:
-        if _visible_length(merged[0] + merged[1], protected) <= maximum:
-            merged[1] = merged[0] + merged[1]
-            merged.pop(0)
-    return merged
-
-
-def _limit_chunks(pieces: list[str], protected: list[str]) -> list[str]:
+def _limit_chunks(pieces: list[str]) -> list[str]:
     if len(pieces) <= MAX_REPLY_CHUNKS:
         return pieces
     grouped: list[str] = []
@@ -165,36 +119,75 @@ def _limit_chunks(pieces: list[str], protected: list[str]) -> list[str]:
 
 
 def split_qq_reply(text: str, target_chars: object = DEFAULT_CHUNK_TARGET_CHARS) -> list[str]:
-    """Split a reviewed model reply into a small number of natural QQ messages."""
+    """Compatibility splitter that only honors complete sentences or paragraphs."""
 
     normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not normalized:
         return []
-    minimum, maximum = chunk_length_bounds(target_chars)
+    normalize_chunk_target(target_chars)
     masked, protected = _mask_protected(normalized)
-    if _visible_length(masked, protected) <= maximum:
-        return [normalized]
-
-    pieces: list[str] = []
-    for sentence in _split_sentences(masked):
-        if _visible_length(sentence, protected) <= maximum:
-            pieces.append(sentence)
-            continue
-        for secondary in _split_secondary(sentence, protected, minimum):
-            if _visible_length(secondary, protected) <= maximum:
-                pieces.append(secondary)
-            else:
-                pieces.extend(_hard_split(secondary, protected, maximum))
-
-    pieces = _merge_short_pieces(pieces, protected, minimum, maximum)
-    pieces = _limit_chunks(pieces, protected)
-    # Keep whitespace at internal chunk boundaries.  Trimming every chunk would
-    # silently concatenate words (for example, ``"hello world"`` becoming
-    # ``"helloworld"`` when the split falls on a space).  The whole input was
-    # already normalized at the boundary above, so only whitespace-only pieces
-    # are discarded here.
+    pieces = _limit_chunks(_split_sentences(masked))
     restored = [_restore(piece, protected) for piece in pieces if piece.strip()]
     return restored or [normalized]
+
+
+def plan_delivery_parts(plan: ReplyPlan) -> list[str]:
+    """Return already-reviewed plan parts without any character-based split."""
+
+    chunks: list[str] = []
+    for part in plan.parts:
+        text = part.text
+        if not text.strip():
+            continue
+        if part.kind == "segment" and text in _PLAN_BOUNDARY_PUNCTUATION and chunks:
+            chunks[-1] += text
+        else:
+            chunks.append(text)
+    return chunks or ([plan.text] if plan.text else [])
+
+
+def reply_plan_from_event(data: dict[str, object]) -> ReplyPlan | None:
+    """Rebuild the validated plan carried by a ChatService final event."""
+
+    mode = data.get("response_mode")
+    if mode == "short":
+        reply_mode: ReplyMode = "short"
+    elif mode == "long":
+        reply_mode = "long"
+    else:
+        return None
+    raw_parts = data.get("parts")
+    if not isinstance(raw_parts, list):
+        return None
+    parts: list[ReplyPart] = []
+    for item in raw_parts:
+        if not isinstance(item, dict):
+            return None
+        kind = item.get("kind")
+        text = item.get("text")
+        if kind not in {"segment", "atomic"} or not isinstance(text, str) or not text.strip():
+            return None
+        parts.append(
+            ReplyPart("segment" if kind == "segment" else "atomic", text)
+        )
+    segments = data.get("segments")
+    atomic_parts = data.get("atomic_parts")
+    if not isinstance(segments, list) or not all(isinstance(item, str) for item in segments):
+        return None
+    if not isinstance(atomic_parts, list) or not all(
+        isinstance(item, str) for item in atomic_parts
+    ):
+        return None
+    plan = ReplyPlan(
+        reply_mode,
+        tuple(segments),
+        tuple(atomic_parts),
+        tuple(parts),
+    )
+    expected_text = data.get("text")
+    if isinstance(expected_text, str) and expected_text != plan.text:
+        return None
+    return plan
 
 
 def qq_reply_delay_seconds(text: str) -> float:

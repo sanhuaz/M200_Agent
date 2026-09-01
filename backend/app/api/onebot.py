@@ -36,6 +36,7 @@ from app.db.models import (
 )
 from app.db.session import SessionLocal
 from app.domain.chat_inputs import ChatAttachmentInput, ChatTurnInput
+from app.domain.reply_types import ReplyPlan
 from app.services.chat import chat_service
 from app.services.chat_attachments import (
     MAX_ATTACHMENTS,
@@ -79,7 +80,9 @@ from app.services.qq_delivery import (
     MIN_CHUNK_TARGET_CHARS,
     chunk_length_bounds,
     normalize_chunk_target,
+    plan_delivery_parts,
     qq_reply_delay_seconds,
+    reply_plan_from_event,
     split_qq_reply,
 )
 
@@ -161,7 +164,7 @@ def set_qq_reply_settings(
         except (TypeError, ValueError) as error:
             raise ValueError("QQ 分段目标字数必须是整数") from error
         if not MIN_CHUNK_TARGET_CHARS <= target <= MAX_CHUNK_TARGET_CHARS:
-            raise ValueError("QQ 分段目标字数必须在 5–100 之间")
+            raise ValueError("QQ 分段目标字数必须在 5–30 之间")
         item = session.get(AppSetting, QQ_CHUNK_TARGET_SETTING_KEY)
         if item is None:
             item = AppSetting(key=QQ_CHUNK_TARGET_SETTING_KEY, value="")
@@ -494,6 +497,7 @@ class OneBotManager:
             chunked_output = qq_chunked_output_enabled(session)
             chunk_target_chars = qq_chunk_target_chars(session)
             final_text = ""
+            reply_plan: ReplyPlan | None = None
             response_source = ""
             error_text = ""
             safety_intercepted = False
@@ -519,12 +523,14 @@ class OneBotManager:
                 message_id,
                 platform="qq",
                 is_group=bool(group_id),
+                reply_max_segments=3 if chunked_output else 1,
             ):
                 event_data = item["data"]
                 if not isinstance(event_data, dict):
                     continue
                 if item["event"] == "final":
                     final_text = str(event_data.get("text", ""))
+                    reply_plan = reply_plan_from_event(event_data)
                     response_source = str(event_data.get("response_source") or "agent")
                 elif item["event"] == "companion_analysis":
                     safety_intercepted = bool(event_data.get("safety_intercepted"))
@@ -536,17 +542,26 @@ class OneBotManager:
                         artifact_ids.append(artifact_id)
             reply_text = final_text or f"处理失败：{error_text}"
             chunkable_response_sources = {"agent", "rewritten", "style_rewritten"}
-            chunks = (
-                split_qq_reply(reply_text, target_chars=chunk_target_chars)
-                if (
-                    final_text
-                    and not error_text
-                    and chunked_output
-                    and not safety_intercepted
-                    and response_source in chunkable_response_sources
-                )
-                else [reply_text]
-            )
+            if (
+                reply_plan is not None
+                and final_text
+                and not error_text
+                and not safety_intercepted
+                and response_source in chunkable_response_sources
+            ):
+                chunks = plan_delivery_parts(reply_plan)
+            elif (
+                final_text
+                and not error_text
+                and chunked_output
+                and not safety_intercepted
+                and response_source in chunkable_response_sources
+            ):
+                # Compatibility path for older/custom ChatService producers
+                # that do not yet carry a ReplyPlan in the final event.
+                chunks = split_qq_reply(reply_text, target_chars=chunk_target_chars)
+            else:
+                chunks = [reply_text]
             chunks = [chunk for chunk in chunks if chunk.strip()] or [reply_text]
             sent_count = 0
             try:

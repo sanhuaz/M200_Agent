@@ -182,6 +182,7 @@ class ChatService:
         platform: str = "web",
         is_group: bool = False,
         attachments: Sequence[ChatAttachmentInput] | None = None,
+        reply_max_segments: int | None = None,
     ) -> AsyncGenerator[dict[str, object]]:
         if isinstance(text, ChatTurnInput):
             turn = text
@@ -193,6 +194,7 @@ class ChatService:
         else:
             input_text = text
             input_attachments = tuple(attachments or ())
+        max_reply_segments = reply_max_segments if reply_max_segments is not None else 3
 
         profile = model_registry.profile(conversation.model_alias)
         if input_attachments and not profile.supports_vision:
@@ -399,7 +401,12 @@ class ChatService:
                 )
                 response_source = "safety_llm" if safety_answer else "template"
                 answer = safety_answer or safety_redirect_text(safety_analysis.risk_level)
-                reply_plan = prepare_reply(answer, text, conversation.model_alias)
+                reply_plan = prepare_reply(
+                    answer,
+                    text,
+                    conversation.model_alias,
+                    max_segments=max_reply_segments,
+                )
                 answer = reply_plan.text
                 session.add(
                     SafetyEvent(
@@ -453,6 +460,9 @@ class ChatService:
                         "response_mode": reply_plan.mode,
                         "segments": list(reply_plan.segments),
                         "atomic_parts": list(reply_plan.atomic_parts),
+                        "parts": [
+                            {"kind": part.kind, "text": part.text} for part in reply_plan.parts
+                        ],
                         "assessment_id": safety_analysis.assessment_id,
                         "response_source": response_source,
                     },
@@ -803,7 +813,12 @@ class ChatService:
                                 trace_id=user_message.id,
                                 details={"violation_codes": style_violations},
                             )
-            reply_plan: ReplyPlan = prepare_reply(answer, text, conversation.model_alias)
+            reply_plan: ReplyPlan = prepare_reply(
+                answer,
+                text,
+                conversation.model_alias,
+                max_segments=max_reply_segments,
+            )
             answer = reply_plan.text
             assistant_message = Message(
                 conversation_id=conversation.id,
@@ -845,6 +860,9 @@ class ChatService:
                     "response_mode": reply_plan.mode,
                     "segments": list(reply_plan.segments),
                     "atomic_parts": list(reply_plan.atomic_parts),
+                    "parts": [
+                        {"kind": part.kind, "text": part.text} for part in reply_plan.parts
+                    ],
                     "assessment_id": companion_analysis.assessment_id
                     if companion_analysis is not None
                     else None,

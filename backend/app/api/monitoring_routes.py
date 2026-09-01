@@ -31,7 +31,7 @@ class NapCatLogTest(BaseModel):
 
 class QQReplySettingsUpdate(BaseModel):
     chunked_output_enabled: bool | None = None
-    chunk_target_chars: int | None = Field(default=None, ge=5, le=100)
+    chunk_target_chars: int | None = Field(default=None, ge=5, le=30)
 
 
 @router.get("/logs", dependencies=[Depends(require_loopback)])

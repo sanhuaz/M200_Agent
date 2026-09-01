@@ -40,6 +40,7 @@ class ReplyPlan:
             "response_mode": self.mode,
             "segments": list(self.segments),
             "atomic_parts": list(self.atomic_parts),
+            "parts": [{"kind": part.kind, "text": part.text} for part in self.parts],
         }
 
 

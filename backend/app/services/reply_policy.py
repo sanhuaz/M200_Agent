@@ -33,7 +33,7 @@ _URL_RE = re.compile(
     r"www\.[^\s<>\u3000`，。！？；：、（）【】《》]+",
     re.IGNORECASE,
 )
-_FENCED_CODE_RE = re.compile(r"```[\s\S]*?(?:```|$)")
+_FENCED_CODE_RE = re.compile(r"```[\s\S]*?(?:```|\Z)")
 _INLINE_CODE_RE = re.compile(r"`[^`\r\n]+`")
 _COMMAND_RE = re.compile(
     r"(?<!\S)(?:PS>\s*|(?:python(?:\.exe)?|pip|pnpm|npm|git|curl|"
