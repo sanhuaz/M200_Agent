@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -28,6 +29,8 @@ class MemoryCreate(BaseModel):
     content: str = Field(min_length=1, max_length=5_000)
     scope_type: str = "global"
     user_id: str | None = None
+    memory_kind: Literal["fact", "event"] = "fact"
+    event_date: date | None = None
 
 
 @router.get("/memories")
@@ -58,6 +61,8 @@ def list_memories(
             "user_id": item.user_id,
             "fact_key": item.fact_key,
             "content": item.content,
+            "memory_kind": item.memory_kind,
+            "event_date": item.event_date,
             "status": item.status,
             "source_message_id": item.source_message_id,
             "created_at": utc_isoformat(item.created_at),
@@ -118,6 +123,8 @@ def list_memory_center(
                     "user_id": item.user_id,
                     "fact_key": item.fact_key,
                     "content": item.content,
+                    "memory_kind": item.memory_kind,
+                    "event_date": item.event_date,
                     "status": item.status,
                     "source_message_id": item.source_message_id,
                     "created_at": utc_isoformat(item.created_at),
@@ -221,10 +228,19 @@ def create_memory(payload: MemoryCreate, session: Session = Depends(get_db)) -> 
         raise HTTPException(400, "用户记忆必须提供 user_id")
     try:
         item = (
-            MemoryService(session).upsert_global(payload.fact_key, payload.content)
+            MemoryService(session).upsert_global(
+                payload.fact_key,
+                payload.content,
+                memory_kind=payload.memory_kind,
+                event_date=payload.event_date,
+            )
             if payload.scope_type == "global"
             else MemoryService(session).upsert(
-                payload.user_id or "", payload.fact_key, payload.content
+                payload.user_id or "",
+                payload.fact_key,
+                payload.content,
+                memory_kind=payload.memory_kind,
+                event_date=payload.event_date,
             )
         )
     except ValueError as error:
@@ -235,6 +251,8 @@ def create_memory(payload: MemoryCreate, session: Session = Depends(get_db)) -> 
         "user_id": item.user_id,
         "fact_key": item.fact_key,
         "content": item.content,
+        "memory_kind": item.memory_kind,
+        "event_date": item.event_date,
         "status": item.status,
     }
 
@@ -249,7 +267,13 @@ def update_memory(
         raise HTTPException(404, str(error)) from error
     except ValueError as error:
         raise HTTPException(400, str(error)) from error
-    return {"id": item.id, "content": item.content, "status": item.status}
+    return {
+        "id": item.id,
+        "content": item.content,
+        "memory_kind": item.memory_kind,
+        "event_date": item.event_date,
+        "status": item.status,
+    }
 
 
 @router.post("/memories/{memory_id}/archive", dependencies=[Depends(require_loopback)])

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.session import Base
@@ -31,6 +31,9 @@ class Conversation(Base):
     )
     owner_id: Mapped[str] = mapped_column(String(120), default="local-owner")
     summary: Mapped[str] = mapped_column(Text, default="")
+    summary_format_version: Mapped[int] = mapped_column(
+        Integer, default=1, server_default="1", nullable=False
+    )
     summary_up_to_message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
@@ -121,6 +124,10 @@ class Memory(Base):
     user_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
     fact_key: Mapped[str] = mapped_column(String(200), index=True)
     content: Mapped[str] = mapped_column(Text)
+    memory_kind: Mapped[str] = mapped_column(
+        String(10), default="fact", server_default="fact", nullable=False
+    )
+    event_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="active")
     source_message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     extraction_model: Mapped[str | None] = mapped_column(String(120), nullable=True)

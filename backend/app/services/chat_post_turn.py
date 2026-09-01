@@ -5,7 +5,7 @@ import threading
 
 from sqlalchemy.orm import Session
 
-from app.db.models import Conversation
+from app.db.models import Conversation, Message
 from app.db.session import SessionLocal
 from app.services.companion import extract_relationship
 from app.services.context import (
@@ -55,6 +55,7 @@ class PostTurnService:
             if conversation is None:
                 return
             context_rows = load_pending_messages(session, conversation, limit=8)
+            source_message = session.get(Message, message_id)
             time_context = current_time_context()
             turn_context = format_messages_for_model(context_rows[:-1])
             memory_scope_type = "group" if is_group else "user"
@@ -91,6 +92,7 @@ class PostTurnService:
                         scope_id=memory_scope_id,
                         context=turn_context,
                         time_context=time_context,
+                        message_time=source_message.created_at if source_message else None,
                     )
                 operation_logs.finish_operation(
                     memory_operation,
@@ -167,6 +169,7 @@ class PostTurnService:
             )
             if isinstance(response.content, str) and response.content.strip():
                 conversation.summary = clip_text(response.content.strip(), SUMMARY_MAX_TOKENS)
+                conversation.summary_format_version = 2
                 conversation.summary_up_to_message_id = batch[-1].id
                 session.commit()
                 operation_logs.finish_operation(

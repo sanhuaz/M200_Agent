@@ -85,3 +85,18 @@ def verify_schema() -> None:
     missing = required.difference(inspect(engine).get_table_names())
     if missing:
         raise RuntimeError(f"数据库缺少必要表，迁移未完成: {', '.join(sorted(missing))}")
+    inspector = inspect(engine)
+    required_columns = {
+        "conversations": {"summary_format_version"},
+        "memories": {"memory_kind", "event_date"},
+    }
+    missing_columns = {
+        f"{table}.{column}"
+        for table, columns in required_columns.items()
+        for column in columns
+        if column not in {item["name"] for item in inspector.get_columns(table)}
+    }
+    if missing_columns:
+        raise RuntimeError(
+            "数据库缺少必要字段，迁移未完成: " + ", ".join(sorted(missing_columns))
+        )

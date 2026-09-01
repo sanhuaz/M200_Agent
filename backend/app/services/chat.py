@@ -82,6 +82,7 @@ from app.services.time_context import (
     current_time_context,
     format_memory_for_model,
     format_messages_for_model,
+    format_summary_for_model,
 )
 from app.workflows.agent import build_agent_graph, final_ai_message, skill_descriptions
 
@@ -582,11 +583,19 @@ class ChatService:
                 f"\n策略攻略：{strategy_guide or '安全流程不加载普通策略攻略。'}\n"
                 "先回应用户明确表达，不要为了展示能力主动调用工具。"
             )
+        summary_text = clip_text(
+            format_summary_for_model(
+                conversation.summary or "",
+                conversation.summary_format_version,
+            ),
+            SUMMARY_MAX_TOKENS,
+        )
         system = (
             f"{SYSTEM_PROMPT}\n\n{time_context}\n\n当前用户画像和长期记忆：\n{memory_text}"
+            "\n\n事件记忆只作为历史背景；除非用户本轮重新确认，不得改写为当前仍在发生。"
             f"\n\n可用知识库：\n{knowledge_text}"
             f"\n\n可按需加载的 Skill（只提供名称和描述）：\n{skills_text}"
-            f"\n\n历史摘要：\n{clip_text(conversation.summary or '无', SUMMARY_MAX_TOKENS)}"
+            f"\n\n历史摘要：\n{summary_text}"
             f"\n\n{persona_text}"
             f"{companion_instruction}"
             f"{search_system_instruction(search_intent(text))}"

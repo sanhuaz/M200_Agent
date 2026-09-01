@@ -49,6 +49,7 @@ def conversation_dict(item: Conversation) -> dict[str, object]:
         "persona_id": item.persona_id,
         "owner_id": item.owner_id,
         "summary": item.summary,
+        "summary_format_version": item.summary_format_version,
         "created_at": utc_isoformat(item.created_at),
         "updated_at": utc_isoformat(item.updated_at),
     }

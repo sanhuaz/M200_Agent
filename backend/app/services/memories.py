@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from typing import Literal, cast
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
@@ -11,9 +12,11 @@ from app.core.config import get_settings
 from app.db.models import Memory
 from app.services.embeddings import get_embedding_provider
 from app.services.models import model_registry
+from app.services.time_context import format_message_for_model
 from app.services.vector_store import safe_collection_name, vector_store
 
 SENSITIVE_PATTERN = re.compile(r"(?i)(api[_ -]?key|token|password|passwd|secret|密码|密钥)\s*[:=：]")
+MemoryKind = Literal["fact", "event"]
 
 
 def memory_scope_key(scope_type: str, scope_id: str) -> str:
@@ -36,6 +39,24 @@ def memory_collection_name(scope_type: str, scope_id: str, profile: str) -> str:
 class ExtractedFact(BaseModel):
     fact_key: str = Field(description="稳定、简短的事实键，例如 preference.language")
     content: str = Field(description="一条可以独立理解的中文事实")
+    memory_kind: MemoryKind = Field(
+        default="fact", description="稳定事实使用 fact；有明确日期的一次历史事件使用 event"
+    )
+    event_date: date | None = Field(
+        default=None, description="事件发生日期，必须是 YYYY-MM-DD；无法确定时为空"
+    )
+
+    @field_validator("event_date", mode="before")
+    @classmethod
+    def parse_event_date(cls, value: object) -> date | None:
+        if value is None or isinstance(value, date):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                return date.fromisoformat(value.strip())
+            except ValueError:
+                return None
+        return None
 
 
 class ExtractedFacts(BaseModel):
@@ -130,6 +151,8 @@ class MemoryService:
         *,
         scope_type: str = "user",
         scope_id: str | None = None,
+        memory_kind: MemoryKind = "fact",
+        event_date: date | None = None,
     ) -> Memory:
         key = scope_id or user_id
         return self._upsert(
@@ -140,7 +163,25 @@ class MemoryService:
             content=content,
             source_message_id=source_message_id,
             extraction_model=extraction_model,
+            memory_kind=memory_kind,
+            event_date=event_date,
         )
+
+    @staticmethod
+    def _normalize_kind(value: str) -> MemoryKind:
+        if value not in {"fact", "event"}:
+            raise ValueError("memory_kind 只能是 fact 或 event")
+        return cast(MemoryKind, value)
+
+    @staticmethod
+    def _vector_metadata(item: Memory) -> dict[str, str | int]:
+        return {
+            "scope_type": item.scope_type,
+            "scope_id": item.user_id or "global",
+            "fact_key": item.fact_key,
+            "memory_kind": item.memory_kind,
+            "event_date": item.event_date.isoformat() if item.event_date else "",
+        }
 
     def _upsert(
         self,
@@ -152,9 +193,13 @@ class MemoryService:
         content: str,
         source_message_id: str | None,
         extraction_model: str | None,
+        memory_kind: MemoryKind,
+        event_date: date | None,
     ) -> Memory:
         if SENSITIVE_PATTERN.search(content):
             raise ValueError("疑似凭证内容不能写入长期记忆")
+        normalized_kind = self._normalize_kind(memory_kind)
+        normalized_event_date = event_date if normalized_kind == "event" else None
         user_condition = (
             Memory.user_id.is_(None)
             if database_user_id is None
@@ -170,6 +215,8 @@ class MemoryService:
         )
         now = datetime.now(UTC).replace(tzinfo=None)
         if active and active.content == content:
+            active.memory_kind = normalized_kind
+            active.event_date = normalized_event_date
             active.last_seen_at = now
             self.session.commit()
             return active
@@ -186,6 +233,8 @@ class MemoryService:
             user_id=database_user_id,
             fact_key=fact_key[:200],
             content=content,
+            memory_kind=normalized_kind,
+            event_date=normalized_event_date,
             source_message_id=source_message_id,
             extraction_model=extraction_model,
         )
@@ -198,7 +247,7 @@ class MemoryService:
             [memory.id],
             [memory.content],
             provider.embed_documents([memory.content]),
-            [{"scope_type": scope_type, "scope_id": scope_id, "fact_key": fact_key}],
+            [self._vector_metadata(memory)],
         )
         self.session.commit()
         return memory
@@ -209,6 +258,9 @@ class MemoryService:
         content: str,
         source_message_id: str | None = None,
         extraction_model: str | None = None,
+        *,
+        memory_kind: MemoryKind = "fact",
+        event_date: date | None = None,
     ) -> Memory:
         return self._upsert(
             scope_type="global",
@@ -218,6 +270,8 @@ class MemoryService:
             content=content,
             source_message_id=source_message_id,
             extraction_model=extraction_model,
+            memory_kind=memory_kind,
+            event_date=event_date,
         )
 
     @staticmethod
@@ -238,13 +292,7 @@ class MemoryService:
             [item.id],
             [item.content],
             provider.embed_documents([item.content]),
-            [
-                {
-                    "scope_type": item.scope_type,
-                    "scope_id": item.user_id or "global",
-                    "fact_key": item.fact_key,
-                }
-            ],
+            [self._vector_metadata(item)],
         )
         self.session.commit()
         return item
@@ -280,13 +328,7 @@ class MemoryService:
             [item.id],
             [item.content],
             provider.embed_documents([item.content]),
-            [
-                {
-                    "scope_type": item.scope_type,
-                    "scope_id": item.user_id or "global",
-                    "fact_key": item.fact_key,
-                }
-            ],
+            [self._vector_metadata(item)],
         )
         self.session.commit()
         return item
@@ -302,6 +344,7 @@ class MemoryService:
         scope_id: str | None = None,
         context: str = "",
         time_context: str = "",
+        message_time: datetime | None = None,
     ) -> list[Memory]:
         if SENSITIVE_PATTERN.search(user_text):
             return []
@@ -315,6 +358,11 @@ class MemoryService:
             ExtractedFacts,
             method="function_calling",
         )
+        timed_user_text = format_message_for_model(
+            "user",
+            user_text,
+            message_time or datetime.now(UTC),
+        )
         raw_result = model.invoke(
             [
                 (
@@ -323,6 +371,10 @@ class MemoryService:
                         "从用户消息中提取稳定事实、长期偏好或明确长期事件。"
                         "不要提取临时请求、猜测、第三方隐私或任何凭证。没有则返回空列表。"
                         "必须依据消息时间上下文理解今天、昨天、昨晚和刚才；不要把历史事件改写为当前状态。"
+                        "稳定偏好、身份和长期倾向输出 memory_kind=fact；"
+                        "只有一次性历史事件且日期可安全确定时输出 memory_kind=event。"
+                        "event_date 只能输出原始消息时间推导出的绝对 YYYY-MM-DD；"
+                        "无法确定就留空，fact 的 event_date 必须为空。"
                         + (
                             "当前是QQ群作用域，只提取群共同决定、项目事实或群级偏好，"
                             "不要提取发言者个人信息。"
@@ -336,7 +388,7 @@ class MemoryService:
                     (
                         f"当前时间上下文：\n{time_context or '未提供'}\n\n"
                         f"相关近期对话（仅用于指代消解，不得把助手猜测写入记忆）：\n{context}\n\n"
-                        f"本轮用户消息：\n{user_text}"
+                        f"本轮用户消息（以下前缀是原始消息的时间锚点）：\n{timed_user_text}"
                     ),
                 ),
             ]
@@ -351,6 +403,8 @@ class MemoryService:
                 model_alias,
                 scope_type=scope_type,
                 scope_id=scope_id,
+                memory_kind=fact.memory_kind,
+                event_date=fact.event_date,
             )
             for fact in result.facts
             if fact.fact_key.strip() and fact.content.strip()

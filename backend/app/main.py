@@ -81,7 +81,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
 
 app = FastAPI(
     title="PersonalAgent API",
-    version="0.4.5",
+    version="0.4.6",
     docs_url="/docs" if settings.app_env == "development" else None,
     lifespan=lifespan,
 )

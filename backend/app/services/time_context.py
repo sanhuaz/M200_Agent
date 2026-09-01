@@ -129,16 +129,30 @@ def format_messages_for_model(
     return "\n".join(rendered)
 
 
+def format_summary_for_model(summary: str, format_version: int | None) -> str:
+    text = summary.strip()
+    if not text:
+        return "无"
+    version = format_version if isinstance(format_version, int) and format_version >= 1 else 1
+    if version >= 2:
+        return f"[时间化摘要 v{version}]\n{text}"
+    return f"[旧摘要 v{version}：时间不可靠，仅作背景，不据此判断当前状态]\n{text}"
+
+
 def format_memory_for_model(item: object, timezone_name: str | None = None) -> str:
     created_at = getattr(item, "created_at", None)
     last_seen_at = getattr(item, "last_seen_at", None)
     created = to_local(created_at, timezone_name).strftime("%Y-%m-%d %H:%M") if created_at else "未知"
     last_seen = to_local(last_seen_at, timezone_name).strftime("%Y-%m-%d %H:%M") if last_seen_at else created
-    kind = str(getattr(item, "memory_kind", "fact") or "fact")
+    kind_value = str(getattr(item, "memory_kind", "fact") or "fact")
+    kind = kind_value if kind_value in {"fact", "event"} else "fact"
     event_date = getattr(item, "event_date", None)
-    event_label = f"；事件日期 {event_date}" if event_date else ""
-    history_label = f"记忆类型 {kind}；首次记录 {created}；最近确认 {last_seen}{event_label}"
-    return f"- [{history_label}] {getattr(item, 'content', '')}"
+    event_label = (
+        f"事件日期 {event_date or '未精确记录'}；" if kind == "event" else ""
+    )
+    history_label = f"记忆类型 {kind}；{event_label}首次记录 {created}；最近确认 {last_seen}"
+    historical_note = "（仅作历史背景，除非本轮重新确认，不视为当前状态）" if kind == "event" else ""
+    return f"- [{history_label}] {getattr(item, 'content', '')}{historical_note}"
 
 
 __all__ = [
@@ -149,6 +163,7 @@ __all__ = [
     "format_memory_for_model",
     "format_message_for_model",
     "format_messages_for_model",
+    "format_summary_for_model",
     "resolve_timezone",
     "to_local",
     "utc_isoformat",
