@@ -75,7 +75,7 @@ from app.services.mcp_search import search_intent, search_system_instruction
 from app.services.models import model_registry
 from app.services.operation_logs import operation_logs
 from app.services.personas import active_persona, persona_system_prompt
-from app.services.reply_policy import prepare_reply
+from app.services.reply_policy import EmptyModelReplyError, prepare_reply
 from app.services.runtime import is_owner
 from app.services.strategy_guides import NORMAL_STRATEGIES, guide_for_strategy
 from app.services.time_context import (
@@ -87,6 +87,35 @@ from app.services.time_context import (
 from app.workflows.agent import build_agent_graph, final_ai_message, skill_descriptions
 
 logger = logging.getLogger(__name__)
+
+
+def _emit_reply_policy_degraded(
+    reply_plan: ReplyPlan,
+    *,
+    operation_id: str,
+    trace_id: str,
+    model_output_chars: int,
+) -> None:
+    if reply_plan.policy_status != "original_preserved":
+        return
+    operation_logs.emit(
+        source="reply_policy",
+        level="warn",
+        kind="reply_policy_degraded",
+        title="回复策略降级",
+        message="回复修订失败，已保留原始模型回复",
+        parent_operation_id=operation_id,
+        trace_id=trace_id,
+        details={
+            "model_output_chars": model_output_chars,
+            "delivered_chars": len(reply_plan.text),
+            "reply_policy_status": reply_plan.policy_status,
+            "violation_codes": list(reply_plan.policy_violations),
+            "repair_failure_code": reply_plan.repair_failure_code,
+        },
+    )
+
+
 SYSTEM_PROMPT = """你是 PersonalAgent，一个本地个人助理。
 优先使用已经提供的用户画像和长期记忆，但不要把它们当作当前用户刚说的话。
 文档问题需要使用 search_knowledge，并在回答中写明文件、标题和页码或位置。
@@ -410,12 +439,19 @@ class ChatService:
                 )
                 response_source = "safety_llm" if safety_answer else "template"
                 answer = safety_answer or safety_redirect_text(safety_analysis.risk_level)
+                model_output_chars = len(safety_answer or "")
                 reply_plan = prepare_reply(
                     answer,
                     text,
                     conversation.model_alias,
                     max_segments=max_reply_segments,
                     time_context=time_context,
+                )
+                _emit_reply_policy_degraded(
+                    reply_plan,
+                    operation_id=operation_id,
+                    trace_id=user_message.id,
+                    model_output_chars=model_output_chars,
                 )
                 answer = reply_plan.text
                 session.add(
@@ -458,6 +494,10 @@ class ChatService:
                         "message_id": assistant_message.id,
                         "risk_level": safety_analysis.risk_level,
                         "response_source": response_source,
+                        "output_chars": len(answer),
+                        "model_output_chars": model_output_chars,
+                        "delivered_chars": len(answer),
+                        "reply_policy_status": reply_plan.policy_status,
                         "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 1),
                     },
                 )
@@ -473,6 +513,7 @@ class ChatService:
                         "parts": [
                             {"kind": part.kind, "text": part.text} for part in reply_plan.parts
                         ],
+                        "reply_policy_status": reply_plan.policy_status,
                         "assessment_id": safety_analysis.assessment_id,
                         "response_source": response_source,
                     },
@@ -833,12 +874,19 @@ class ChatService:
                                 trace_id=user_message.id,
                                 details={"violation_codes": style_violations},
                             )
+            model_output = answer
             reply_plan: ReplyPlan = prepare_reply(
-                answer,
+                model_output,
                 text,
                 conversation.model_alias,
                 max_segments=max_reply_segments,
                 time_context=time_context,
+            )
+            _emit_reply_policy_degraded(
+                reply_plan,
+                operation_id=operation_id,
+                trace_id=user_message.id,
+                model_output_chars=len(model_output),
             )
             answer = reply_plan.text
             assistant_message = Message(
@@ -855,7 +903,10 @@ class ChatService:
                 title="模型调用完成",
                 message="模型回复已生成",
                 details={
-                    "output_chars": len(answer),
+                    "output_chars": len(model_output),
+                    "model_output_chars": len(model_output),
+                    "delivered_chars": len(answer),
+                    "reply_policy_status": reply_plan.policy_status,
                     "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 1),
                 },
             )
@@ -867,6 +918,9 @@ class ChatService:
                 details={
                     "message_id": assistant_message.id,
                     "output_chars": len(answer),
+                    "model_output_chars": len(model_output),
+                    "delivered_chars": len(answer),
+                    "reply_policy_status": reply_plan.policy_status,
                     "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 1),
                     "tools": len(started_tools),
                 },
@@ -884,6 +938,7 @@ class ChatService:
                     "parts": [
                         {"kind": part.kind, "text": part.text} for part in reply_plan.parts
                     ],
+                    "reply_policy_status": reply_plan.policy_status,
                     "assessment_id": companion_analysis.assessment_id
                     if companion_analysis is not None
                     else None,
@@ -906,27 +961,49 @@ class ChatService:
             )
         except Exception as error:
             logger.exception("聊天执行失败")
+            error_code = (
+                "empty_model_output"
+                if isinstance(error, EmptyModelReplyError)
+                else type(error).__name__
+            )
             if model_operation is not None:
                 operation_logs.finish_operation(
                     model_operation,
                     source="model",
-                    title="模型调用失败",
-                    message="模型请求失败",
+                    title="模型输出为空" if error_code == "empty_model_output" else "模型调用失败",
+                    message=(
+                        "模型未返回有效内容"
+                        if error_code == "empty_model_output"
+                        else "模型请求失败"
+                    ),
                     success=False,
-                    details={"error": f"{type(error).__name__}: {error}"},
+                    details={
+                        "error_code": error_code,
+                        "error": f"{type(error).__name__}: {error}",
+                    },
                 )
             operation_logs.finish_operation(
                 operation_id,
                 source="chat",
-                title="对话失败",
-                message="请求未完成",
+                title="模型输出为空" if error_code == "empty_model_output" else "对话失败",
+                message=(
+                    "模型未返回有效内容"
+                    if error_code == "empty_model_output"
+                    else "请求未完成"
+                ),
                 success=False,
                 details={
+                    "error_code": error_code,
                     "error": f"{type(error).__name__}: {error}",
                     "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 1),
                 },
             )
-            yield {"event": "error", "data": {"message": f"{type(error).__name__}: {error}"}}
+            error_message = (
+                str(error)
+                if isinstance(error, EmptyModelReplyError)
+                else f"{type(error).__name__}: {error}"
+            )
+            yield {"event": "error", "data": {"message": error_message}}
 
     def _post_turn(
         self,
