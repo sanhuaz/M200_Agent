@@ -15,6 +15,14 @@ import {
   updateConversationModel,
   updateConversationPersona,
 } from '../features/chat'
+import {
+  DEFAULT_TIMEZONE,
+  formatLocalDate,
+  formatLocalDateTime,
+  formatLocalTime,
+  normalizeTimeZone,
+  sameLocalDay,
+} from '../features/time'
 import type {
   ChatPersona,
   Conversation,
@@ -22,11 +30,13 @@ import type {
   MessageAttachment,
   ModelProfile,
 } from '../types/chat'
+import type { TimeZone } from '../types/time'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   models: ModelProfile[]
   personas: ChatPersona[]
-}>()
+  timeZone?: TimeZone
+}>(), { timeZone: DEFAULT_TIMEZONE })
 const emit = defineEmits<{ changed: [] }>()
 
 type PendingImage = {
@@ -58,6 +68,7 @@ const currentModel = computed(() =>
   props.models.find((item) => item.alias === currentConversation.value?.model_alias),
 )
 const visionEnabled = computed(() => currentModel.value?.supports_vision === true)
+const displayTimeZone = computed(() => normalizeTimeZone(props.timeZone))
 
 function isMessagesNearBottom(element: HTMLElement) {
   return element.scrollHeight - element.scrollTop - element.clientHeight < 56
@@ -192,6 +203,27 @@ function formatBytes(size: number) {
   return `${(size / 1024 / 1024).toFixed(1)} MiB`
 }
 
+function messageDateLabel(value: string | undefined) {
+  return formatLocalDate(value, displayTimeZone.value)
+}
+
+function messageTimeLabel(value: string | undefined) {
+  return formatLocalTime(value, displayTimeZone.value)
+}
+
+function messageTimeTitle(value: string | undefined) {
+  return value
+    ? formatLocalDateTime(value, displayTimeZone.value)
+    : '该消息来自旧数据，API 未提供时间'
+}
+
+function showDateDivider(index: number) {
+  const message = messages.value[index]
+  if (!message?.created_at) return false
+  if (index === 0) return true
+  return !sameLocalDay(messages.value[index - 1]?.created_at, message.created_at, displayTimeZone.value)
+}
+
 function addImages(event: Event) {
   const inputElement = event.target as HTMLInputElement
   const files = Array.from(inputElement.files || [])
@@ -259,11 +291,12 @@ async function send() {
   const localMessageId = `local-${requestSequence}`
   const optimisticImages = pendingImages.value.map((item) => optimisticAttachment(item, localMessageId))
   const previewUrls = pendingImages.value.map((item) => item.previewUrl)
+  const createdAt = new Date().toISOString()
   input.value = ''
   pendingImages.value = []
   messages.value.push(
-    { id: localMessageId, role: 'user', content: text || '[图片]', attachments: optimisticImages },
-    { id: `assistant-${localMessageId}`, role: 'assistant', content: '' },
+    { id: localMessageId, role: 'user', content: text || '[图片]', created_at: createdAt, attachments: optimisticImages },
+    { id: `assistant-${localMessageId}`, role: 'assistant', content: '', created_at: createdAt },
   )
   const target = messages.value[messages.value.length - 1]
   messagesAutoFollow.value = true
@@ -346,22 +379,26 @@ onUnmounted(() => {
           <el-select :model-value="currentConversation?.model_alias" placeholder="选择模型" :disabled="sending" @change="switchModel"><el-option v-for="model in models" :key="model.alias" :label="`${model.alias}${model.configured ? '' : '（未配置）'}`" :value="model.alias" /></el-select>
           <el-select :model-value="currentConversation?.persona_id || ''" placeholder="选择人格" :disabled="sending" @change="switchPersona"><el-option label="关闭人格" value="" /><el-option v-for="item in personas" :key="item.id" :label="`${item.name}${item.status === 'active' ? '' : '（文件无效）'}`" :value="item.id" :disabled="item.status !== 'active'" /></el-select>
         </div>
+        <small class="chat-timezone-hint" :title="`消息时间按 ${displayTimeZone} 显示`">显示时区：{{ displayTimeZone }}</small>
       </div>
       <div ref="messagesContainer" class="messages" v-loading="messagesLoading" @scroll="handleMessagesScroll">
         <div v-if="!messages.length && !messagesLoading" class="chat-empty"><span class="empty-orb"><el-icon><ChatDotRound /></el-icon></span><h3>开始一段新对话</h3><p>选择模型和人格，然后输入你的问题。</p></div>
-        <article v-for="(message, index) in messages" :key="message.id || index" :class="['message', message.role]">
-          <span>{{ message.role === 'user' ? '你' : 'M200 Agent' }}</span>
-          <p>{{ message.content }}</p>
-          <div v-if="message.attachments?.length" class="message-attachments">
-            <figure v-for="attachment in message.attachments" :key="attachment.id" class="message-attachment">
-              <template v-if="!failedAttachmentUrls.has(displayAttachmentUrl(attachment))">
-                <img :src="displayAttachmentUrl(attachment)" :alt="attachment.original_filename" loading="lazy" @error="markAttachmentFailed(displayAttachmentUrl(attachment))" />
-              </template>
-              <div v-else class="attachment-placeholder">图片不可用</div>
-              <figcaption><span>{{ attachment.original_filename }} · {{ formatBytes(attachment.byte_size) }}</span><button v-if="!attachment.id.startsWith('local-')" type="button" aria-label="删除附件" title="删除附件" @click="deleteHistoryAttachment(message, attachment)"><el-icon><Delete /></el-icon></button></figcaption>
-            </figure>
-          </div>
-        </article>
+        <template v-for="(message, index) in messages" :key="message.id || index">
+          <div v-if="showDateDivider(index)" class="message-date-divider"><span>{{ messageDateLabel(message.created_at) }}</span></div>
+          <article :class="['message', message.role]">
+            <div class="message-meta"><span>{{ message.role === 'user' ? '你' : 'M200 Agent' }}</span><time v-if="message.created_at" class="message-time" :datetime="message.created_at" :title="messageTimeTitle(message.created_at)">{{ messageTimeLabel(message.created_at) }}</time><span v-else class="message-time" :title="messageTimeTitle(message.created_at)">时间未知</span></div>
+            <p>{{ message.content }}</p>
+            <div v-if="message.attachments?.length" class="message-attachments">
+              <figure v-for="attachment in message.attachments" :key="attachment.id" class="message-attachment">
+                <template v-if="!failedAttachmentUrls.has(displayAttachmentUrl(attachment))">
+                  <img :src="displayAttachmentUrl(attachment)" :alt="attachment.original_filename" loading="lazy" @error="markAttachmentFailed(displayAttachmentUrl(attachment))" />
+                </template>
+                <div v-else class="attachment-placeholder">图片不可用</div>
+                <figcaption><span>{{ attachment.original_filename }} · {{ formatBytes(attachment.byte_size) }}</span><button v-if="!attachment.id.startsWith('local-')" type="button" aria-label="删除附件" title="删除附件" @click="deleteHistoryAttachment(message, attachment)"><el-icon><Delete /></el-icon></button></figcaption>
+              </figure>
+            </div>
+          </article>
+        </template>
       </div>
       <div v-if="pendingImages.length" class="pending-attachments">
         <figure v-for="(item, index) in pendingImages" :key="item.previewUrl" class="pending-attachment">

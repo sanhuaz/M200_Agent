@@ -9,6 +9,7 @@ import {
 import { buildMemoryCenterQuery } from './features/memory'
 import { normalizeTab, pathForTab, resolveRoute } from './features/navigation'
 import { LatestRequestGate } from './features/requestGate'
+import { DEFAULT_TIMEZONE, formatCalendarDate, formatLocalDateTime, normalizeTimeZone } from './features/time'
 import { API, api } from './services/api'
 import type { AdminRow, HealthData, NapcatStatus } from './types/management'
 import type { Confirmation, TaskRow } from './types/tasks'
@@ -33,8 +34,10 @@ type MemoryCenterFact = {
   status: 'active' | 'archived'
   source_message_id: string | null
   created_at: string
-  last_seen_at: string
+  last_seen_at: string | null
   updated_at: string
+  memory_kind?: 'fact' | 'event'
+  event_date?: string | null
 }
 type MemoryCenterRelationship = {
   memory_type: 'relationship'
@@ -146,6 +149,7 @@ const editingModelAlias = ref('')
 const modelSaving = ref(false)
 const modelTesting = ref(false)
 const health = ref<HealthData>({})
+const displayTimeZone = computed(() => normalizeTimeZone(health.value.timezone || DEFAULT_TIMEZONE))
 const knowledgeBases = ref<KnowledgeBase[]>([])
 const documents = ref<DocumentRow[]>([])
 const memories = ref<MemoryCenterRow[]>([])
@@ -720,7 +724,7 @@ function changeTab(tab: string | number) {
 
 async function loadBase() {
   const [healthData, modelData, knowledgeData, personaData] = await Promise.all([
-    api<Record<string, unknown>>('/health'),
+    api<HealthData>('/health'),
     api<ModelProfile[]>('/models'),
     api<KnowledgeBase[]>('/knowledge-bases'),
     api<PersonaRow[]>('/personas'),
@@ -1402,7 +1406,22 @@ async function deleteMemory(id: string) {
 }
 
 function memoryTypeLabel(item: MemoryCenterRow) {
-  return item.memory_type === 'fact' ? '普通事实' : '陪伴关系'
+  if (item.memory_type === 'relationship') return '陪伴关系'
+  return item.memory_kind === 'event' ? '历史事件' : '普通事实'
+}
+
+function memoryEventDateLabel(item: MemoryCenterRow) {
+  return item.memory_type === 'fact' ? formatCalendarDate(item.event_date) : '—'
+}
+
+function memoryFirstSeenLabel(item: MemoryCenterRow) {
+  return formatLocalDateTime(item.created_at, displayTimeZone.value)
+}
+
+function memoryLastConfirmedLabel(item: MemoryCenterRow) {
+  return item.memory_type === 'fact'
+    ? formatLocalDateTime(item.last_seen_at, displayTimeZone.value)
+    : formatLocalDateTime(item.updated_at, displayTimeZone.value)
 }
 
 function changeMemoryType(value: string | number) {
@@ -1720,7 +1739,7 @@ onUnmounted(() => {
           <div><span class="eyebrow">本地智能工作台</span><h1>{{ currentPage.title }}</h1><p>{{ currentPage.description }}</p></div>
         </div>
 
-        <ChatPage v-if="activeTab === 'chat'" :models="models" :personas="personas" @changed="loadBase" />
+        <ChatPage v-if="activeTab === 'chat'" :models="models" :personas="personas" :time-zone="displayTimeZone" @changed="loadBase" />
 
         <template v-else-if="activeTab === 'companion'">
           <section v-if="!companionOwners.length" class="panel stack">
@@ -1884,7 +1903,9 @@ onUnmounted(() => {
                 <el-table-column label="人格" min-width="130"><template #default="scope"><span v-if="scope.row.memory_type === 'relationship'">{{ scope.row.persona_name }}</span><span v-else>—</span></template></el-table-column>
                 <el-table-column label="内容" min-width="360"><template #default="scope"><template v-if="scope.row.memory_type === 'fact'"><div class="table-primary"><strong>{{ scope.row.fact_key }}</strong><small>{{ scope.row.content }}</small></div></template><template v-else><div class="table-primary"><div v-if="memoryRelationshipContentItems(scope.row).length" class="memory-content-list"><small v-for="content in memoryRelationshipContentItems(scope.row)" :key="`${content.kind}-${content.label}-${content.content}`"><strong>{{ content.label }}：</strong>{{ content.content }}</small></div><small v-else>暂无关系记忆内容</small><small v-if="memoryRelationshipBoundaryCount(scope.row)">边界 {{ memoryRelationshipBoundaryCount(scope.row) }} 项</small></div></template></template></el-table-column>
                 <el-table-column label="状态" width="100"><template #default="scope"><el-tag :type="scope.row.status === 'active' ? 'success' : 'warning'">{{ scope.row.status === 'active' ? '有效' : '已归档' }}</el-tag></template></el-table-column>
-                <el-table-column label="更新时间" min-width="165"><template #default="scope">{{ scope.row.updated_at }}</template></el-table-column>
+                <el-table-column label="事件日期" width="135"><template #default="scope">{{ memoryEventDateLabel(scope.row) }}</template></el-table-column>
+                <el-table-column label="首次记录" min-width="190"><template #default="scope">{{ memoryFirstSeenLabel(scope.row) }}</template></el-table-column>
+                <el-table-column label="最近确认 / 更新" min-width="190"><template #default="scope">{{ memoryLastConfirmedLabel(scope.row) }}</template></el-table-column>
                 <el-table-column label="操作" width="250" fixed="right"><template #default="scope"><template v-if="scope.row.memory_type === 'fact'"><el-button size="small" @click="editMemory(scope.row)">编辑</el-button><el-button v-if="scope.row.status === 'active'" size="small" @click="archiveMemory(scope.row.id)">归档</el-button><el-button v-else size="small" @click="restoreMemory(scope.row.id)">恢复</el-button><el-button size="small" type="danger" plain @click="deleteMemory(scope.row.id)">删除</el-button></template><template v-else><el-button size="small" @click="editMemoryRelationship(scope.row)">编辑</el-button><el-button size="small" type="danger" plain @click="deleteMemoryRelationship(scope.row)">删除</el-button></template></template></el-table-column>
               </el-table>
             </div>

@@ -202,6 +202,7 @@ def health(session: Session = Depends(get_db)) -> dict[str, object]:
     return {
         "status": "ok" if database == "connected" else "degraded",
         "python_executable": sys.executable,
+        "timezone": settings.personal_agent_timezone,
         "database": database,
         "chroma": "installed",
         "worker": "running" if job_worker.running else "stopped",

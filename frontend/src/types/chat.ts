@@ -51,6 +51,7 @@ export type Message = {
   id?: string
   role: string
   content: string
+  created_at?: string
   attachments?: MessageAttachment[]
 }
 

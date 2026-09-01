@@ -277,13 +277,19 @@ h3 { margin: 0; }
 .chat-toolbar > div:first-child, .chat-title > span { display: grid; }
 .toolbar-selects { display: flex; gap: 9px; }
 .toolbar-selects .el-select { width: 210px; }
+.chat-timezone-hint { flex: 0 0 auto; color: var(--text-soft); font-size: 10px; white-space: nowrap; }
 .conversation-toggle { display: none; width: 34px; height: 34px; }
 .messages { overflow-y: auto; padding: 22px; }
 .message { max-width: min(78%, 780px); margin-bottom: 18px; }
-.message > span { color: var(--text-soft); font-size: 11px; font-weight: 750; }
+.message-meta { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--text-soft); font-size: 11px; font-weight: 750; }
+.message-time { color: var(--text-muted); font-size: 10px; font-weight: 600; }
+.message-time:not(:first-child) { white-space: nowrap; }
+.message.user .message-meta { justify-content: flex-end; }
+.message-date-divider { display: flex; align-items: center; gap: 12px; margin: 2px 0 18px; color: var(--text-soft); font-size: 11px; font-weight: 700; }
+.message-date-divider::before, .message-date-divider::after { flex: 1; height: 1px; content: ''; background: var(--border); }
+.message-date-divider span { flex: 0 0 auto; }
 .message p { margin: 5px 0 0; padding: 13px 15px; overflow-wrap: anywhere; border-radius: 4px 14px 14px; background: var(--surface-soft); white-space: pre-wrap; line-height: 1.65; }
 .message.user { margin-left: auto; }
-.message.user > span { display: block; text-align: right; }
 .message.user p { color: #fff; border-radius: 14px 4px 14px 14px; background: linear-gradient(135deg, var(--primary), var(--primary-strong)); }
 .message-attachments, .pending-attachments { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 9px; }
 .message-attachment, .pending-attachment { width: 156px; margin: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }

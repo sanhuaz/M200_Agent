@@ -23,6 +23,7 @@ export type NapcatStatus = {
 
 export type HealthData = {
   status?: string
+  timezone?: string
   database?: string
   chroma?: string
   worker?: string
