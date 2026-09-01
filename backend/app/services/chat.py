@@ -70,6 +70,7 @@ from app.services.context import (
 from app.services.extensions import list_packages
 from app.services.jobs import create_companion_analysis_retry_job
 from app.services.manga_intent import MangaIntent, detect_manga_intent
+from app.services.mcp_search import search_intent, search_system_instruction
 from app.services.models import model_registry
 from app.services.operation_logs import operation_logs
 from app.services.personas import active_persona, persona_system_prompt
@@ -562,6 +563,7 @@ class ChatService:
             f"\n\n历史摘要：\n{clip_text(conversation.summary or '无', SUMMARY_MAX_TOKENS)}"
             f"\n\n{persona_text}"
             f"{companion_instruction}"
+            f"{search_system_instruction(search_intent(text))}"
             f"{_manga_system_instruction(manga_intent)}"
         )
         try:
@@ -596,6 +598,7 @@ class ChatService:
                 platform=platform,
                 is_group=is_group,
                 allowed_manga_actions=allowed_manga_actions,
+                allow_anysearch_tools=search_intent(text),
             )
             input_state: MessagesState = {"messages": messages}
             final_messages: list[BaseMessage] = []

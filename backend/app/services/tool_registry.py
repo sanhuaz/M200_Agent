@@ -31,6 +31,8 @@ from app.services.builtin_tools import (
 )
 from app.services.context import limit_tool_content
 from app.services.extensions import load_python_tools
+from app.services.mcp_presets import ANYSEARCH_SLUG
+from app.services.mcp_search import ANYSEARCH_TOOL_NAMES, AnySearchCallGuard, is_error_result
 from app.services.mcp_servers import McpServerError, mcp_manager
 
 _SAFE_NAME = re.compile(r"[^a-zA-Z0-9_-]+")
@@ -41,6 +43,16 @@ _MCP_STATUS_READY = "ready"
 
 class McpToolDenied(PermissionError):
     """A safe denial returned when an MCP grant or request policy fails."""
+
+
+def _anysearch_failure() -> str:
+    return tool_envelope(
+        {
+            "error": "AnySearch 本次调用失败，当前信息无法核实",
+            "code": "realtime_search_failed",
+            "realtime_verified": False,
+        }
+    )
 
 
 def _json(value: Any, default: Any) -> Any:
@@ -269,6 +281,7 @@ def _mcp_tool(
     context: ToolContext,
     item: McpServer,
     entry: dict[str, Any],
+    search_guard: AnySearchCallGuard | None = None,
 ) -> BaseTool:
     remote_name = str(entry.get("name") or "remote_tool")
     item_key = str(entry.get("key") or _grant_key("tool", entry))
@@ -276,15 +289,38 @@ def _mcp_tool(
     schema = _args_schema(entry.get("input_schema"), public_name)
 
     async def invoke(**kwargs: Any) -> str:
+        if search_guard is not None:
+            boundary_error = search_guard.before_call(remote_name, kwargs)
+            if boundary_error:
+                return tool_envelope(
+                    {
+                        "error": boundary_error,
+                        "code": "vertical_domain_discovery_required",
+                    }
+                )
         try:
             current = _authorize(session, context, item.id, "tool", item_key)
             result = await mcp_manager.call_tool(current.id, remote_name, kwargs)
+            if search_guard is not None:
+                if is_error_result(result):
+                    return tool_envelope(
+                        {
+                            "error": "AnySearch 本次调用未返回可用结果",
+                            "code": "realtime_search_failed",
+                            "realtime_verified": False,
+                        }
+                    )
+                search_guard.after_call(remote_name, kwargs, result)
             return _mcp_result(
                 result, session=session, context=context, label=f"{current.slug}:{remote_name}"
             )
         except (McpToolDenied, McpServerError) as error:
+            if search_guard is not None:
+                return _anysearch_failure()
             return tool_envelope({"error": str(error)})
         except Exception as error:  # third-party failures must not break the graph
+            if search_guard is not None:
+                return _anysearch_failure()
             return tool_envelope({"error": f"MCP 工具调用失败：{type(error).__name__}"})
 
     return StructuredTool.from_function(
@@ -395,7 +431,13 @@ def _prompt_tool(
     )
 
 
-def _mcp_tools(session: Session, context: ToolContext) -> list[BaseTool]:
+def _mcp_tools(
+    session: Session,
+    context: ToolContext,
+    *,
+    allow_anysearch_tools: bool = True,
+    search_guard: AnySearchCallGuard | None = None,
+) -> list[BaseTool]:
     tools: list[BaseTool] = []
     rows = session.scalars(
         select(McpServer).where(
@@ -413,8 +455,21 @@ def _mcp_tools(session: Session, context: ToolContext) -> list[BaseTool]:
             )
         }
         for entry in catalog["tools"]:
+            remote_name = str(entry.get("name") or "remote_tool")
+            if item.slug == ANYSEARCH_SLUG and (
+                not allow_anysearch_tools or remote_name not in ANYSEARCH_TOOL_NAMES
+            ):
+                continue
             if str(entry.get("key") or _grant_key("tool", entry)) in grants:
-                tools.append(_mcp_tool(session, context, item, entry))
+                tools.append(
+                    _mcp_tool(
+                        session,
+                        context,
+                        item,
+                        entry,
+                        search_guard if item.slug == ANYSEARCH_SLUG else None,
+                    )
+                )
         for entry in catalog["resources"]:
             if str(entry.get("key") or _grant_key("resource", entry)) in grants:
                 tools.append(_resource_tool(session, context, item, entry))
@@ -445,6 +500,8 @@ def build_registered_tools(
     allowed_manga_actions: frozenset[str] = frozenset(),
     knowledge_search_guard: KnowledgeSearchGuard | None = None,
     manga_download_job_factory: Callable[..., Any] | None = None,
+    allow_anysearch_tools: bool = True,
+    search_guard: AnySearchCallGuard | None = None,
 ) -> list[BaseTool]:
     """Return the sole tool list consumed by model binding and ``ToolNode``."""
 
@@ -456,7 +513,18 @@ def build_registered_tools(
         manga_download_job_factory=manga_download_job_factory,
     )
     python_tools = load_python_tools(session, context)
-    return _dedupe([*builtins, *python_tools, *_mcp_tools(session, context)])
+    return _dedupe(
+        [
+            *builtins,
+            *python_tools,
+            *_mcp_tools(
+                session,
+                context,
+                allow_anysearch_tools=allow_anysearch_tools,
+                search_guard=search_guard,
+            ),
+        ]
+    )
 
 
 # Naming aliases make the service convenient for callers and tests while the

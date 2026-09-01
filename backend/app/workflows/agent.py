@@ -21,6 +21,7 @@ from app.services.context import (
 )
 from app.services.extensions import list_packages
 from app.services.jobs import create_manga_download_job
+from app.services.mcp_search import AnySearchCallGuard
 from app.services.models import model_registry
 from app.services.runtime import is_owner
 from app.services.tool_registry import build_registered_tools
@@ -62,6 +63,7 @@ def build_agent_graph(
     platform: str = "web",
     is_group: bool = False,
     allowed_manga_actions: frozenset[str] = frozenset(),
+    allow_anysearch_tools: bool = False,
 ):
     settings = get_settings()
     owner = is_owner(requester_id)
@@ -74,12 +76,15 @@ def build_agent_graph(
         is_owner=owner,
     )
     knowledge_search_guard = KnowledgeSearchGuard()
+    search_guard = AnySearchCallGuard() if allow_anysearch_tools else None
     tools = build_registered_tools(
         session,
         context,
         allowed_manga_actions=allowed_manga_actions,
         knowledge_search_guard=knowledge_search_guard,
         manga_download_job_factory=create_manga_download_job,
+        allow_anysearch_tools=allow_anysearch_tools,
+        search_guard=search_guard,
     )
     base_model = model_registry.chat_model(model_alias)
     model = base_model.bind_tools(tools)
