@@ -47,12 +47,21 @@ export type MessageAttachment = {
   preview_url?: string
 }
 
+export type ChatArtifact = {
+  id: string
+  filename: string
+  size: number
+  content_type?: string
+  download_url: string
+}
+
 export type Message = {
   id?: string
   role: string
   content: string
   created_at?: string
   attachments?: MessageAttachment[]
+  artifacts?: ChatArtifact[]
 }
 
 export type ChatStreamEvent = {

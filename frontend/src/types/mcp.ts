@@ -36,6 +36,47 @@ export type McpCatalog = {
   prompts: McpCatalogEntry[]
 }
 
+export type McpIntentPhrase = {
+  id: string
+  phrase: string
+  enabled: boolean
+}
+
+export type McpIntentRule = McpIntentPhrase & {
+  server_id: string
+  tool_key: string | null
+  catalog_present?: boolean
+  orphaned?: boolean
+}
+
+export type McpBuiltinIntentRule = {
+  id: string
+  description: string
+  server_slug: string
+  readonly: boolean
+}
+
+export type McpGlobalIntents = {
+  version: number
+  inheritance_ttl_seconds: number
+  builtin_rules: McpBuiltinIntentRule[]
+  custom_rules: McpIntentRule[]
+}
+
+export type McpServerIntentTool = {
+  item_key: string
+  name: string
+  title?: string | null
+  phrases: McpIntentPhrase[]
+  catalog_present: boolean
+}
+
+export type McpServerIntents = {
+  server_id: string
+  server_phrases: McpIntentPhrase[]
+  tools: McpServerIntentTool[]
+}
+
 export type McpServer = {
   id: string
   name: string

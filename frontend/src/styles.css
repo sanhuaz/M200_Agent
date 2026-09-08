@@ -298,6 +298,9 @@ h3 { margin: 0; }
 .message-attachment figcaption span, .pending-attachment figcaption span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .message-attachment figcaption button, .pending-attachment figcaption button { flex: 0 0 auto; padding: 2px 4px; color: var(--text-soft); border: 0; border-radius: 5px; background: transparent; cursor: pointer; }
 .message-attachment figcaption button:hover, .pending-attachment figcaption button:hover { color: var(--danger); background: var(--surface-hover); }
+.message-artifacts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 9px; }
+.message-artifact { color: var(--primary-strong); font-size: 12px; text-decoration: none; }
+.message-artifact:hover { text-decoration: underline; }
 .attachment-placeholder { display: grid; height: 116px; place-items: center; color: var(--text-soft); font-size: 11px; background: var(--surface-soft); }
 .composer { display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: end; padding: 14px 16px; border-top: 1px solid var(--border); background: var(--surface-soft); }
 .composer .el-button { height: 74px; padding-inline: 22px; }
@@ -349,6 +352,16 @@ h3 { margin: 0; }
 .mcp-catalog-item strong, .mcp-catalog-item small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mcp-catalog-item small { color: var(--text-soft); font-size: 11px; }
 .mcp-error-note { margin: 0; padding: 9px 12px; color: var(--danger); font-size: 12px; border-radius: 9px; background: color-mix(in srgb, var(--danger) 10%, transparent); }
+.mcp-intent-panel { margin-top: 18px; }
+.mcp-intent-stack, .mcp-intent-section, .mcp-tool-intent-list { display: grid; gap: 10px; }
+.mcp-intent-readonly { display: grid; gap: 6px; padding: 10px 12px; border-radius: 9px; background: var(--surface-soft); }
+.mcp-intent-readonly-row { display: flex; align-items: center; gap: 8px; color: var(--text-soft); font-size: 12px; line-height: 1.5; }
+.mcp-intent-rules { display: grid; gap: 7px; }
+.mcp-intent-rule-row { display: grid; grid-template-columns: minmax(150px, 1.2fr) minmax(140px, .8fr) minmax(180px, 1fr) auto auto; gap: 8px; align-items: center; }
+.mcp-intent-rule-row-phrase { grid-template-columns: minmax(180px, 1fr) auto auto; }
+.mcp-tool-intent-card { display: grid; gap: 10px; padding: 13px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-soft); }
+.mcp-tool-intent-card .panel-heading { margin: 0; }
+.mcp-tool-intent-card .panel-heading small { display: block; margin-top: 3px; color: var(--text-soft); font-size: 11px; }
 .mcp-risk-note { margin-top: 18px; }
 .mcp-risk-note h2 { display: flex; align-items: center; gap: 7px; }
 .mcp-risk-note p { margin: 0; color: var(--text-soft); font-size: 13px; line-height: 1.7; }
@@ -358,6 +371,8 @@ h3 { margin: 0; }
   .tools-layout { grid-template-columns: 1fr; }
   .model-management { grid-template-columns: 1fr; }
   .mcp-layout { grid-template-columns: 1fr; }
+  .mcp-intent-rule-row { grid-template-columns: 1fr 1fr; }
+  .mcp-intent-rule-row-phrase { grid-template-columns: 1fr auto auto; }
   .mcp-server-list { position: static; max-height: none; }
   .manga-panel { position: static; }
   .toolbar-selects .el-select { width: 170px; }

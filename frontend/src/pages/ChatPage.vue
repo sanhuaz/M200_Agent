@@ -25,6 +25,7 @@ import {
 } from '../features/time'
 import type {
   ChatPersona,
+  ChatArtifact,
   Conversation,
   Message,
   MessageAttachment,
@@ -292,6 +293,8 @@ async function send() {
   const optimisticImages = pendingImages.value.map((item) => optimisticAttachment(item, localMessageId))
   const previewUrls = pendingImages.value.map((item) => item.previewUrl)
   const createdAt = new Date().toISOString()
+  const streamArtifacts: ChatArtifact[] = []
+  let streamedMessageId = ''
   input.value = ''
   pendingImages.value = []
   messages.value.push(
@@ -310,11 +313,23 @@ async function send() {
       ({ event, data }) => {
         if (requestSequence !== streamSequence || currentConversationId.value !== targetConversationId) return
         if (event === 'token') target.content += String(data.text || '')
+        if (event === 'final') {
+          streamedMessageId = String(data.message_id || '')
+          if (data.artifact_error) ElMessage.warning('完整正文已保留，但 Markdown 文件生成失败。')
+        }
+        if (event === 'artifact_created') {
+          const artifact = data as unknown as ChatArtifact
+          if (artifact.id && artifact.filename && artifact.download_url) streamArtifacts.push(artifact)
+        }
         if (event === 'error') target.content = `错误：${String(data.message || '聊天请求失败')}`
         if (event === 'token') void scrollMessagesToBottom()
       },
     )
-    if (requestSequence === streamSequence && currentConversationId.value === targetConversationId) await loadMessages(false)
+    if (requestSequence === streamSequence && currentConversationId.value === targetConversationId) {
+      await loadMessages(false)
+      const persisted = messages.value.find((message) => message.id === streamedMessageId)
+      if (persisted && streamArtifacts.length) persisted.artifacts = streamArtifacts
+    }
   } catch (error) {
     if (requestSequence === streamSequence && currentConversationId.value === targetConversationId) {
       if ((error as Error).name !== 'AbortError') target.content = `错误：${(error as Error).message}`
@@ -396,6 +411,11 @@ onUnmounted(() => {
                 <div v-else class="attachment-placeholder">图片不可用</div>
                 <figcaption><span>{{ attachment.original_filename }} · {{ formatBytes(attachment.byte_size) }}</span><button v-if="!attachment.id.startsWith('local-')" type="button" aria-label="删除附件" title="删除附件" @click="deleteHistoryAttachment(message, attachment)"><el-icon><Delete /></el-icon></button></figcaption>
               </figure>
+            </div>
+            <div v-if="message.artifacts?.length" class="message-artifacts">
+              <a v-for="artifact in message.artifacts" :key="artifact.id" class="message-artifact" :href="attachmentUrl(artifact.download_url)" target="_blank" rel="noreferrer">
+                {{ artifact.filename }} · {{ formatBytes(artifact.size) }}
+              </a>
             </div>
           </article>
         </template>

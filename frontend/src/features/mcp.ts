@@ -2,10 +2,13 @@ import { api } from '../services/api'
 import type {
   McpAccessPolicy,
   McpCatalogResponse,
+  McpGlobalIntents,
   McpGrantKind,
+  McpIntentPhrase,
   McpPreset,
   McpServer,
   McpServerDraft,
+  McpServerIntents,
   McpTestResponse,
 } from '../types/mcp'
 
@@ -51,6 +54,37 @@ export function listMcpServers(): Promise<McpServer[]> {
 
 export function listMcpPresets(): Promise<McpPreset[]> {
   return api<McpPreset[]>('/mcp/presets')
+}
+
+export function getMcpGlobalIntents(): Promise<McpGlobalIntents> {
+  return api<McpGlobalIntents>('/mcp/intents/global')
+}
+
+export function setMcpGlobalIntents(customRules: McpGlobalIntents['custom_rules']): Promise<McpGlobalIntents> {
+  const payloadRules = customRules.map(({ catalog_present: _catalogPresent, orphaned: _orphaned, ...rule }) => rule)
+  return api<McpGlobalIntents>('/mcp/intents/global', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ custom_rules: payloadRules }),
+  })
+}
+
+export function getMcpServerIntents(id: string): Promise<McpServerIntents> {
+  return api<McpServerIntents>(`/mcp/servers/${encodeURIComponent(id)}/intents`)
+}
+
+export function setMcpServerIntents(
+  id: string,
+  payload: {
+    server_phrases: McpIntentPhrase[]
+    tools: Array<{ item_key: string; phrases: McpIntentPhrase[] }>
+  },
+): Promise<McpServerIntents> {
+  return api<McpServerIntents>(`/mcp/servers/${encodeURIComponent(id)}/intents`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
 }
 
 export function installAnySearch(apiKey?: string): Promise<McpServer> {

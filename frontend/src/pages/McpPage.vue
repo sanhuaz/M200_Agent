@@ -6,6 +6,8 @@ import {
   createMcpServer,
   deleteMcpServer,
   getMcpCatalog,
+  getMcpGlobalIntents,
+  getMcpServerIntents,
   installAnySearch,
   listMcpPresets,
   listMcpServers,
@@ -13,6 +15,8 @@ import {
   refreshMcpServer,
   serverToDraft,
   setMcpGrants,
+  setMcpGlobalIntents,
+  setMcpServerIntents,
   setMcpServerEnabled,
   testMcpServer,
   updateMcpServer,
@@ -21,10 +25,14 @@ import type {
   McpCatalog,
   McpCatalogEntry,
   McpGrantKind,
+  McpGlobalIntents,
+  McpIntentPhrase,
+  McpIntentRule,
   AnySearchAuthMode,
   McpPreset,
   McpServer,
   McpServerDraft,
+  McpServerIntents,
   McpTransport,
 } from '../types/mcp'
 
@@ -64,8 +72,15 @@ const anySearchApiKey = ref('')
 const anySearchInstalling = ref(false)
 const grantSaving = reactive<Record<McpGrantKind, boolean>>({ tool: false, resource: false, prompt: false })
 const grantSelections = reactive<Record<McpGrantKind, string[]>>({ tool: [], resource: [], prompt: [] })
+const globalIntents = ref<McpGlobalIntents | null>(null)
+const serverIntents = ref<McpServerIntents | null>(null)
+const globalIntentLoading = ref(false)
+const globalIntentSaving = ref(false)
+const serverIntentLoading = ref(false)
+const serverIntentSaving = ref(false)
 let serverRequest = 0
 let catalogRequest = 0
+let intentRequest = 0
 
 const selectedServer = computed(() => servers.value.find((item) => item.id === selectedId.value) || null)
 const anySearchPreset = computed(() => presets.value.find((item) => item.slug === 'anysearch') || null)
@@ -102,10 +117,25 @@ function entrySubtitle(entry: McpCatalogEntry): string {
     .join(' · ')
 }
 
+function newIntentId(): string {
+  return typeof crypto !== 'undefined' && crypto.randomUUID
+    ? crypto.randomUUID()
+    : `intent-${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+function newPhrase(): McpIntentPhrase {
+  return { id: newIntentId(), phrase: '', enabled: true }
+}
+
+function newGlobalRule(serverId: string): McpIntentRule {
+  return { id: newIntentId(), phrase: '', server_id: serverId, tool_key: null, enabled: true }
+}
+
 function selectServer(item: McpServer) {
   selectedId.value = item.id
   Object.assign(draft, serverToDraft(item))
   void loadCatalog(item.id)
+  void loadServerIntents(item.id)
 }
 
 function startNew() {
@@ -113,6 +143,7 @@ function startNew() {
   Object.assign(draft, newDraft())
   catalog.value = emptyCatalog()
   catalogStatus.value = ''
+  serverIntents.value = null
   resetGrants()
 }
 
@@ -143,6 +174,97 @@ async function loadPresets() {
     presets.value = await listMcpPresets()
   } catch (error) {
     ElMessage.error((error as Error).message)
+  }
+}
+
+async function loadGlobalIntents() {
+  globalIntentLoading.value = true
+  try {
+    globalIntents.value = await getMcpGlobalIntents()
+  } catch (error) {
+    ElMessage.error((error as Error).message)
+  } finally {
+    globalIntentLoading.value = false
+  }
+}
+
+async function loadServerIntents(id = selectedId.value) {
+  if (!id) {
+    serverIntents.value = null
+    return
+  }
+  const request = ++intentRequest
+  serverIntentLoading.value = true
+  try {
+    const result = await getMcpServerIntents(id)
+    if (request !== intentRequest || id !== selectedId.value) return
+    serverIntents.value = result
+  } catch (error) {
+    if (request === intentRequest) ElMessage.error((error as Error).message)
+  } finally {
+    if (request === intentRequest) serverIntentLoading.value = false
+  }
+}
+
+function addGlobalRule() {
+  if (!globalIntents.value || !servers.value.length) {
+    ElMessage.warning('请先创建 MCP Server')
+    return
+  }
+  globalIntents.value.custom_rules.push(newGlobalRule(servers.value[0].id))
+}
+
+function removeGlobalRule(index: number) {
+  globalIntents.value?.custom_rules.splice(index, 1)
+}
+
+function setGlobalToolKey(rule: McpIntentRule, value: string | number) {
+  const normalized = String(value).trim()
+  rule.tool_key = normalized || null
+}
+
+async function saveGlobalIntentRules() {
+  if (!globalIntents.value) return
+  globalIntentSaving.value = true
+  try {
+    globalIntents.value = await setMcpGlobalIntents(globalIntents.value.custom_rules)
+    ElMessage.success('全局 MCP 意图已保存')
+  } catch (error) {
+    ElMessage.error((error as Error).message)
+  } finally {
+    globalIntentSaving.value = false
+  }
+}
+
+function addServerPhrase() {
+  serverIntents.value?.server_phrases.push(newPhrase())
+}
+
+function removeServerPhrase(index: number) {
+  serverIntents.value?.server_phrases.splice(index, 1)
+}
+
+function addToolPhrase(tool: McpServerIntents['tools'][number]) {
+  tool.phrases.push(newPhrase())
+}
+
+function removeToolPhrase(tool: McpServerIntents['tools'][number], index: number) {
+  tool.phrases.splice(index, 1)
+}
+
+async function saveServerIntentRules() {
+  if (!serverIntents.value || !selectedId.value) return
+  serverIntentSaving.value = true
+  try {
+    serverIntents.value = await setMcpServerIntents(selectedId.value, {
+      server_phrases: serverIntents.value.server_phrases,
+      tools: serverIntents.value.tools.map((tool) => ({ item_key: tool.item_key, phrases: tool.phrases })),
+    })
+    ElMessage.success('Server 与 Tool 意图已保存')
+  } catch (error) {
+    ElMessage.error((error as Error).message)
+  } finally {
+    serverIntentSaving.value = false
   }
 }
 
@@ -221,6 +343,7 @@ async function save() {
     draft.secretValuesText = '{}'
     ElMessage.success(isEditing.value ? 'MCP Server 已保存' : 'MCP Server 已创建，默认停用')
     await loadCatalog(item.id)
+    await loadServerIntents(item.id)
   } catch (error) {
     ElMessage.error((error as Error).message)
   } finally {
@@ -326,10 +449,43 @@ async function saveGrant(kind: McpGrantKind) {
   }
 }
 
-onMounted(() => { void loadServers(); void loadPresets() })
+onMounted(() => { void loadServers(); void loadPresets(); void loadGlobalIntents() })
 </script>
 
 <template>
+  <section class="panel stack mcp-intent-panel">
+    <div class="panel-heading">
+      <div><span class="section-kicker">意图路由</span><h2>全局 MCP 意图</h2></div>
+      <div class="form-row">
+        <el-tag type="info">追问继承 {{ globalIntents?.inheritance_ttl_seconds || 600 }} 秒</el-tag>
+        <el-button :loading="globalIntentSaving" @click="saveGlobalIntentRules">保存全局规则</el-button>
+        <el-button type="primary" plain :disabled="!servers.length" @click="addGlobalRule"><Plus />新增规则</el-button>
+      </div>
+    </div>
+    <p class="hint">全局规则可以把自然表达绑定到整个 Server 或指定 Tool。内置规则只读；短语会在后端统一做 Unicode 规范化和同级冲突校验。</p>
+    <div v-loading="globalIntentLoading" class="mcp-intent-stack">
+      <div v-if="globalIntents?.builtin_rules.length" class="mcp-intent-readonly">
+        <div v-for="rule in globalIntents.builtin_rules" :key="rule.id" class="mcp-intent-readonly-row">
+          <el-tag size="small" type="info">内置</el-tag>
+          <span><strong>{{ rule.server_slug }}</strong> · {{ rule.description }}</span>
+        </div>
+      </div>
+      <div v-if="globalIntents?.custom_rules.length" class="mcp-intent-rules">
+        <div v-for="(rule, index) in globalIntents.custom_rules" :key="rule.id" class="mcp-intent-rule-row">
+          <el-input v-model="rule.phrase" placeholder="例如：帮我看看今天的热搜" />
+          <el-select v-model="rule.server_id" placeholder="目标 Server">
+            <el-option v-for="item in servers" :key="item.id" :label="item.name" :value="item.id" />
+          </el-select>
+          <el-input :model-value="rule.tool_key || ''" placeholder="Tool key（留空为整个 Server）" @update:model-value="setGlobalToolKey(rule, $event)" />
+          <el-tag v-if="rule.orphaned" size="small" type="warning">孤儿目标</el-tag>
+          <el-checkbox v-model="rule.enabled">启用</el-checkbox>
+          <el-button text type="danger" @click="removeGlobalRule(index)"><Delete /></el-button>
+        </div>
+      </div>
+      <div v-else class="empty-copy">还没有自定义全局规则。</div>
+    </div>
+  </section>
+
   <div class="mcp-layout">
     <section class="panel stack mcp-editor">
       <div class="panel-heading">
@@ -386,6 +542,47 @@ onMounted(() => { void loadServers(); void loadPresets() })
         </div>
         <div v-else class="empty-copy">目录中没有此类能力。</div>
       </article>
+    </div>
+  </section>
+
+  <section v-if="selectedServer && serverIntents" v-loading="serverIntentLoading" class="panel stack mcp-intent-panel">
+    <div class="panel-heading">
+      <div><span class="section-kicker">意图路由</span><h2>{{ selectedServer.name }} 的 Server / Tool 规则</h2></div>
+      <div class="form-row">
+        <el-button :loading="serverIntentSaving" @click="saveServerIntentRules">保存 Server / Tool 规则</el-button>
+        <el-button type="primary" plain @click="addServerPhrase"><Plus />新增 Server 短语</el-button>
+      </div>
+    </div>
+    <p class="hint">Server 短语作用于该 Server；Tool 短语只作用于对应目录项。目录刷新后消失的 Tool 会保留为孤儿规则，但不会在运行时命中。</p>
+    <div class="mcp-intent-section">
+      <div class="panel-heading"><div><h3>Server 短语</h3><small>用于表达“使用这个 Server”或该 Server 的整体能力</small></div></div>
+      <div v-if="serverIntents.server_phrases.length" class="mcp-intent-rules">
+        <div v-for="(phrase, index) in serverIntents.server_phrases" :key="phrase.id" class="mcp-intent-rule-row mcp-intent-rule-row-phrase">
+          <el-input v-model="phrase.phrase" placeholder="例如：使用 AnySearch" />
+          <el-checkbox v-model="phrase.enabled">启用</el-checkbox>
+          <el-button text type="danger" @click="removeServerPhrase(index)"><Delete /></el-button>
+        </div>
+      </div>
+      <div v-else class="empty-copy">还没有 Server 自定义短语。</div>
+    </div>
+    <div class="mcp-intent-section">
+      <div class="panel-heading"><div><h3>Tool 短语</h3><small>只对当前目录中的 Tool 产生意图</small></div></div>
+      <div class="mcp-tool-intent-list">
+        <article v-for="tool in serverIntents.tools" :key="tool.item_key" class="mcp-tool-intent-card">
+          <div class="panel-heading">
+            <div><strong>{{ tool.title || tool.name }}</strong><small>{{ tool.item_key }}</small></div>
+            <div class="form-row"><el-tag v-if="!tool.catalog_present" size="small" type="warning">目录已不存在</el-tag><el-button size="small" plain @click="addToolPhrase(tool)"><Plus />新增短语</el-button></div>
+          </div>
+          <div v-if="tool.phrases.length" class="mcp-intent-rules">
+            <div v-for="(phrase, index) in tool.phrases" :key="phrase.id" class="mcp-intent-rule-row mcp-intent-rule-row-phrase">
+              <el-input v-model="phrase.phrase" placeholder="例如：把搜索结果列出来" />
+              <el-checkbox v-model="phrase.enabled">启用</el-checkbox>
+              <el-button text type="danger" @click="removeToolPhrase(tool, index)"><Delete /></el-button>
+            </div>
+          </div>
+          <div v-else class="empty-copy">还没有 Tool 自定义短语。</div>
+        </article>
+      </div>
     </div>
   </section>
 
