@@ -98,7 +98,11 @@ def _split_sentences(masked: str) -> list[str]:
             current = []
             continue
         if not is_protected and atom == "\n":
-            pieces.append("".join(current))
+            newline_piece = "".join(current)
+            if newline_piece == "\n" and pieces:
+                pieces[-1] += newline_piece
+            else:
+                pieces.append(newline_piece)
             current = []
         index += 1
     if current:
@@ -192,7 +196,11 @@ def reply_plan_from_event(data: dict[str, object]) -> ReplyPlan | None:
     expected_text = data.get("text")
     source_text = (
         expected_text
-        if policy_status == "original_preserved" and isinstance(expected_text, str)
+        if (
+            policy_status == "original_preserved"
+            or data.get("mcp_functional_reply") is True
+        )
+        and isinstance(expected_text, str)
         else None
     )
     plan = ReplyPlan(

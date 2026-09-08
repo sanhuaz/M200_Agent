@@ -502,6 +502,7 @@ class OneBotManager:
             response_source = ""
             error_text = ""
             safety_intercepted = False
+            mcp_functional_reply = False
             artifact_ids: list[str] = []
             stream_input: str | ChatTurnInput = text
             if attachments:
@@ -533,13 +534,26 @@ class OneBotManager:
                     final_text = str(event_data.get("text", ""))
                     reply_plan = reply_plan_from_event(event_data)
                     response_source = str(event_data.get("response_source") or "agent")
+                    mcp_functional_reply = bool(event_data.get("mcp_functional_reply"))
+                    final_artifacts = event_data.get("artifacts")
+                    if isinstance(final_artifacts, list):
+                        for artifact in final_artifacts:
+                            if not isinstance(artifact, dict):
+                                continue
+                            artifact_id = str(
+                                artifact.get("artifact_id") or artifact.get("id") or ""
+                            )
+                            if artifact_id and artifact_id not in artifact_ids:
+                                artifact_ids.append(artifact_id)
                 elif item["event"] == "companion_analysis":
                     safety_intercepted = bool(event_data.get("safety_intercepted"))
                 elif item["event"] == "error":
                     error_text = str(event_data.get("message", ""))
                 elif item["event"] == "artifact_created":
-                    artifact_id = str(event_data.get("artifact_id", ""))
-                    if artifact_id:
+                    artifact_id = str(
+                        event_data.get("artifact_id") or event_data.get("id") or ""
+                    )
+                    if artifact_id and artifact_id not in artifact_ids:
                         artifact_ids.append(artifact_id)
             reply_text = final_text or f"处理失败：{error_text}"
             chunkable_response_sources = {"agent", "rewritten", "style_rewritten"}
@@ -548,6 +562,13 @@ class OneBotManager:
                 and reply_plan.policy_status == "original_preserved"
             )
             if (
+                mcp_functional_reply
+                and final_text
+                and not error_text
+                and not safety_intercepted
+            ):
+                chunks = split_qq_reply(reply_text, target_chars=chunk_target_chars)
+            elif (
                 reply_plan is not None
                 and final_text
                 and not error_text
@@ -608,18 +629,89 @@ class OneBotManager:
                 with SessionLocal() as artifact_session:
                     artifacts = [artifact_session.get(Artifact, artifact_id) for artifact_id in artifact_ids]
                 for artifact in artifacts:
-                    if artifact is None or not Path(artifact.path).is_file():
+                    if artifact is None:
+                        operation_logs.emit(
+                            source="onebot",
+                            level="warn",
+                            kind="failed",
+                            title="QQ 文件发送失败",
+                            message="Artifact 记录不存在，未确认 QQ 文件送达",
+                            details={
+                                "conversation_id": conversation.id,
+                                "delivery_status": "failed",
+                                "reason": "artifact_missing",
+                            },
+                        )
+                        continue
+                    if not Path(artifact.path).is_file():
+                        operation_logs.emit(
+                            source="onebot",
+                            level="warn",
+                            kind="failed",
+                            title="QQ 文件发送失败",
+                            message="Artifact 文件不存在，未确认 QQ 文件送达",
+                            details={
+                                "conversation_id": conversation.id,
+                                "artifact_id": artifact.id,
+                                "filename": artifact.filename,
+                                "delivery_status": "failed",
+                                "reason": "artifact_file_missing",
+                            },
+                        )
                         continue
                     path = Path(artifact.path)
                     if path.stat().st_size <= settings.qq_upload_limit_mb * 1024 * 1024:
                         try:
                             await self.send_private_file(user_id, path)
+                            operation_logs.emit(
+                                source="onebot",
+                                kind="succeeded",
+                                title="QQ 文件发送完成",
+                                message="Artifact 已实际收到 QQ 文件发送成功回执",
+                                details={
+                                    "conversation_id": conversation.id,
+                                    "artifact_id": artifact.id,
+                                    "filename": artifact.filename,
+                                    "size": artifact.size,
+                                    "delivery_status": "sent",
+                                },
+                            )
                         except Exception as error:
+                            operation_logs.emit(
+                                source="onebot",
+                                level="warn",
+                                kind="failed",
+                                title="QQ 文件发送失败",
+                                message="Artifact 已保留，但 QQ 文件未确认送达",
+                                details={
+                                    "conversation_id": conversation.id,
+                                    "artifact_id": artifact.id,
+                                    "filename": artifact.filename,
+                                    "size": artifact.size,
+                                    "delivery_status": "failed",
+                                    "error": type(error).__name__,
+                                },
+                            )
                             await self.send_text(
                                 user_id,
                                 f"文件发送失败：{error}\n本地路径：{path.resolve()}",
                             )
                     else:
+                        operation_logs.emit(
+                            source="onebot",
+                            level="warn",
+                            kind="failed",
+                            title="QQ 文件发送失败",
+                            message="Artifact 超过 QQ 上传阈值，未确认送达",
+                            details={
+                                "conversation_id": conversation.id,
+                                "artifact_id": artifact.id,
+                                "filename": artifact.filename,
+                                "size": artifact.size,
+                                "delivery_status": "failed",
+                                "reason": "qq_upload_limit",
+                            },
+                        )
                         await self.send_text(
                             user_id,
                             f"文件超过 QQ 上传阈值，本地路径：{path.resolve()}",
