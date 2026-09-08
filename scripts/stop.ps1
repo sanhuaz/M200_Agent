@@ -5,7 +5,9 @@ param(
 $ErrorActionPreference = "Stop"
 
 $ProjectRoot = (Resolve-Path -LiteralPath (Split-Path -Parent $PSScriptRoot)).Path
-$TargetPorts = @(8000, 5176)
+$BackendPorts = @(8000, 8200)
+$FrontendPorts = @(5176)
+$TargetPorts = @($BackendPorts + $FrontendPorts)
 $LogRoot = [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot "logs"))
 $CurrentLogRoot = [System.IO.Path]::GetFullPath((Join-Path $LogRoot "current"))
 $ArchiveLogRoot = [System.IO.Path]::GetFullPath((Join-Path $LogRoot "archives"))
@@ -90,12 +92,15 @@ function Get-ProjectProcess {
 function Test-BackendEndpointIdentity {
     param(
         [Parameter(Mandatory)]
-        [string]$ExpectedPython
+        [string]$ExpectedPython,
+
+        [Parameter(Mandatory)]
+        [int]$Port
     )
 
     try {
-        $root = Invoke-RestMethod -UseBasicParsing -Uri "http://127.0.0.1:8000/" -TimeoutSec 3
-        $health = Invoke-RestMethod -UseBasicParsing -Uri "http://127.0.0.1:8000/api/v1/health" -TimeoutSec 3
+        $root = Invoke-RestMethod -UseBasicParsing -Uri "http://127.0.0.1:$Port/" -TimeoutSec 3
+        $health = Invoke-RestMethod -UseBasicParsing -Uri "http://127.0.0.1:$Port/api/v1/health" -TimeoutSec 3
         if ($root.service -ne "personal-agent" -or -not $health.python_executable) {
             return $false
         }
@@ -111,8 +116,13 @@ function Test-BackendEndpointIdentity {
 }
 
 function Test-FrontendEndpointIdentity {
+    param(
+        [Parameter(Mandatory)]
+        [int]$Port
+    )
+
     try {
-        $response = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:5176/" -TimeoutSec 3
+        $response = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$Port/" -TimeoutSec 3
         $content = [string]$response.Content
         return (
             $content -match '(?i)<title>\s*PersonalAgent\s*</title>' -and
@@ -164,7 +174,10 @@ function Test-PythonExecutableIdentity {
 function Test-BackendProcess {
     param(
         [Parameter(Mandatory)]
-        [psobject]$Process
+        [psobject]$Process,
+
+        [Parameter(Mandatory)]
+        [int]$Port
     )
 
     if (-not $Process.ExecutablePath -or -not $PythonExe) {
@@ -179,16 +192,19 @@ function Test-BackendProcess {
     if ($Process.CommandLine) {
         return (
             $Process.CommandLine -match "(?i)(?:^|\s)-m\s+uvicorn\s+app\.main:app(?:\s|$)" -and
-            (Test-PortArgument -CommandLine $Process.CommandLine -Port 8000)
+            (Test-PortArgument -CommandLine $Process.CommandLine -Port $Port)
         )
     }
-    return Test-BackendEndpointIdentity -ExpectedPython $expectedPython
+    return Test-BackendEndpointIdentity -ExpectedPython $expectedPython -Port $Port
 }
 
 function Test-FrontendProcess {
     param(
         [Parameter(Mandatory)]
-        [psobject]$Process
+        [psobject]$Process,
+
+        [Parameter(Mandatory)]
+        [int]$Port
     )
 
     if (-not $Process.ExecutablePath) {
@@ -202,10 +218,10 @@ function Test-FrontendProcess {
         return (
             $Process.CommandLine -match "(?i)$frontendPath[\\/]" -and
             $Process.CommandLine -match "(?i)(?:^|[\\/])vite(?:\.cmd|\.js|\.mjs)?(?:\s|$|[\\/])" -and
-            (Test-PortArgument -CommandLine $Process.CommandLine -Port 5176)
+            (Test-PortArgument -CommandLine $Process.CommandLine -Port $Port)
         )
     }
-    return Test-FrontendEndpointIdentity
+    return Test-FrontendEndpointIdentity -Port $Port
 }
 
 function Archive-CurrentLogs {
@@ -262,7 +278,7 @@ function Archive-CurrentLogs {
 
 $listeners = Get-ProjectListeners
 if ($listeners.Count -eq 0) {
-    Write-Host "PersonalAgent 当前未运行，端口 8000、5176 均无监听。"
+    Write-Host "PersonalAgent 当前未运行，项目目标端口均无监听。"
     Archive-CurrentLogs
     exit 0
 }
@@ -277,10 +293,12 @@ foreach ($listener in $listeners) {
         continue
     }
 
-    $isExpectedProcess = switch ([int]$listener.LocalPort) {
-        8000 { Test-BackendProcess -Process $process }
-        5176 { Test-FrontendProcess -Process $process }
-        default { $false }
+    $isExpectedProcess = if ($listener.LocalPort -in $BackendPorts) {
+        Test-BackendProcess -Process $process -Port $listener.LocalPort
+    } elseif ($listener.LocalPort -in $FrontendPorts) {
+        Test-FrontendProcess -Process $process -Port $listener.LocalPort
+    } else {
+        $false
     }
 
     if (-not $isExpectedProcess) {
@@ -296,11 +314,16 @@ if ($validationErrors.Count -gt 0) {
     throw "为避免误杀，未停止任何进程：$([Environment]::NewLine)$details"
 }
 
-try {
-    Invoke-WebRequest -UseBasicParsing -Method Post -Uri "http://127.0.0.1:8000/api/v1/logs/finalize" -TimeoutSec 3 | Out-Null
-    Write-Host "已通知后端刷新停止日志。"
-} catch {
-    Write-Warning "未能通知后端刷新停止日志，将继续执行安全停止：$($_.Exception.Message)"
+$backendListener = $listeners |
+    Where-Object { $_.LocalPort -in $BackendPorts } |
+    Select-Object -First 1
+if ($backendListener) {
+    try {
+        Invoke-WebRequest -UseBasicParsing -Method Post -Uri "http://127.0.0.1:$($backendListener.LocalPort)/api/v1/logs/finalize" -TimeoutSec 3 | Out-Null
+        Write-Host "已通知后端刷新停止日志。"
+    } catch {
+        Write-Warning "未能通知后端刷新停止日志，将继续执行安全停止：$($_.Exception.Message)"
+    }
 }
 
 foreach ($processId in $processesToStop.Keys) {
@@ -321,5 +344,5 @@ if ($remainingListeners.Count -gt 0) {
     throw "PersonalAgent 停止后仍有目标端口处于监听状态：$($details -join '；')"
 }
 
-Write-Host "PersonalAgent 已停止，端口 8000、5176 均已释放。"
+Write-Host "PersonalAgent 已停止，项目目标端口均已释放。"
 Archive-CurrentLogs
