@@ -15,11 +15,20 @@ from app.db.session import get_db
 from app.domain.mcp_types import (
     AnySearchPresetPayload,
     McpEnabledPayload,
+    McpGlobalIntentPayload,
     McpGrantPayload,
+    McpServerIntentPayload,
     McpServerPayload,
     McpServerUpdate,
 )
 from app.services.mcp_client import McpClientError, safe_error
+from app.services.mcp_intents import (
+    McpIntentError,
+    get_global_intents,
+    get_server_intents,
+    replace_global_intents,
+    replace_server_intents,
+)
 from app.services.mcp_presets import anysearch_preset, anysearch_server_payload
 from app.services.mcp_servers import (
     McpServerConflictError,
@@ -67,6 +76,46 @@ def list_mcp_servers(session: Session = Depends(get_db)) -> list[dict[str, objec
 def list_mcp_presets(session: Session = Depends(get_db)) -> list[dict[str, object]]:
     installed = session.scalar(select(McpServer.id).where(McpServer.slug == "anysearch")) is not None
     return [anysearch_preset(installed=installed).model_dump(mode="json")]
+
+
+@router.get("/intents/global", dependencies=_MANAGEMENT)
+def get_global_mcp_intents(session: Session = Depends(get_db)) -> dict[str, object]:
+    return get_global_intents(session)
+
+
+@router.put("/intents/global", dependencies=_MANAGEMENT)
+def put_global_mcp_intents(
+    payload: McpGlobalIntentPayload, session: Session = Depends(get_db)
+) -> dict[str, object]:
+    try:
+        result = replace_global_intents(session, payload)
+        session.commit()
+        return result
+    except McpIntentError as error:
+        session.rollback()
+        raise _safe_http_error(error, 422) from error
+
+
+@router.get("/servers/{server_id}/intents", dependencies=_MANAGEMENT)
+def get_server_mcp_intents(server_id: str, session: Session = Depends(get_db)) -> dict[str, object]:
+    item = _get_server(server_id, session)
+    return get_server_intents(session, item)
+
+
+@router.put("/servers/{server_id}/intents", dependencies=_MANAGEMENT)
+def put_server_mcp_intents(
+    server_id: str,
+    payload: McpServerIntentPayload,
+    session: Session = Depends(get_db),
+) -> dict[str, object]:
+    item = _get_server(server_id, session)
+    try:
+        result = replace_server_intents(session, item, payload)
+        session.commit()
+        return result
+    except McpIntentError as error:
+        session.rollback()
+        raise _safe_http_error(error, 422) from error
 
 
 @router.post("/presets/anysearch", dependencies=_MANAGEMENT)

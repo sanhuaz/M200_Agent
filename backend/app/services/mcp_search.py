@@ -11,19 +11,52 @@ ANYSEARCH_TOOL_NAMES = frozenset({"search", "get_sub_domains", "batch_search", "
 _DIRECT_SEARCH_RE = re.compile(
     r"搜索|搜一下|查一下|查询|检索|上网查|联网查|帮我找|找一下|查资料|网页来源|事实核查"
 )
-_CURRENT_MARKER_RE = re.compile(r"最新|目前|当前|实时|今日|本周|截至|最近发布|现在的")
-_CURRENT_TOPIC_RE = re.compile(
-    r"新闻|价格|价位|股价|汇率|政策|法规|规则|版本|发布|天气|赛事|比赛|航班|路线|官网|资料|来源|排名|市场|股票|软件|框架|库"
+_REFRESH_WEB_RE = re.compile(
+    r"(?:刷新|更新|重新查|再查|重新获取|再获取).{0,24}"
+    r"(?:新闻|价格|价位|股价|汇率|政策|法规|规则|版本|发布|天气|赛事|比赛|航班|路线|"
+    r"官网|资料|来源|排名|市场|股票|软件|框架|库|热搜|热榜|榜单|排行榜|舆情|趋势|动态|"
+    r"网页|网站|页面|数据)",
 )
+_IMPLICIT_WEB_ACTION_RE = re.compile(
+    r"告诉我|列出|获取|抓取|访问|打开|浏览|查看|查阅|帮我看看|看看|看一下|了解一下|"
+    r"核实一下|确认一下|盘点一下|整理一下"
+)
+_STATUS_QUERY_RE = re.compile(
+    r"(?:联网|上网|网页|搜索|查资料|anysearch).{0,16}"
+    r"(?:功能|能力|可用|能用|可以|支持|权限|授权|连接|状态|吗|么|呢)"
+    r"|(?:有没有|是否有|能否|能不能|可以|能).{0,12}"
+    r"(?:联网|上网|搜索|查资料|外部(?:搜索|信息))",
+    re.IGNORECASE,
+)
+_CURRENT_MARKER_RE = re.compile(r"最新|目前|当前|实时|今日|今天|本周|截至|最近发布|现在的|近期")
+_CURRENT_TOPIC_RE = re.compile(
+    r"新闻|价格|价位|股价|汇率|政策|法规|规则|版本|发布|天气|赛事|比赛|航班|路线|官网|资料|来源|排名|市场|股票|软件|框架|库|热搜|热榜|榜单|排行榜|舆情|趋势|动态|网页|网站|页面|数据"
+)
+_RANKING_REQUEST_RE = re.compile(
+    r"(?:热搜|热榜|榜单|排行榜|排名|排行).{0,12}(?:前[一二三四五六七八九十百千\d]+|top\s*\d+)",
+    re.IGNORECASE,
+)
+_DEFINITION_REQUEST_RE = re.compile(r"什么是|什么意思|解释|定义")
 
 
 def search_intent(text: str) -> bool:
     """Return whether this turn explicitly asks for current/web evidence."""
 
     normalized = " ".join(str(text or "").split())
-    return bool(_DIRECT_SEARCH_RE.search(normalized) or (
-        _CURRENT_MARKER_RE.search(normalized) and _CURRENT_TOPIC_RE.search(normalized)
-    ))
+    if _DIRECT_SEARCH_RE.search(normalized):
+        return True
+    if _REFRESH_WEB_RE.search(normalized):
+        return True
+    if _RANKING_REQUEST_RE.search(normalized) and not _DEFINITION_REQUEST_RE.search(normalized):
+        return True
+    if _STATUS_QUERY_RE.search(normalized):
+        return True
+    has_current_marker = _CURRENT_MARKER_RE.search(normalized) is not None
+    has_current_topic = _CURRENT_TOPIC_RE.search(normalized) is not None
+    return bool(
+        has_current_marker and has_current_topic
+        or _IMPLICIT_WEB_ACTION_RE.search(normalized) and (has_current_marker or has_current_topic)
+    )
 
 
 def search_system_instruction(enabled: bool) -> str:

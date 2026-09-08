@@ -129,6 +129,44 @@ class McpGrantPayload(BaseModel):
         return list(dict.fromkeys(normalized))
 
 
+class McpIntentPhrasePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str | None = Field(default=None, min_length=1, max_length=80)
+    phrase: str = Field(min_length=1, max_length=200)
+    enabled: bool = True
+
+
+class McpIntentRulePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str | None = Field(default=None, min_length=1, max_length=80)
+    phrase: str = Field(min_length=1, max_length=200)
+    server_id: str = Field(min_length=1, max_length=36)
+    tool_key: str | None = Field(default=None, max_length=500)
+    enabled: bool = True
+
+
+class McpGlobalIntentPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    custom_rules: list[McpIntentRulePayload] = Field(default_factory=list, max_length=200)
+
+
+class McpToolIntentPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_key: str = Field(min_length=1, max_length=500)
+    phrases: list[McpIntentPhrasePayload] = Field(default_factory=list, max_length=100)
+
+
+class McpServerIntentPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    server_phrases: list[McpIntentPhrasePayload] = Field(default_factory=list, max_length=200)
+    tools: list[McpToolIntentPayload] = Field(default_factory=list, max_length=200)
+
+
 class McpCatalog(BaseModel):
     """Persisted directory metadata; never contains resource bodies."""
 

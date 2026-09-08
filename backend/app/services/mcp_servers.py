@@ -377,6 +377,11 @@ class McpServerManager:
         self._connections: dict[str, McpConnection] = {}
         self._lock = asyncio.Lock()
 
+    def is_connected(self, server_id: str) -> bool:
+        """Return the current in-process transport snapshot without I/O."""
+
+        return server_id in self._connections
+
     async def connect(self, item: McpServer) -> tuple[dict[str, Any], dict[str, Any]]:
         await self.disconnect(item.id)
         connection = McpConnection(item.id)

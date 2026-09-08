@@ -8,6 +8,7 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.domain.mcp_routing import McpToolSelection
 from app.domain.tool_types import ToolContext
 from app.services.builtin_tools import (
     MANGA_TOOL_ACTIONS,
@@ -64,6 +65,7 @@ def build_agent_graph(
     is_group: bool = False,
     allowed_manga_actions: frozenset[str] = frozenset(),
     allow_anysearch_tools: bool = False,
+    mcp_selection: McpToolSelection | None = None,
 ):
     settings = get_settings()
     owner = is_owner(requester_id)
@@ -85,6 +87,7 @@ def build_agent_graph(
         manga_download_job_factory=create_manga_download_job,
         allow_anysearch_tools=allow_anysearch_tools,
         search_guard=search_guard,
+        mcp_selection=mcp_selection,
     )
     base_model = model_registry.chat_model(model_alias)
     model = base_model.bind_tools(tools)

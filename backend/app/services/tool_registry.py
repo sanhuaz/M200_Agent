@@ -21,6 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.models import McpGrant, McpServer
+from app.domain.mcp_routing import McpToolSelection
 from app.domain.mcp_types import jsonable
 from app.domain.tool_types import ToolContext
 from app.services.artifacts import ArtifactError, artifact_envelope, create_artifact
@@ -151,7 +152,10 @@ def _authorize(
     server_id: str,
     kind: str,
     item_key: str,
+    selection: McpToolSelection | None = None,
 ) -> McpServer:
+    if selection is not None and not selection.allows(server_id, item_key):
+        raise McpToolDenied("本轮 MCP 意图未绑定该能力")
     item = session.get(McpServer, server_id)
     if item is None or not item.enabled or item.status != _MCP_STATUS_READY:
         raise McpToolDenied("MCP Server 当前未启用或未连接")
@@ -210,8 +214,24 @@ def _mcp_result(
 ) -> str:
     """Turn SDK result objects into bounded text and private Artifacts."""
 
+    if is_error_result(result):
+        return tool_envelope(
+            {
+                "error": "MCP 工具返回错误结果，当前信息无法核实",
+                "code": "mcp_result_error",
+                "realtime_verified": False,
+            }
+        )
     payload = jsonable(result)
     if not isinstance(payload, dict):
+        if payload is None or payload == "" or payload == []:
+            return tool_envelope(
+                {
+                    "error": "MCP 工具未返回可用内容",
+                    "code": "mcp_empty_result",
+                    "realtime_verified": False,
+                }
+            )
         return tool_envelope({"server_item": label, "content": limit_tool_content(payload)})
     artifacts: list[dict[str, Any]] = []
     textual: list[Any] = []
@@ -255,8 +275,28 @@ def _mcp_result(
         structured = payload.get("structuredContent")
         if structured is not None:
             textual.append(structured)
+        elif not any(
+            key in payload
+            for key in ("content", "contents", "messages", "structuredContent", "isError", "is_error")
+        ):
+            if payload:
+                textual.append(payload)
+            else:
+                return tool_envelope(
+                    {
+                        "error": "MCP 工具未返回可用内容",
+                        "code": "mcp_empty_result",
+                        "realtime_verified": False,
+                    }
+                )
         else:
-            textual.append(payload)
+            return tool_envelope(
+                {
+                    "error": "MCP 工具未返回可用内容",
+                    "code": "mcp_empty_result",
+                    "realtime_verified": False,
+                }
+            )
     data: dict[str, Any] = {"server_item": label}
     if textual:
         data["content"] = textual
@@ -282,6 +322,7 @@ def _mcp_tool(
     item: McpServer,
     entry: dict[str, Any],
     search_guard: AnySearchCallGuard | None = None,
+    selection: McpToolSelection | None = None,
 ) -> BaseTool:
     remote_name = str(entry.get("name") or "remote_tool")
     item_key = str(entry.get("key") or _grant_key("tool", entry))
@@ -299,7 +340,7 @@ def _mcp_tool(
                     }
                 )
         try:
-            current = _authorize(session, context, item.id, "tool", item_key)
+            current = _authorize(session, context, item.id, "tool", item_key, selection)
             result = await mcp_manager.call_tool(current.id, remote_name, kwargs)
             if search_guard is not None:
                 if is_error_result(result):
@@ -336,6 +377,7 @@ def _resource_tool(
     context: ToolContext,
     item: McpServer,
     entry: dict[str, Any],
+    selection: McpToolSelection | None = None,
 ) -> BaseTool:
     uri = str(entry.get("uri") or "")
     item_key = str(entry.get("key") or f"resource:{uri}")
@@ -346,7 +388,7 @@ def _resource_tool(
 
     async def invoke(**_kwargs: Any) -> str:
         try:
-            current = _authorize(session, context, item.id, "resource", item_key)
+            current = _authorize(session, context, item.id, "resource", item_key, selection)
             result = await mcp_manager.read_resource(current.id, uri)
             return _mcp_result(result, session=session, context=context, label=f"{current.slug}:{uri}")
         except (McpToolDenied, McpServerError) as error:
@@ -367,6 +409,7 @@ def _resource_template_tool(
     context: ToolContext,
     item: McpServer,
     entry: dict[str, Any],
+    selection: McpToolSelection | None = None,
 ) -> BaseTool:
     template = str(entry.get("uri_template") or "")
     item_key = str(entry.get("key") or f"resource_template:{template}")
@@ -380,7 +423,7 @@ def _resource_template_tool(
         if not matcher.fullmatch(uri):
             return tool_envelope({"error": "Resource Template URI 与已授权模板不匹配"})
         try:
-            current = _authorize(session, context, item.id, "resource", item_key)
+            current = _authorize(session, context, item.id, "resource", item_key, selection)
             result = await mcp_manager.read_resource(current.id, uri)
             return _mcp_result(result, session=session, context=context, label=f"{current.slug}:{uri}")
         except (McpToolDenied, McpServerError) as error:
@@ -401,6 +444,7 @@ def _prompt_tool(
     context: ToolContext,
     item: McpServer,
     entry: dict[str, Any],
+    selection: McpToolSelection | None = None,
 ) -> BaseTool:
     prompt_name = str(entry.get("name") or "remote_prompt")
     item_key = str(entry.get("key") or f"prompt:{prompt_name}")
@@ -409,7 +453,7 @@ def _prompt_tool(
 
     async def invoke(arguments: dict[str, Any] | None = None, **_kwargs: Any) -> str:
         try:
-            current = _authorize(session, context, item.id, "prompt", item_key)
+            current = _authorize(session, context, item.id, "prompt", item_key, selection)
             result = await mcp_manager.get_prompt(
                 current.id,
                 prompt_name,
@@ -437,6 +481,7 @@ def _mcp_tools(
     *,
     allow_anysearch_tools: bool = True,
     search_guard: AnySearchCallGuard | None = None,
+    mcp_selection: McpToolSelection | None = None,
 ) -> list[BaseTool]:
     tools: list[BaseTool] = []
     rows = session.scalars(
@@ -456,11 +501,14 @@ def _mcp_tools(
         }
         for entry in catalog["tools"]:
             remote_name = str(entry.get("name") or "remote_tool")
+            item_key = str(entry.get("key") or _grant_key("tool", entry))
+            if mcp_selection is not None and not mcp_selection.allows(item.id, item_key):
+                continue
             if item.slug == ANYSEARCH_SLUG and (
                 not allow_anysearch_tools or remote_name not in ANYSEARCH_TOOL_NAMES
             ):
                 continue
-            if str(entry.get("key") or _grant_key("tool", entry)) in grants:
+            if item_key in grants:
                 tools.append(
                     _mcp_tool(
                         session,
@@ -468,17 +516,32 @@ def _mcp_tools(
                         item,
                         entry,
                         search_guard if item.slug == ANYSEARCH_SLUG else None,
+                        mcp_selection,
                     )
                 )
         for entry in catalog["resources"]:
-            if str(entry.get("key") or _grant_key("resource", entry)) in grants:
-                tools.append(_resource_tool(session, context, item, entry))
+            item_key = str(entry.get("key") or _grant_key("resource", entry))
+            if (
+                (mcp_selection is None or mcp_selection.allows(item.id, item_key))
+                and item_key in grants
+            ):
+                tools.append(_resource_tool(session, context, item, entry, mcp_selection))
         for entry in catalog["resource_templates"]:
-            if str(entry.get("key") or _grant_key("resource_template", entry)) in grants:
-                tools.append(_resource_template_tool(session, context, item, entry))
+            item_key = str(entry.get("key") or _grant_key("resource_template", entry))
+            if (
+                (mcp_selection is None or mcp_selection.allows(item.id, item_key))
+                and item_key in grants
+            ):
+                tools.append(
+                    _resource_template_tool(session, context, item, entry, mcp_selection)
+                )
         for entry in catalog["prompts"]:
-            if str(entry.get("key") or _grant_key("prompt", entry)) in grants:
-                tools.append(_prompt_tool(session, context, item, entry))
+            item_key = str(entry.get("key") or _grant_key("prompt", entry))
+            if (
+                (mcp_selection is None or mcp_selection.allows(item.id, item_key))
+                and item_key in grants
+            ):
+                tools.append(_prompt_tool(session, context, item, entry, mcp_selection))
     return tools
 
 
@@ -502,6 +565,7 @@ def build_registered_tools(
     manga_download_job_factory: Callable[..., Any] | None = None,
     allow_anysearch_tools: bool = True,
     search_guard: AnySearchCallGuard | None = None,
+    mcp_selection: McpToolSelection | None = None,
 ) -> list[BaseTool]:
     """Return the sole tool list consumed by model binding and ``ToolNode``."""
 
@@ -522,6 +586,7 @@ def build_registered_tools(
                 context,
                 allow_anysearch_tools=allow_anysearch_tools,
                 search_guard=search_guard,
+                mcp_selection=mcp_selection,
             ),
         ]
     )

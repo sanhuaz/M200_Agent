@@ -171,11 +171,18 @@ class ToolRun(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     conversation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    user_message_id: Mapped[str | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL"), nullable=True
+    )
     tool_name: Mapped[str] = mapped_column(String(120))
     arguments: Mapped[str] = mapped_column(Text)
     result: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(20))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    __table_args__ = (
+        Index("ix_tool_runs_conversation_user_message", "conversation_id", "user_message_id"),
+    )
 
 
 class ExtensionPackage(Base):
