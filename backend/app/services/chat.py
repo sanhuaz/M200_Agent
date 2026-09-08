@@ -12,6 +12,7 @@ from langgraph.graph import MessagesState
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.db.models import (
     CompanionPreference,
     Conversation,
@@ -23,6 +24,8 @@ from app.db.models import (
 )
 from app.domain.chat_inputs import ChatAttachmentInput, ChatTurnInput
 from app.domain.reply_types import ReplyPlan
+from app.domain.tool_types import ToolContext
+from app.services.artifacts import ArtifactError, artifact_envelope, create_artifact
 from app.services.chat_attachments import (
     AttachmentValidationError,
     attachment_content_blocks,
@@ -71,11 +74,21 @@ from app.services.context import (
 from app.services.extensions import list_packages
 from app.services.jobs import create_companion_analysis_retry_job
 from app.services.manga_intent import MangaIntent, detect_manga_intent
-from app.services.mcp_search import search_intent, search_system_instruction
+from app.services.mcp_delivery import (
+    McpEvidence,
+    aggregate_mcp_evidence,
+    normalize_mcp_result,
+    should_create_markdown,
+)
+from app.services.mcp_router import (
+    inherit_mcp_intent,
+    mcp_intent_system_instruction,
+    resolve_mcp_intent,
+)
 from app.services.models import model_registry
 from app.services.operation_logs import operation_logs
 from app.services.personas import active_persona, persona_system_prompt
-from app.services.reply_policy import EmptyModelReplyError, prepare_reply
+from app.services.reply_policy import EmptyModelReplyError, functional_reply_plan, prepare_reply
 from app.services.runtime import is_owner
 from app.services.strategy_guides import NORMAL_STRATEGIES, guide_for_strategy
 from app.services.time_context import (
@@ -292,6 +305,36 @@ class ChatService:
         text = model_text
         time_context = current_time_context()
 
+        mcp_decision = resolve_mcp_intent(
+            session,
+            text,
+            ToolContext(
+                requester_id=sender_id,
+                conversation_id=conversation.id,
+                platform=platform,
+                is_group=is_group,
+                workspace_path=get_settings().workspace_path,
+                is_owner=is_owner(sender_id),
+            ),
+        )
+        if mcp_decision.status == "none":
+            inherited_mcp_decision = inherit_mcp_intent(
+                session,
+                user_message.id,
+                conversation.id,
+                ToolContext(
+                    requester_id=sender_id,
+                    conversation_id=conversation.id,
+                    platform=platform,
+                    is_group=is_group,
+                    workspace_path=get_settings().workspace_path,
+                    is_owner=is_owner(sender_id),
+                ),
+                current_text=text,
+            )
+            if inherited_mcp_decision.status != "none":
+                mcp_decision = inherited_mcp_decision
+
         started_at = time.perf_counter()
         operation_id = operation_logs.start_operation(
             source="chat",
@@ -303,6 +346,27 @@ class ChatService:
                 "sender_id": sender_id,
                 "message_id": user_message.id,
                 "text": text,
+            },
+        )
+        operation_logs.emit(
+            source="mcp",
+            kind="intent_decision",
+            title="MCP 意图判定",
+            message=(
+                f"{mcp_decision.status}"
+                + (f" / {mcp_decision.availability}" if mcp_decision.availability else "")
+            ),
+            parent_operation_id=operation_id,
+            trace_id=user_message.id,
+            details={
+                "status": mcp_decision.status,
+                "availability": mcp_decision.availability,
+                "server_id": mcp_decision.server_id,
+                "tool_key": mcp_decision.tool_key,
+                "level": mcp_decision.level,
+                "matched_rule_ids": list(mcp_decision.matched_rule_ids),
+                "state_reason": mcp_decision.state_reason,
+                "inherited": mcp_decision.inherited,
             },
         )
 
@@ -639,7 +703,7 @@ class ChatService:
             f"\n\n历史摘要：\n{summary_text}"
             f"\n\n{persona_text}"
             f"{companion_instruction}"
-            f"{search_system_instruction(search_intent(text))}"
+            f"{mcp_intent_system_instruction(mcp_decision)}"
             f"{_manga_system_instruction(manga_intent)}"
         )
         try:
@@ -663,6 +727,10 @@ class ChatService:
             return
         messages = snapshot.messages
         started_tools: set[str] = set()
+        mcp_evidence: list[McpEvidence] = []
+        mcp_artifact_ids: list[str] = []
+        mcp_artifacts_from_tools: list[dict[str, object]] = []
+        emitted_artifact_ids: set[str] = set()
         model_operation: str | None = None
         try:
             graph = build_agent_graph(
@@ -673,7 +741,8 @@ class ChatService:
                 platform=platform,
                 is_group=is_group,
                 allowed_manga_actions=allowed_manga_actions,
-                allow_anysearch_tools=search_intent(text),
+                allow_anysearch_tools=mcp_decision.anysearch_guard,
+                mcp_selection=mcp_decision.selection,
             )
             input_state: MessagesState = {"messages": messages}
             final_messages: list[BaseMessage] = []
@@ -730,12 +799,30 @@ class ChatService:
                                 "data": {"tool_call_id": call_id, "name": call.get("name")},
                             }
                 if isinstance(chunk, ToolMessage):
+                    tool_name = str(chunk.name or "unknown")
+                    evidence = normalize_mcp_result(chunk.content, tool_name)
+                    if evidence is not None:
+                        mcp_evidence.append(evidence)
+                    tool_result = normalize_tool_result(chunk.content)
+                    result_data = tool_result.get("data")
+                    artifact_ids = tool_result.get("artifact_ids", [])
+                    has_mcp_artifact = tool_name.startswith("mcp__") and (
+                        isinstance(artifact_ids, list)
+                        and any(str(item or "").strip() for item in artifact_ids)
+                    )
                     tool_run = ToolRun(
                         conversation_id=conversation.id,
-                        tool_name=str(chunk.name or "unknown"),
+                        user_message_id=user_message.id,
+                        tool_name=tool_name,
                         arguments="{}",
                         result=str(chunk.content),
-                        status="succeeded",
+                        status=(
+                            "succeeded"
+                            if evidence is not None
+                            or has_mcp_artifact
+                            or not tool_name.startswith("mcp__")
+                            else "failed"
+                        ),
                     )
                     session.add(tool_run)
                     session.commit()
@@ -750,34 +837,148 @@ class ChatService:
                         title="工具调用完成",
                         message=str(chunk.name or "未知工具"),
                         parent_operation_id=operation_id,
-                        details={
-                            "tool_call_id": chunk.tool_call_id,
-                            "name": chunk.name,
-                            "result": chunk.content,
-                        },
+                        details=(
+                            {
+                                "tool_call_id": chunk.tool_call_id,
+                                "name": chunk.name,
+                                "result_chars": len(str(chunk.content or "")),
+                                "result_status": (
+                                    "non_empty"
+                                    if evidence is not None
+                                    else "artifact_only"
+                                    if has_mcp_artifact
+                                    else "empty_or_failed"
+                                ),
+                                "mcp_evidence": evidence is not None,
+                                "mcp_artifact": has_mcp_artifact,
+                            }
+                            if tool_name.startswith("mcp__")
+                            else {
+                                "tool_call_id": chunk.tool_call_id,
+                                "name": chunk.name,
+                                "result": chunk.content,
+                            }
+                        ),
                     )
                     yield {"event": "tool_finished", "data": data}
-                    tool_result = normalize_tool_result(chunk.content)
                     if tool_result.get("pending_confirmation"):
                         yield {"event": "pending_confirmation", "data": tool_result}
-                    result_data = tool_result.get("data")
                     if isinstance(result_data, dict) and isinstance(result_data.get("task"), dict):
                         yield {"event": "task_created", "data": result_data["task"]}
-                    artifact_ids = tool_result.get("artifact_ids", [])
+                    artifact_envelopes = (
+                        result_data.get("artifacts")
+                        if isinstance(result_data, dict)
+                        else None
+                    )
+                    artifact_by_id: dict[str, dict[str, object]] = {}
+                    if isinstance(artifact_envelopes, list):
+                        for item in artifact_envelopes:
+                            if isinstance(item, dict) and item.get("id"):
+                                artifact_by_id[str(item["id"])] = {
+                                    str(key): value for key, value in item.items()
+                                }
                     if isinstance(artifact_ids, list):
+                        if tool_name.startswith("mcp__"):
+                            for item in artifact_ids:
+                                artifact_id = str(item or "")
+                                if artifact_id and artifact_id not in mcp_artifact_ids:
+                                    mcp_artifact_ids.append(artifact_id)
                         for artifact_id in artifact_ids:
+                            artifact_payload = artifact_by_id.get(str(artifact_id))
+                            event_data: dict[str, object] = {"artifact_id": str(artifact_id)}
+                            if artifact_payload is not None:
+                                event_data.update(artifact_payload)
+                                if (
+                                    tool_name.startswith("mcp__")
+                                    and str(artifact_id) not in {
+                                        str(item.get("id") or "")
+                                        for item in mcp_artifacts_from_tools
+                                    }
+                                ):
+                                    mcp_artifacts_from_tools.append(dict(artifact_payload))
+                            if artifact_id:
+                                normalized_artifact_id = str(artifact_id)
+                                if normalized_artifact_id in emitted_artifact_ids:
+                                    continue
+                                emitted_artifact_ids.add(normalized_artifact_id)
                             yield {
                                 "event": "artifact_created",
-                                "data": {"artifact_id": str(artifact_id)},
+                                "data": event_data,
                             }
-            final = final_ai_message(final_messages)
-            answer = (
-                final.content
-                if isinstance(final.content, str)
-                else json.dumps(final.content, ensure_ascii=False)
+            mcp_body = aggregate_mcp_evidence(mcp_evidence)
+            if (
+                not mcp_body
+                and mcp_decision.inherited
+                and not mcp_decision.requires_fresh
+                and mcp_decision.has_bound_tools
+            ):
+                mcp_body = aggregate_mcp_evidence(
+                    McpEvidence("inherited", body) for body in mcp_decision.inherited_evidence
+                )
+            if not mcp_body and mcp_artifact_ids:
+                mcp_body = "MCP 已生成文件产物，请查看附件。"
+            mcp_functional_reply = bool(mcp_body)
+            mcp_execution_failed = (
+                mcp_decision.status == "selected"
+                and not mcp_body
+                and not mcp_artifact_ids
             )
+            try:
+                final = final_ai_message(final_messages)
+                raw_model_answer = (
+                    final.content
+                    if isinstance(final.content, str)
+                    else json.dumps(final.content, ensure_ascii=False)
+                )
+            except RuntimeError:
+                if not mcp_functional_reply:
+                    raise
+                raw_model_answer = ""
+            if not raw_model_answer.strip() and not mcp_functional_reply:
+                raise EmptyModelReplyError("模型未返回有效内容，请重试")
+            # Keep the model's actual output separate from a deterministic
+            # MCP failure notice that may replace it below.
+            model_output = raw_model_answer
+            if mcp_execution_failed:
+                failure_answer = {
+                    "connected_unauthorized": (
+                        "MCP 已连接但当前会话或目标能力未授权，暂时无法执行，请授权后重试。"
+                    ),
+                    "unavailable": "当前 MCP 能力不可用，暂时无法核实或交付，请检查连接后重试。",
+                }.get(
+                    mcp_decision.availability,
+                    "本次 MCP 调用未返回可用结果，暂时无法核实或交付，请重试。",
+                )
+                operation_logs.emit(
+                    source="mcp",
+                    level="warn",
+                    kind="mcp_result_degraded",
+                    title="MCP 结果降级",
+                    message="MCP 未返回可用结果，未采用模型成功话术",
+                    parent_operation_id=operation_id,
+                    trace_id=user_message.id,
+                    details={
+                        "server_id": mcp_decision.server_id,
+                        "availability": mcp_decision.availability,
+                        "state_reason": mcp_decision.state_reason,
+                        "matched_rule_ids": list(mcp_decision.matched_rule_ids),
+                        "result_status": (
+                            "empty_or_failed"
+                            if mcp_decision.availability == "available"
+                            else "not_bound"
+                        ),
+                        "model_output_chars": len(model_output),
+                        "delivered_chars": len(failure_answer),
+                    },
+                )
+                raw_model_answer = failure_answer
+            answer = mcp_body if mcp_functional_reply else raw_model_answer
             response_source = "agent"
-            if companion_enabled:
+            if mcp_functional_reply:
+                response_source = "mcp_functional"
+            elif mcp_execution_failed:
+                response_source = "mcp_failure"
+            if companion_enabled or mcp_functional_reply:
                 violations = (
                     output_safety_violations(answer)
                     if companion_safety_mode == "standard"
@@ -819,7 +1020,11 @@ class ChatService:
                         )
                     )
                     session.commit()
-                elif companion_analysis is not None:
+                elif (
+                    companion_analysis is not None
+                    and not mcp_functional_reply
+                    and not mcp_execution_failed
+                ):
                     style_violations = response_style_violations(
                         answer, text, companion_analysis.next_action
                     )
@@ -874,21 +1079,46 @@ class ChatService:
                                 trace_id=user_message.id,
                                 details={"violation_codes": style_violations},
                             )
-            model_output = answer
-            reply_plan: ReplyPlan = prepare_reply(
-                model_output,
-                text,
-                conversation.model_alias,
-                max_segments=max_reply_segments,
-                time_context=time_context,
-            )
-            _emit_reply_policy_degraded(
-                reply_plan,
-                operation_id=operation_id,
-                trace_id=user_message.id,
-                model_output_chars=len(model_output),
-            )
+            if mcp_functional_reply:
+                reply_plan = functional_reply_plan(answer)
+            else:
+                reply_plan = prepare_reply(
+                    answer,
+                    text,
+                    conversation.model_alias,
+                    max_segments=max_reply_segments,
+                    time_context=time_context,
+                )
+                _emit_reply_policy_degraded(
+                    reply_plan,
+                    operation_id=operation_id,
+                    trace_id=user_message.id,
+                    model_output_chars=len(model_output),
+                )
             answer = reply_plan.text
+            mcp_artifacts: list[dict[str, object]] = list(mcp_artifacts_from_tools)
+            mcp_artifact_error: str | None = None
+            if mcp_functional_reply and should_create_markdown(text, answer):
+                try:
+                    artifact = create_artifact(
+                        session,
+                        owner_id=sender_id,
+                        conversation_id=conversation.id,
+                        files=[("mcp-result.md", answer.encode("utf-8"))],
+                    )
+                    mcp_artifacts.append(artifact_envelope(artifact))
+                except (ArtifactError, OSError) as error:
+                    mcp_artifact_error = type(error).__name__
+                    operation_logs.emit(
+                        source="artifact",
+                        level="warn",
+                        kind="mcp_artifact_failed",
+                        title="MCP Markdown 生成失败",
+                        message="完整正文已保留，但 Markdown 文件未生成",
+                        parent_operation_id=operation_id,
+                        trace_id=user_message.id,
+                        details={"error_code": mcp_artifact_error},
+                    )
             assistant_message = Message(
                 conversation_id=conversation.id,
                 sender_id="assistant",
@@ -907,6 +1137,8 @@ class ChatService:
                     "model_output_chars": len(model_output),
                     "delivered_chars": len(answer),
                     "reply_policy_status": reply_plan.policy_status,
+                    "mcp_functional_reply": mcp_functional_reply,
+                    "mcp_artifact_count": len(mcp_artifacts),
                     "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 1),
                 },
             )
@@ -921,12 +1153,25 @@ class ChatService:
                     "model_output_chars": len(model_output),
                     "delivered_chars": len(answer),
                     "reply_policy_status": reply_plan.policy_status,
+                    "mcp_functional_reply": mcp_functional_reply,
+                    "mcp_artifact_count": len(mcp_artifacts),
+                    "mcp_artifact_error": mcp_artifact_error,
                     "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 1),
                     "tools": len(started_tools),
                 },
             )
             if answer:
                 yield {"event": "token", "data": {"text": answer}}
+            for artifact in mcp_artifacts:
+                artifact_id = str(artifact.get("id") or artifact.get("artifact_id") or "")
+                if artifact_id and artifact_id in emitted_artifact_ids:
+                    continue
+                if artifact_id:
+                    emitted_artifact_ids.add(artifact_id)
+                artifact_event = dict(artifact)
+                if artifact_id:
+                    artifact_event.setdefault("artifact_id", artifact_id)
+                yield {"event": "artifact_created", "data": artifact_event}
             yield {
                 "event": "final",
                 "data": {
@@ -939,6 +1184,9 @@ class ChatService:
                         {"kind": part.kind, "text": part.text} for part in reply_plan.parts
                     ],
                     "reply_policy_status": reply_plan.policy_status,
+                    "mcp_functional_reply": mcp_functional_reply,
+                    "artifacts": mcp_artifacts,
+                    "artifact_error": mcp_artifact_error,
                     "assessment_id": companion_analysis.assessment_id
                     if companion_analysis is not None
                     else None,

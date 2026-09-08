@@ -3,9 +3,10 @@ from __future__ import annotations
 import logging
 import threading
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db.models import Conversation, Message
+from app.db.models import Conversation, Message, ToolRun
 from app.db.session import SessionLocal
 from app.services.companion import extract_relationship
 from app.services.context import (
@@ -15,7 +16,6 @@ from app.services.context import (
     choose_summary_batch,
     clip_text,
     load_pending_messages,
-    pending_message_count,
     pending_prefix,
     should_compact,
 )
@@ -25,6 +25,45 @@ from app.services.operation_logs import operation_logs
 from app.services.time_context import current_time_context, format_messages_for_model
 
 logger = logging.getLogger(__name__)
+
+
+def _mcp_result_assistant_ids(session: Session, conversation_id: str) -> set[str]:
+    """Return assistant messages whose preceding user turn has MCP evidence.
+
+    MCP output is short-lived external evidence. It remains in normal
+    conversation history, but must not be copied into the long-term summary.
+    The exact ``ToolRun.user_message_id`` association avoids guessing from
+    timestamps or matching unrelated assistant text.
+    """
+
+    mcp_user_ids = {
+        str(user_message_id)
+        for user_message_id, tool_name, status in session.execute(
+            select(ToolRun.user_message_id, ToolRun.tool_name, ToolRun.status).where(
+                ToolRun.conversation_id == conversation_id,
+                ToolRun.user_message_id.is_not(None),
+                ToolRun.status == "succeeded",
+            )
+        )
+        if user_message_id and str(tool_name or "").startswith("mcp__")
+    }
+    if not mcp_user_ids:
+        return set()
+    rows = list(
+        session.scalars(
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at, Message.id)
+        )
+    )
+    result: set[str] = set()
+    previous_user_id: str | None = None
+    for row in rows:
+        if row.role == "user":
+            previous_user_id = row.id
+        elif row.role == "assistant" and previous_user_id in mcp_user_ids:
+            result.add(row.id)
+    return result
 
 
 class PostTurnService:
@@ -55,6 +94,10 @@ class PostTurnService:
             if conversation is None:
                 return
             context_rows = load_pending_messages(session, conversation, limit=8)
+            mcp_assistant_ids = _mcp_result_assistant_ids(session, conversation_id)
+            context_rows = [
+                item for item in context_rows if item.id not in mcp_assistant_ids
+            ]
             source_message = session.get(Message, message_id)
             time_context = current_time_context()
             turn_context = format_messages_for_model(context_rows[:-1])
@@ -123,12 +166,16 @@ class PostTurnService:
         model_alias: str,
     ) -> None:
         pending = pending_prefix(session, conversation)
-        if not should_compact(session, conversation, pending=pending):
+        mcp_assistant_ids = _mcp_result_assistant_ids(session, conversation.id)
+        summary_pending = [item for item in pending if item.id not in mcp_assistant_ids]
+        if not summary_pending:
             return
-        pending_count = pending_message_count(session, conversation)
+        if not should_compact(session, conversation, pending=summary_pending):
+            return
+        pending_count = len(summary_pending)
         if pending_count <= SUMMARY_KEEP_MESSAGES:
             return
-        candidate_rows = pending[: min(len(pending), pending_count - SUMMARY_KEEP_MESSAGES)]
+        candidate_rows = summary_pending[: min(len(summary_pending), pending_count - SUMMARY_KEEP_MESSAGES)]
         existing_summary = clip_text(conversation.summary or "", SUMMARY_MAX_TOKENS)
         batch = choose_summary_batch(
             candidate_rows,

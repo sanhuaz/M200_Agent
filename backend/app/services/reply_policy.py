@@ -435,11 +435,28 @@ def prepare_reply(
     )
 
 
+def functional_reply_plan(candidate: str) -> ReplyPlan:
+    """Build a complete-result plan without invoking policy repair.
+
+    MCP evidence has its own delivery contract.  It still gets atomic
+    extraction for QQ-safe boundaries, while ``source_text`` preserves the
+    exact normalized body used by Message, Web and Markdown.
+    """
+
+    normalized_candidate = _normalize_reply_text(candidate)
+    if not normalized_candidate:
+        raise EmptyModelReplyError("模型未返回有效内容，请重试")
+    parts = _parts_from_candidate(normalized_candidate)
+    plan = _build_plan("long", parts, source_text=normalized_candidate)
+    return plan
+
+
 __all__ = [
     "SHORT_MAX_CHARS",
     "SHORT_MAX_SEGMENTS",
     "EmptyModelReplyError",
     "extract_atomic_parts",
+    "functional_reply_plan",
     "is_long_output_request",
     "prepare_reply",
     "validate_reply_plan",

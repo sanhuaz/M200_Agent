@@ -7,7 +7,7 @@ from app.domain.mcp_types import AnySearchPresetPayload, McpPreset, McpServerPay
 ANYSEARCH_NAME = "AnySearch"
 ANYSEARCH_SLUG = "anysearch"
 ANYSEARCH_URL = "https://api.anysearch.com/mcp"
-ANYSEARCH_CLIENT_HEADER = "PersonalAgent/0.4.6"
+ANYSEARCH_CLIENT_HEADER = "PersonalAgent/0.4.7"
 
 
 def anysearch_preset(*, installed: bool = False) -> McpPreset:

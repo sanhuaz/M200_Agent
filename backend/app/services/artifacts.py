@@ -111,4 +111,5 @@ def artifact_envelope(item: Artifact) -> dict[str, object]:
         "size": item.size,
         "sha256": item.sha256,
         "content_type": item.content_type,
+        "download_url": f"/api/v1/artifacts/{item.id}/download",
     }
