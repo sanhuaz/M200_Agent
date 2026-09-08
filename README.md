@@ -11,7 +11,7 @@ Docker、Redis、Celery、完整 RBAC、OCR、语音、图像 RAG、生产日志
 
 ## 当前发布
 
-- 当前版本：`v0.4.6`（已同步 GitHub `main`，未创建标签或 Release）
+- 当前版本：`v0.4.7`
 - 仓库：<https://github.com/sanhuaz/M200_Agent>
 
 ## 功能
@@ -44,7 +44,8 @@ Docker、Redis、Celery、完整 RBAC、OCR、语音、图像 RAG、生产日志
 - 动态 Tool Registry：内置 Tool、审核后启用的 Python Tool、文件创建 Tool。
 - Agent Skills：`SKILL.md` 导入、启停、自动/手动加载；包内脚本只展示不执行。
 - MCP：通过官方 Python MCP SDK 接入 stdio、SSE 和 Streamable HTTP Server；工具、资源、资源模板和 Prompt
-  统一进入 Tool Registry，逐项授权后才可调用。第三方 MCP Server 的实际稳定性取决于其自身实现，并非模型本身。
+  统一进入 Tool Registry，逐项授权后才可调用；v0.4.7 增加全局/Server/Tool 三层自定义意图、确定性优先级路由、
+  `可用`/`已连接但未授权`/`不可用` 三态提示、10 分钟紧邻追问继承和完整结果交付。第三方 MCP Server 的实际稳定性取决于其自身实现，并非模型本身。
 - Web 和 QQ 支持 JPEG、PNG、GIF、WebP 文图或纯图片消息；每条消息最多 4 张、总大小不超过 32 MiB、
   图片最多 40MP。图片只保存在私有 `data/chat-images/`，不进入 Chroma、RAG 或公开目录。
 - 图片输入校验失败时不保存；消息/附件持久化失败会回滚并删除图片；已持久化后模型失败则保留用户消息和图片，
@@ -84,14 +85,14 @@ SQLite（关系、消息、状态） + Chroma（文档/记忆向量） + 私有�
 
 ### 公开仓库目录架构
 
-以下是 `v0.4.6` 公开源码的目录结构；测试集、评测运行结果、运行数据、第三方本机 Skill 和私有材料不在其中：
+以下是 `v0.4.7` 公开源码的目录结构；测试集、评测运行结果、运行数据、第三方本机 Skill 和私有材料不在其中：
 
 ```text
 M200_Agent/
 ├─ backend/
 │  ├─ alembic/
 │  │  ├─ env.py
-│  │  └─ versions/                 # 0001—0012，支持旧数据库逐版升级
+│  │  └─ versions/                 # 0001—0013，支持旧数据库逐版升级
 │  └─ app/
 │     ├─ api/                      # 分域 Router、聊天、多模态附件、OneBot、MCP
 │     ├─ core/                     # 环境配置
@@ -128,7 +129,7 @@ M200_Agent/
 ```
 
 `backend/alembic/versions/` 中的历史迁移不是重复文件。Alembic 需要按修订链将旧版本数据库逐步升级到
-`0012_temporal_context`，因此公开发行必须保留 `0001`—`0012`。
+`0013_tool_run_user_message`，因此公开发行必须保留 `0001`—`0013`。
 
 ## 技术栈
 
@@ -277,6 +278,9 @@ pnpm run dev
 ```powershell
 .\scripts\start.ps1
 ```
+
+启动脚本默认使用后端端口 `8000`。如果该端口被 Windows 排除范围占用且 `8200` 可用，脚本会自动回退到 `8200`，
+并同步更新本次 Vite `/api` 代理；终端输出的实际后端地址为准。也可以用 `-BackendPort`、`-FrontendPort` 显式指定端口。
 
 启动脚本按以下顺序寻找解释器，并逐一验证 `sys.executable` 和 Python 版本：
 `-PythonExe` 参数、`PERSONAL_AGENT_PYTHON`、项目 `.venv\Scripts\python.exe`、`py -3.13`、`PATH` 中的 `python`，
@@ -454,7 +458,17 @@ Top-3 87.65%、Micro-F1 0.7024，报告保存在被版本控制忽略的评测�
 
 ## 版本更新记录
 
-### v0.4.6（已同步 GitHub `main`，未创建标签或 Release）
+### v0.4.7
+
+- MCP 意图从仅依赖“搜索”关键词扩展为确定性路由：支持动态 Server/Tool 名称、全局/Server/Tool 自定义短语、AnySearch 当前事实规则、同级歧义阻断和无意图工具关闭。
+- MCP 调用前统一计算 `可用`、`已连接但未授权`、`不可用` 三态；同一决定同时约束系统提示、工具注册、调用时授权、日志和结果交付。
+- 新增 `0013_tool_run_user_message`，精确关联 ToolRun 与用户回合；紧邻追问在 10 分钟内按会话、用户和已完成回合继承短期 MCP 证据，刷新请求仍重新调用。
+- 成功且非空的 MCP 结果进入功能回复通道，保留完整正文并绕过陪伴风格与短回复长度修订；安全检查仍执行。结果为空或失败时不生成成功 Markdown，也不以工具未返回的内容伪装实时结果。
+- 用户要求文件、正文超过 600 个中文字符或实际包含不少于 5 项列表时，从同一完整正文生成 Markdown Artifact；Web SSE 提供下载信息，QQ 私聊先发送语义完整文本，再在文件实际发送成功后记录送达状态；同一 Artifact 按 ID 去重，避免重复发送。
+- MCP 选中但返回空/失败结果，或目标处于未授权/不可用状态且没有真实结果时，拦截模型伪成功话术并返回明确状态；空模型输出进入错误流；成功 MCP 助手正文不复制进轮后记忆、关系提取或长期会话摘要，仍保留在普通会话历史和 10 分钟短期回合证据中。
+- `final` 与 `artifact_created` 事件保留旧字段并追加可选 MCP/Artifact 元数据；MCP 审计日志不写入外部正文，只记录状态、长度和标识。
+
+### v0.4.6
 
 - 增加 AnySearch 官方远程 MCP 预设，支持匿名或 API Key 安装；默认停用、零授权、管理员确认后启用，Agent 按明确联网意图调用，
   垂直搜索先发现合法 domain，搜索失败时明确降级并保留来源边界。
@@ -471,7 +485,7 @@ Top-3 87.65%、Micro-F1 0.7024，报告保存在被版本控制忽略的评测�
 - 本机验收记录：后端 `206 passed, 1 skipped`，前端 Vitest `20 passed`，Pyright `0 errors`、Ruff、`pip check`、编译检查、
   空库/旧库迁移和 AnySearch 匿名真实探针通过；未将测试源码、评测原文、日志、数据库或私有配置纳入公开树。
 
-### v0.4.5（已发布）
+### v0.4.5
 
 - 统一产品文案：用户可见的“你听我说模式”改为“倾听模式”，`Owner` 显示为“管理员”或“QQ 管理员”，内部权限字段保持兼容。
 - 三个启动脚本共用 Python 3.13 解析器，按显式参数、`PERSONAL_AGENT_PYTHON`、项目 `.venv`、`py -3.13`、`PATH` 和手动输入发现，
@@ -483,7 +497,7 @@ Top-3 87.65%、Micro-F1 0.7024，报告保存在被版本控制忽略的评测�
 - 完成 MCP、附件、OneBot、前端请求竞态和 Skill 读取的本机回归；`human-writing` 1.1.0 仅安装在维护者本机，不进入公开源码。
 - FastAPI 与前端包版本同步为 `0.4.5`；完整验收结果和仍有限制以本机实施文档为准，本机文档和测试资产不随发布外发。
 
-### v0.4.4（已发布）
+### v0.4.4
 
 - 修复迁移脚本写死旧版本导致每次启动重复备份的问题：动态比较 `alembic current` 与 `heads`，只在确需升级时备份，自动迁移备份默认保留最近 3 份；人工快照和 NapCat 原始备份不自动删除。
 - 统一长期记忆、Tool/Skill 扩展和 QQ 命令的领域服务路径，消除 Web 与 QQ 删除记忆时 SQLite/Chroma 行为不一致，以及启停、删除扩展的重复实现。

@@ -45,9 +45,10 @@ scripts/generate_companion_*.py
 scripts/fixtures/companion_p0_smoke.json
 
 # 本机项目材料（不进入公开仓库）
-/M200情感陪伴产品优化方案.md
-/QQ自然分批输出测试报告.md
-/Windows正式版制作路线.md
-/项目交接文档.md
-/v0.4.5实施计划.md
-/v0.4.6实施计划.md
+/*计划*.md
+/*规划*.md
+/*方案*.md
+/*路线*.md
+/*交接*.md
+/*测试报告*.md
+/*评测报告*.md
